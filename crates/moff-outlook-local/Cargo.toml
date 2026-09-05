@@ -5,10 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Read-only local macOS Outlook accessibility adapter"
-
-[features]
-test-support = []
+description = "Read-only local macOS Outlook screen and OCR adapter"
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }

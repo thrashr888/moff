@@ -1,270 +1,313 @@
-//! Read-only, local-only macOS Outlook accessibility boundary.
-//!
-//! This crate deliberately knows nothing about Moff credentials, Microsoft Graph,
-//! Outlook profiles, or network transports. Its sole production process boundary is
-//! `/usr/bin/osascript -l JavaScript` talking to the Accessibility tree.
-
+//! Read-only local macOS Outlook window capture and Vision OCR.
+//! No network, credentials, Accessibility APIs, or persistent capture storage.
 use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UiRequest {
-    Doctor,
-    VisibleMail { limit: u16 },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UiReply {
-    pub stdout: String,
-}
-impl UiReply {
-    #[must_use]
-    pub fn json(stdout: impl Into<String>) -> Self {
-        Self {
-            stdout: stdout.into(),
-        }
-    }
-}
+const MAX_LIMIT: u16 = 100;
+const OCR_HELPER: &str = include_str!("ocr.swift");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalError {
+    UnsupportedPlatform,
     OutlookNotRunning,
-    AccessibilityUntrusted,
-    UiUnsupported,
+    WindowAmbiguous,
+    ScreenRecordingDenied,
     UiChanged,
+    InvalidLimit,
+    CaptureFailed,
 }
 impl LocalError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::UnsupportedPlatform => "unsupported_platform",
             Self::OutlookNotRunning => "outlook_not_running",
-            Self::AccessibilityUntrusted => "accessibility_untrusted",
-            Self::UiUnsupported => "ui_unsupported",
+            Self::WindowAmbiguous => "outlook_window_ambiguous",
+            Self::ScreenRecordingDenied => "screen_recording_denied",
             Self::UiChanged => "ui_changed",
+            Self::InvalidLimit => "invalid_limit",
+            Self::CaptureFailed => "capture_failed",
         }
     }
 }
 impl fmt::Display for LocalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::OutlookNotRunning => "Microsoft Outlook is not running",
-            Self::AccessibilityUntrusted => "Accessibility permission is not granted",
-            Self::UiUnsupported => {
-                "Outlook UI is unavailable or exposes no accessible content tree"
+            Self::UnsupportedPlatform => "this provider is supported only on macOS",
+            Self::OutlookNotRunning => "no visible Microsoft Outlook mail window was found",
+            Self::WindowAmbiguous => {
+                "exactly one visible Microsoft Outlook mail window is required"
             }
-            Self::UiChanged => "Outlook UI changed while it was being inspected",
+            Self::ScreenRecordingDenied => {
+                "Screen Recording permission is required to capture the Outlook window"
+            }
+            Self::UiChanged => "Outlook's visible message-list layout was not recognized",
+            Self::InvalidLimit => "limit must be between 1 and 100",
+            Self::CaptureFailed => "unable to capture the selected Outlook window",
         })
     }
 }
 impl std::error::Error for LocalError {}
 
-/// Injectable subprocess boundary. Implementations must not mutate Outlook UI.
-pub trait OutlookUi {
-    ///
-    /// # Errors
-    /// Returns a typed error when the process, accessibility permission, or UI shape is unavailable.
-    fn run(&self, request: UiRequest) -> Result<UiReply, LocalError>;
+#[derive(Debug, Deserialize)]
+struct Window {
+    number: u64,
+    title: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+#[derive(Debug, Deserialize)]
+struct Observation {
+    text: String,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+#[derive(Debug, Serialize)]
+pub struct VisibleRow {
+    pub unread: Option<bool>,
+    pub sender: String,
+    pub subject: String,
+    pub preview: String,
+    pub time: String,
+    pub locator: String,
+    pub locator_scope: &'static str,
 }
 
-/// Production implementation: only System Events AX inspection via JXA.
-pub struct OsaScriptOutlookUi;
-impl OutlookUi for OsaScriptOutlookUi {
-    fn run(&self, request: UiRequest) -> Result<UiReply, LocalError> {
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = request;
-            return Err(LocalError::UiUnsupported);
-        }
-        #[cfg(target_os = "macos")]
-        {
-            #[cfg(feature = "test-support")]
-            if matches!(request, UiRequest::Doctor)
-                && let Some(path) = std::env::var_os("MOFF_TEST_OUTLOOK_AX_FIXTURE")
-            {
-                let stdout =
-                    std::fs::read_to_string(path).map_err(|_| LocalError::UiUnsupported)?;
-                return Ok(UiReply::json(stdout));
-            }
-            let script = match request {
-                UiRequest::Doctor => DOCTOR_JXA.to_owned(),
-                UiRequest::VisibleMail { limit } => visible_jxa(limit),
-            };
-            let output = Command::new("/usr/bin/osascript")
-                .args(["-l", "JavaScript", "-e", &script])
-                .output()
-                .map_err(|_| LocalError::UiUnsupported)?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(
-                    if stderr.contains("not authorized") || stderr.contains("-1743") {
-                        LocalError::AccessibilityUntrusted
-                    } else {
-                        LocalError::UiUnsupported
-                    },
-                );
-            }
-            Ok(UiReply::json(String::from_utf8_lossy(&output.stdout)))
-        }
+fn checked_limit(limit: u16) -> Result<(), LocalError> {
+    if (1..=MAX_LIMIT).contains(&limit) {
+        Ok(())
+    } else {
+        Err(LocalError::InvalidLimit)
+    }
+}
+fn windows() -> Result<Vec<Window>, LocalError> {
+    if !cfg!(target_os = "macos") {
+        return Err(LocalError::UnsupportedPlatform);
+    }
+    if let Some(value) = std::env::var_os("MOFF_TEST_WINDOW_JSON") {
+        return serde_json::from_str(&value.to_string_lossy())
+            .map_err(|_| LocalError::CaptureFailed);
+    }
+    let mut child = Command::new("/usr/bin/swift")
+        .args(["-", "windows"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|_| LocalError::CaptureFailed)?;
+    child
+        .stdin
+        .take()
+        .ok_or(LocalError::CaptureFailed)?
+        .write_all(OCR_HELPER.as_bytes())
+        .map_err(|_| LocalError::CaptureFailed)?;
+    let output = child
+        .wait_with_output()
+        .map_err(|_| LocalError::CaptureFailed)?;
+    if !output.status.success() {
+        return Err(LocalError::CaptureFailed);
+    }
+    serde_json::from_slice(&output.stdout).map_err(|_| LocalError::CaptureFailed)
+}
+
+fn selected_window() -> Result<Window, LocalError> {
+    let windows = windows()?;
+    let suitable: Vec<_> = windows
+        .into_iter()
+        .filter(|window| {
+            window.width > 300.0
+                && window.height > 200.0
+                && (window.title.contains("Inbox")
+                    || window.title.contains("Mail")
+                    || window.title.contains("Outlook"))
+        })
+        .collect();
+    match suitable.len() {
+        0 => Err(LocalError::OutlookNotRunning),
+        1 => Ok(suitable.into_iter().next().expect("one window")),
+        _ => Err(LocalError::WindowAmbiguous),
     }
 }
 
-const DOCTOR_JXA: &str = r"
-const se = Application('System Events');
-const p = se.processes.byName('Microsoft Outlook');
-if (!p.exists()) JSON.stringify({state:'outlook_not_running'});
-else {
-  let version='unknown'; try { version=String(p.applicationFile.version()); } catch (_) {}
-  const w = p.windows[0];
-  if (!w || !w.exists()) JSON.stringify({state:'ui_changed'});
-  else {
-    const roles={}; let descendants=0;
-    const walk=(node, depth)=>{
-      if (depth>8 || descendants>=256) return;
-      let children=[]; try { children=node.UIElements(); } catch (_) { return; }
-      children.forEach(child=>{
-        if (descendants>=256) return;
-        let role=''; try { role=String(child.role()); } catch (_) { return; }
-        descendants+=1; roles[role]=(roles[role] || 0)+1; walk(child, depth+1);
-      });
-    };
-    walk(w, 0);
-    JSON.stringify({state:'ok', running:true, version:version, ui_available:true,
-      ax_descendant_count:descendants, ax_roles:roles});
-  }
+fn secure_capture_path() -> Result<PathBuf, LocalError> {
+    let root =
+        std::env::var_os("MOFF_TEST_TEMP_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+    fs::create_dir_all(&root).map_err(|_| LocalError::CaptureFailed)?;
+    let path = root.join(format!(
+        "moff-outlook-{}-{}.png",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| LocalError::CaptureFailed)?
+            .as_nanos()
+    ));
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|_| LocalError::CaptureFailed)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| LocalError::CaptureFailed)?;
+    }
+    Ok(path)
 }
-";
-fn visible_jxa(limit: u16) -> String {
-    // This is inspection only: no activate, keystroke, click, set, or navigation.
-    format!(
-        r"
-const se = Application('System Events');
-const p = se.processes.byName('Microsoft Outlook');
-if (!p.exists()) JSON.stringify({{state:'outlook_not_running'}});
-else {{
-  const w = p.windows[0];
-  if (!w || !w.exists()) JSON.stringify({{state:'ui_changed'}});
-  else {{
-    const found=[]; const walk=(node, depth)=>{{
-      if (depth>8 || found.length>={limit}) return;
-      let role=''; try {{ role=node.role(); }} catch (_) {{ return; }}
-      if (role === 'AXRow') {{
-        let title=''; try {{ title=node.name(); }} catch (_) {{}}
-        if (!title) try {{ title=node.value(); }} catch (_) {{}}
-        if (title) found.push({{title:String(title)}});
-      }}
-      try {{ node.UIElements().forEach(child=>walk(child, depth+1)); }} catch (_) {{}}
-    }};
-    walk(w,0); JSON.stringify({{state:'ok', rows:found}});
-  }}
-  }}
-  "
-    )
+struct Cleanup(PathBuf);
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
-fn decoded(reply: &UiReply) -> Result<Value, LocalError> {
-    serde_json::from_str(&reply.stdout).map_err(|_| LocalError::UiUnsupported)
-}
-fn state(value: &Value) -> Result<(), LocalError> {
-    match value["state"].as_str() {
-        Some("ok") => Ok(()),
-        Some("outlook_not_running") => Err(LocalError::OutlookNotRunning),
-        Some("ui_changed") => Err(LocalError::UiChanged),
-        Some("accessibility_untrusted") => Err(LocalError::AccessibilityUntrusted),
-        _ => Err(LocalError::UiUnsupported),
+fn capture(window: &Window) -> Result<PathBuf, LocalError> {
+    let path = secure_capture_path()?;
+    let cleanup = Cleanup(path.clone());
+    if std::env::var_os("MOFF_TEST_OCR_JSON").is_some() {
+        fs::write(&path, b"synthetic capture").map_err(|_| LocalError::CaptureFailed)?;
+        std::mem::forget(cleanup);
+        return Ok(path);
+    }
+    let result = Command::new("/usr/sbin/screencapture")
+        .args([
+            "-x",
+            "-l",
+            &window.number.to_string(),
+            path.to_str().ok_or(LocalError::CaptureFailed)?,
+        ])
+        .status();
+    match result {
+        Ok(status) if status.success() && fs::metadata(&path).is_ok_and(|meta| meta.len() > 0) => {
+            std::mem::forget(cleanup);
+            Ok(path)
+        }
+        Ok(_) => Err(LocalError::ScreenRecordingDenied),
+        Err(_) => Err(LocalError::CaptureFailed),
     }
 }
 
 /// # Errors
-/// Returns a typed UI availability or accessibility error.
-pub fn doctor(ui: &dyn OutlookUi) -> Result<Value, LocalError> {
-    let reply = ui.run(UiRequest::Doctor)?;
-    let value = decoded(&reply)?;
-    state(&value)?;
-    let descendant_count = value["ax_descendant_count"]
-        .as_u64()
-        .ok_or(LocalError::UiUnsupported)?;
-    if descendant_count == 0 {
-        return Err(LocalError::UiUnsupported);
-    }
-    Ok(
-        json!({"command":"outlook.doctor","provider":"local-macos","platform":"macos","supported":true,"bundle_id":"com.microsoft.Outlook","version":value["version"],"running":true,"ui_available":value["ui_available"],"ax_preflight":"usable","ax_descendant_count":descendant_count,"ax_roles":value["ax_roles"],"network":false,"auth_calls":false}),
-    )
-}
-
-/// # Errors
-/// Returns a typed UI availability/accessibility error or rejects a limit above 100.
-pub fn visible_mail(ui: &dyn OutlookUi, limit: u16) -> Result<Value, LocalError> {
-    if limit > 100 {
-        return Err(LocalError::UiUnsupported);
-    }
-    let reply = ui.run(UiRequest::VisibleMail { limit })?;
-    let value = decoded(&reply)?;
-    state(&value)?;
-    let rows = value["rows"].as_array().ok_or(LocalError::UiUnsupported)?;
+/// Returns `ui_changed` for unstructured OCR and `invalid_limit` for an invalid bound.
+pub fn parse_visible_rows(ocr: &str, limit: u16) -> Result<Vec<VisibleRow>, LocalError> {
+    checked_limit(limit)?;
+    let mut items: Vec<Observation> =
+        serde_json::from_str(ocr).map_err(|_| LocalError::UiChanged)?;
+    // Defense in depth: never use observations outside the center message-list crop.
+    items.retain(|item| {
+        item.x >= 0.05
+            && item.x < 0.75
+            && item.y >= 0.08
+            && item.y < 0.94
+            && item.w > 0.0
+            && item.h > 0.0
+    });
+    let mut times: Vec<_> = items
+        .iter()
+        .filter(|item| item.x >= 0.50 && is_time(&item.text))
+        .collect();
+    times.sort_by(|a, b| b.y.total_cmp(&a.y));
+    let rows = times
+        .into_iter()
+        .filter_map(|time| {
+            let mut left: Vec<_> = items
+                .iter()
+                .filter(|item| item.x < 0.50 && (item.y - time.y).abs() <= 0.075)
+                .collect();
+            left.sort_by(|a, b| b.y.total_cmp(&a.y));
+            if left.len() < 3 {
+                return None;
+            }
+            Some(VisibleRow {
+                unread: None,
+                sender: left[0].text.clone(),
+                subject: left[1].text.clone(),
+                preview: left[2..]
+                    .iter()
+                    .map(|v| v.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                time: time.text.clone(),
+                locator: String::new(),
+                locator_scope: "ephemeral_local_screen_capture",
+            })
+        })
+        .take(usize::from(limit))
+        .collect::<Vec<_>>();
     if rows.is_empty() {
-        return Err(LocalError::UiUnsupported);
+        return Err(LocalError::UiChanged);
     }
-    let rows: Vec<Value> = rows.iter().take(usize::from(limit)).enumerate().map(|(index, row)| {
-        json!({"summary":row["title"],"locator":format!("visible-row:{}", index + 1),"locator_scope":"ephemeral_local_visible_ui"})
-    }).collect();
-    Ok(
-        json!({"command":"outlook.mail.visible","provider":"local-macos","source":"outlook-ui-local","content_origin":"external_email_untrusted","value":rows}),
-    )
+    Ok(rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut row)| {
+            row.locator = format!("capture-row:{}", index + 1);
+            row
+        })
+        .collect())
+}
+fn is_time(value: &str) -> bool {
+    let value = value.trim();
+    value.eq_ignore_ascii_case("yesterday")
+        || value.contains(':')
+        || value
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '/' || c == '-')
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    struct Fixture {
-        reply: UiReply,
+fn ocr(path: &Path) -> Result<String, LocalError> {
+    if let Some(value) = std::env::var_os("MOFF_TEST_OCR_JSON") {
+        return Ok(value.to_string_lossy().into_owned());
     }
-    impl OutlookUi for Fixture {
-        fn run(&self, _: UiRequest) -> Result<UiReply, LocalError> {
-            Ok(self.reply.clone())
-        }
+    let mut child = Command::new("/usr/bin/swift")
+        .args(["-", "ocr", path.to_str().ok_or(LocalError::CaptureFailed)?])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|_| LocalError::CaptureFailed)?;
+    child
+        .stdin
+        .take()
+        .ok_or(LocalError::CaptureFailed)?
+        .write_all(OCR_HELPER.as_bytes())
+        .map_err(|_| LocalError::CaptureFailed)?;
+    let out = child
+        .wait_with_output()
+        .map_err(|_| LocalError::CaptureFailed)?;
+    if out.status.success() {
+        String::from_utf8(out.stdout).map_err(|_| LocalError::UiChanged)
+    } else {
+        Err(LocalError::UiChanged)
     }
-    #[test]
-    fn visible_mail_is_bounded_and_has_safe_provenance() {
-        let ui = Fixture {
-            reply: UiReply::json(r#"{"state":"ok","rows":[{"title":"One"},{"title":"Two"}]}"#),
-        };
-        let output = visible_mail(&ui, 1).unwrap();
-        assert_eq!(output["source"], "outlook-ui-local");
-        assert_eq!(output["content_origin"], "external_email_untrusted");
-        assert_eq!(output["value"].as_array().unwrap().len(), 1);
-        assert!(
-            output["value"][0]["locator"]
-                .as_str()
-                .unwrap()
-                .starts_with("visible-row:")
-        );
-    }
-    #[test]
-    fn missing_rows_is_typed_ui_unsupported() {
-        let ui = Fixture {
-            reply: UiReply::json(r#"{"state":"ok","rows":[]}"#),
-        };
-        assert_eq!(visible_mail(&ui, 25).unwrap_err().code(), "ui_unsupported");
-    }
-    #[test]
-    fn doctor_does_not_return_mail_data() {
-        let ui = Fixture {
-            reply: UiReply::json(
-                r#"{"state":"ok","ui_available":true,"ax_descendant_count":1,"ax_roles":{"AXGroup":1}}"#,
-            ),
-        };
-        let result = doctor(&ui).unwrap();
-        assert!(result.get("rows").is_none());
-        assert_eq!(result["auth_calls"], false);
-    }
+}
 
-    #[test]
-    fn doctor_rejects_a_window_without_accessible_descendants() {
-        let ui = Fixture {
-            reply: UiReply::json(include_str!("../fixtures/inaccessible-ax-tree.json")),
-        };
-        assert_eq!(doctor(&ui).unwrap_err().code(), "ui_unsupported");
-    }
+/// # Errors
+/// Returns a typed platform or visible-window selection error without reading email text.
+pub fn doctor() -> Result<Value, LocalError> {
+    let window = selected_window()?;
+    Ok(
+        json!({"command":"outlook.doctor","provider":"local-macos-screen-ocr","source":"outlook-screen-local","platform":"macos","screen_recording":"ready","email_content":false,"network":false,"window":{"number":window.number,"frame":{"x":window.x,"y":window.y,"width":window.width,"height":window.height}}}),
+    )
+}
+/// # Errors
+/// Returns typed capture, permission, window, limit, or conservative OCR layout errors.
+pub fn visible_mail(limit: u16) -> Result<Value, LocalError> {
+    checked_limit(limit)?;
+    let window = selected_window()?;
+    let path = capture(&window)?;
+    let cleanup = Cleanup(path.clone());
+    let rows = parse_visible_rows(&ocr(&path)?, limit)?;
+    drop(cleanup);
+    Ok(
+        json!({"command":"outlook.mail.visible","provider":"local-macos-screen-ocr","source":"outlook-screen-local","content_origin":"external_email_untrusted","value":rows,"capture_locator":{"window_number":window.number,"frame":{"x":window.x,"y":window.y,"width":window.width,"height":window.height},"scope":"ephemeral_current_capture"}}),
+    )
 }

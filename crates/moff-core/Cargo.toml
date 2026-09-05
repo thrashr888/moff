@@ -5,15 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Core contracts for the Moff agent-first CLI"
+description = "Core contracts for the local Moff CLI"
 
 [dependencies]
-base64 = "0.22.1"
-directories = "6.0.0"
-keyring = { version = "3.6.3", features = ["apple-native", "linux-native", "windows-native"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-url = "2.5.8"
 
 [features]
 test-support = []
