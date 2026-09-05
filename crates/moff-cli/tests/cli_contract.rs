@@ -401,6 +401,76 @@ fn draft_update_requires_a_change_and_rejects_invalid_rfc3339_dates() {
 }
 
 #[test]
+fn draft_update_and_forward_require_the_id_flag() {
+    for args in [
+        [
+            "--dry-run",
+            "outlook",
+            "mail",
+            "draft-update",
+            "immutable-id",
+            "--subject",
+            "updated",
+        ]
+        .as_slice(),
+        [
+            "--dry-run",
+            "outlook",
+            "mail",
+            "forward",
+            "immutable-id",
+            "--to",
+            "a@example.test",
+            "--body",
+            "hello",
+            "--confirm-send",
+        ]
+        .as_slice(),
+    ] {
+        moff()
+            .args(args)
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(contains("unexpected argument"));
+    }
+
+    for args in [
+        [
+            "--dry-run",
+            "outlook",
+            "mail",
+            "draft-update",
+            "--id",
+            "immutable-id",
+            "--subject",
+            "updated",
+        ]
+        .as_slice(),
+        [
+            "--dry-run",
+            "outlook",
+            "mail",
+            "forward",
+            "--id",
+            "immutable-id",
+            "--to",
+            "a@example.test",
+            "--body",
+            "hello",
+            "--confirm-send",
+        ]
+        .as_slice(),
+    ] {
+        moff()
+            .args(args)
+            .assert()
+            .success()
+            .stdout(contains("network_mutation").and(contains("false")));
+    }
+}
+
+#[test]
 fn sync_reset_requires_explicit_local_state_confirmation_and_supports_limit() {
     moff()
         .args(["outlook", "mail", "sync", "--reset"])

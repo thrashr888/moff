@@ -38,6 +38,58 @@ fn graph_rejects_untrusted_next_links_and_marks_mutation_ambiguity() {
 }
 
 #[test]
+fn mutation_http_failures_are_outcome_unknown_without_retries() {
+    let responses = [
+        GraphResponse {
+            status: 500,
+            body: "{}".to_owned(),
+            request_id: Some("post-request".to_owned()),
+            retry_after_seconds: None,
+        },
+        GraphResponse {
+            status: 503,
+            body: "{}".to_owned(),
+            request_id: Some("patch-request".to_owned()),
+            retry_after_seconds: None,
+        },
+        GraphResponse {
+            status: 429,
+            body: "{}".to_owned(),
+            request_id: Some("delete-request".to_owned()),
+            retry_after_seconds: None,
+        },
+        GraphResponse {
+            status: 504,
+            body: "{}".to_owned(),
+            request_id: Some("empty-post-request".to_owned()),
+            retry_after_seconds: None,
+        },
+    ];
+    let http = FakeHttp(Mutex::new(VecDeque::from(
+        responses.into_iter().map(Ok).collect::<Vec<_>>(),
+    )));
+    let client = GraphClient::new(&http, "https://graph.microsoft.com/v1.0", "token").unwrap();
+
+    for (method, expected_request_id) in [
+        ("POST", "post-request"),
+        ("PATCH", "patch-request"),
+        ("DELETE", "delete-request"),
+    ] {
+        let result = client.mutate_json(method, "/me/messages/id", Some(serde_json::json!({})));
+        assert!(matches!(
+            result,
+            Err(GraphError::OutcomeUnknown { request_id: Some(request_id) })
+                if request_id == expected_request_id
+        ));
+    }
+    assert!(matches!(
+        client.post_empty("/me/messages/id/send"),
+        Err(GraphError::OutcomeUnknown { request_id: Some(request_id) })
+            if request_id == "empty-post-request"
+    ));
+}
+
+#[test]
 fn graph_base_allows_only_official_graph_endpoint() {
     let http = FakeHttp(Mutex::new(VecDeque::new()));
     for base in [

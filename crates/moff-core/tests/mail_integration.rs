@@ -59,6 +59,43 @@ fn list_and_search_map_to_safe_graph_requests_and_label_untrusted_email() {
 }
 
 #[test]
+fn folders_and_graph_mutation_responses_are_labeled_as_untrusted() {
+    let http = FakeHttp::with(
+        (0..11)
+            .map(|index| {
+                Ok(GraphResponse::json(
+                    200,
+                    &format!(r#"{{"id":"server-{index}"}}"#),
+                ))
+            })
+            .collect(),
+    );
+    let mail = MailService::new(client(&http));
+
+    let results = [
+        mail.folders().unwrap(),
+        mail.mark("id", true).unwrap(),
+        mail.move_message("id", "folder").unwrap(),
+        mail.copy_message("id", "folder").unwrap(),
+        mail.soft_delete("id").unwrap(),
+        mail.draft_create(serde_json::json!({"subject":"draft"}))
+            .unwrap(),
+        mail.draft_update("id", serde_json::json!({"subject":"updated"}))
+            .unwrap(),
+        mail.send(&serde_json::json!({"subject":"send"})).unwrap(),
+        mail.send_draft("id").unwrap(),
+        mail.reply("id", serde_json::json!({"comment":"reply"}), false)
+            .unwrap(),
+        mail.forward("id", serde_json::json!({"comment":"forward"}))
+            .unwrap(),
+    ];
+
+    for result in results {
+        assert_eq!(result["content_origin"], "external_graph_untrusted");
+    }
+}
+
+#[test]
 fn typed_list_filters_and_folder_search_are_encoded_without_raw_query_injection() {
     let http = FakeHttp::with(vec![
         Ok(GraphResponse::json(200, r#"{"value":[]}"#)),
@@ -354,7 +391,7 @@ fn get_retries_transient_response_after_bounded_retry_after_delay() {
 }
 
 #[test]
-fn non_idempotent_request_does_not_retry_transient_response() {
+fn non_idempotent_request_reports_ambiguous_transient_response_without_retry() {
     let http = FakeHttp::with(vec![Ok(GraphResponse::json(503, "{}").with_retry_after(1))]);
     let sleeper = FakeSleeper::default();
     let client =
@@ -362,7 +399,7 @@ fn non_idempotent_request_does_not_retry_transient_response() {
             .unwrap();
     assert!(matches!(
         client.post_json("/me/sendMail", serde_json::json!({})),
-        Err(GraphError::Http { status: 503, .. })
+        Err(GraphError::OutcomeUnknown { request_id: None })
     ));
     assert!(sleeper.0.lock().unwrap().is_empty());
     assert_eq!(http.requests.lock().unwrap().len(), 1);

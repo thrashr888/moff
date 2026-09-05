@@ -19,5 +19,7 @@ jobs:
       - uses: taiki-e/install-action@fdd9c53beefd63405d1a23c7d3510edb29c26e15 # cargo-audit
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
+      - run: cargo test --workspace --all-features
       - run: cargo audit

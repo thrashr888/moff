@@ -144,13 +144,8 @@ enum MailCommand {
         body_type: BodyType,
     },
     DraftUpdate {
-        #[arg(
-            long,
-            required_unless_present = "legacy_id",
-            conflicts_with = "legacy_id"
-        )]
-        id: Option<String>,
-        legacy_id: Option<String>,
+        #[arg(long)]
+        id: String,
         #[arg(long)]
         subject: Option<String>,
         #[arg(long)]
@@ -215,13 +210,8 @@ enum MailCommand {
         body_type: BodyType,
     },
     Forward {
-        #[arg(
-            long,
-            required_unless_present = "legacy_id",
-            conflicts_with = "legacy_id"
-        )]
-        id: Option<String>,
-        legacy_id: Option<String>,
+        #[arg(long)]
+        id: String,
         #[arg(long)]
         to: Vec<String>,
         #[arg(long)]
@@ -724,18 +714,31 @@ fn sync_delta_cycle(
 }
 
 #[cfg(feature = "test-support")]
-fn test_endpoint(name: &str, graph: bool) -> Result<String, AppError> {
-    let endpoint = std::env::var(name)
-        .map_err(|_| AppError::new("test_endpoint", "test endpoint is required"))?;
-    let loopback =
-        endpoint.starts_with("http://127.0.0.1:") || endpoint.starts_with("http://localhost:");
-    if !loopback || (graph && !endpoint.trim_end_matches('/').ends_with("/v1.0")) {
+fn validate_test_endpoint(endpoint: &str, graph: bool) -> Result<String, AppError> {
+    let parsed = reqwest::Url::parse(endpoint)
+        .map_err(|_| AppError::new("test_endpoint", "test endpoint must be loopback"))?;
+    let loopback = matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"));
+    if parsed.scheme() != "http"
+        || !loopback
+        || parsed.port().is_none_or(|port| port == 0)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || (graph && parsed.path() != "/v1.0")
+    {
         return Err(AppError::new(
             "test_endpoint",
             "test endpoint must be loopback",
         ));
     }
-    Ok(endpoint)
+    Ok(endpoint.to_owned())
+}
+#[cfg(feature = "test-support")]
+fn test_endpoint(name: &str, graph: bool) -> Result<String, AppError> {
+    let endpoint = std::env::var(name)
+        .map_err(|_| AppError::new("test_endpoint", "test endpoint is required"))?;
+    validate_test_endpoint(&endpoint, graph)
 }
 
 #[allow(
@@ -1093,7 +1096,7 @@ fn execute_outlook(
         OutlookCommand::Mail { command: MailCommand::Copy { id, folder } } => mail.copy_message(&id, &folder),
         OutlookCommand::Mail { command: MailCommand::Delete { id } } => mail.soft_delete(&id),
         OutlookCommand::Mail { command: MailCommand::DraftCreate { to, subject, body, body_type, .. } } => mail.draft_create(message(&to, &subject, body.as_deref().expect("validated body"), &body_type)),
-        OutlookCommand::Mail { command: MailCommand::DraftUpdate { id, legacy_id, subject, body, body_type, .. } } => {
+        OutlookCommand::Mail { command: MailCommand::DraftUpdate { id, subject, body, body_type, .. } } => {
             let mut update = serde_json::Map::new();
             if let Some(subject) = subject {
                 update.insert("subject".to_owned(), json!(subject));
@@ -1102,7 +1105,7 @@ fn execute_outlook(
                 update.insert("body".to_owned(), json!({"contentType":body_type.graph(),"content":content}));
             }
             mail.draft_update(
-                id.as_deref().or(legacy_id.as_deref()).expect("validated id"),
+                &id,
                 Value::Object(update),
             )
         }
@@ -1110,7 +1113,7 @@ fn execute_outlook(
         OutlookCommand::Mail { command: MailCommand::SendDraft { id, .. } } => mail.send_draft(&id).map(|_| json!({"accepted":true})),
         OutlookCommand::Mail { command: MailCommand::Reply { id, comment, body, body_type, .. } } => mail.reply(&id, comment.map_or_else(|| json!({"message":{"body":{"contentType":body_type.graph(),"content":body.expect("validated body")}}}), |comment| json!({"comment":comment})), false).map(|_| json!({"accepted":true})),
         OutlookCommand::Mail { command: MailCommand::ReplyAll { id, comment, body, body_type, .. } } => mail.reply(&id, comment.map_or_else(|| json!({"message":{"body":{"contentType":body_type.graph(),"content":body.expect("validated body")}}}), |comment| json!({"comment":comment})), true).map(|_| json!({"accepted":true})),
-        OutlookCommand::Mail { command: MailCommand::Forward { id, legacy_id, to, comment, body, body_type, .. } } => mail.forward(id.as_deref().or(legacy_id.as_deref()).expect("validated id"), comment.map_or_else(|| json!({"message":{"body":{"contentType":body_type.graph(),"content":body.expect("validated body")},"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>()}}), |comment| json!({"comment":comment,"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>() }))).map(|_| json!({"accepted":true})),
+        OutlookCommand::Mail { command: MailCommand::Forward { id, to, comment, body, body_type, .. } } => mail.forward(&id, comment.map_or_else(|| json!({"message":{"body":{"contentType":body_type.graph(),"content":body.expect("validated body")},"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>()}}), |comment| json!({"comment":comment,"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>() }))).map(|_| json!({"accepted":true})),
         OutlookCommand::Mail { command: MailCommand::Sync { folder, reset, limit } } => {
             if reset {
                 vault.delete_delta_link(profile_name, &graph_base, &folder).map_err(storage_error)?;
@@ -1270,6 +1273,25 @@ mod tests {
             graph_base(false),
             Ok(base) if base == "https://graph.microsoft.com/v1.0"
         ));
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn test_endpoints_reject_spoofed_and_malformed_loopback_urls() {
+        for (endpoint, graph) in [
+            ("http://localhost:ignored@evil.example", false),
+            ("https://localhost:8080", false),
+            ("http://localhost", false),
+            ("http://localhost:0", false),
+            ("http://localhost:8080?query", false),
+            ("http://localhost:ignored@evil.example/v1.0", true),
+            ("http://127.0.0.1:8080/v1.0#fragment", true),
+            ("http://127.0.0.1:8080/not-v1.0", true),
+        ] {
+            assert!(validate_test_endpoint(endpoint, graph).is_err());
+        }
+        assert!(validate_test_endpoint("http://localhost:8080", false).is_ok());
+        assert!(validate_test_endpoint("http://127.0.0.1:8080/v1.0", true).is_ok());
     }
 
     #[cfg(unix)]

@@ -582,6 +582,11 @@ impl<'a> GraphClient<'a> {
                     self.wait(response.retry_after_seconds.unwrap_or(1).min(60));
                 }
                 Ok(response) => {
+                    if method != "GET" && matches!(response.status, 408 | 429 | 500..=599) {
+                        return Err(GraphError::OutcomeUnknown {
+                            request_id: response.request_id,
+                        });
+                    }
                     return Err(GraphError::Http {
                         status: response.status,
                         request_id: response.request_id,
@@ -633,6 +638,11 @@ impl<'a> GraphClient<'a> {
             body: Some(String::new()),
         }) {
             Ok(response) if (200..300).contains(&response.status) => Ok(json!({})),
+            Ok(response) if matches!(response.status, 408 | 429 | 500..=599) => {
+                Err(GraphError::OutcomeUnknown {
+                    request_id: response.request_id,
+                })
+            }
             Ok(response) => Err(GraphError::Http {
                 status: response.status,
                 request_id: response.request_id,
@@ -706,10 +716,14 @@ impl<'a> MailService<'a> {
     fn messages(result: &Value) -> Value {
         json!({"content_origin":"external_email_untrusted","value":result["value"].clone(),"next_link":result["@odata.nextLink"].clone()})
     }
+    fn graph_response(mut result: Value) -> Value {
+        result["content_origin"] = json!("external_graph_untrusted");
+        result
+    }
     pub fn folders(&self) -> Result<Value, GraphError> {
-        self.client.get_json(
-            "/me/mailFolders?$select=id,displayName,parentFolderId,totalItemCount,unreadItemCount",
-        )
+        self.client
+            .get_json("/me/mailFolders?$select=id,displayName,parentFolderId,totalItemCount,unreadItemCount")
+            .map(Self::graph_response)
     }
     pub fn list(&self, folder: &str, limit: u16) -> Result<Value, GraphError> {
         Ok(Self::messages(&self.client.get_json(&format!("/me/mailFolders/{}/messages?$select=id%2Csubject%2Cfrom%2CreceivedDateTime%2CisRead&$top={limit}", Self::escape(folder)))?))
@@ -825,66 +839,85 @@ impl<'a> MailService<'a> {
         STANDARD.decode(content).map_err(|_| GraphError::Protocol)
     }
     pub fn mark(&self, id: &str, read: bool) -> Result<Value, GraphError> {
-        self.client.mutate_json(
-            "PATCH",
-            &format!("/me/messages/{}", Self::escape(id)),
-            Some(json!({"isRead":read})),
-        )
+        self.client
+            .mutate_json(
+                "PATCH",
+                &format!("/me/messages/{}", Self::escape(id)),
+                Some(json!({"isRead":read})),
+            )
+            .map(Self::graph_response)
     }
     pub fn move_message(&self, id: &str, folder: &str) -> Result<Value, GraphError> {
-        self.client.post_json(
-            &format!("/me/messages/{}/move", Self::escape(id)),
-            json!({"destinationId":folder}),
-        )
+        self.client
+            .post_json(
+                &format!("/me/messages/{}/move", Self::escape(id)),
+                json!({"destinationId":folder}),
+            )
+            .map(Self::graph_response)
     }
     pub fn copy_message(&self, id: &str, folder: &str) -> Result<Value, GraphError> {
-        self.client.post_json(
-            &format!("/me/messages/{}/copy", Self::escape(id)),
-            json!({"destinationId":folder}),
-        )
+        self.client
+            .post_json(
+                &format!("/me/messages/{}/copy", Self::escape(id)),
+                json!({"destinationId":folder}),
+            )
+            .map(Self::graph_response)
     }
     pub fn soft_delete(&self, id: &str) -> Result<Value, GraphError> {
-        self.client.mutate_json(
-            "DELETE",
-            &format!("/me/messages/{}", Self::escape(id)),
-            None,
-        )
+        self.client
+            .mutate_json(
+                "DELETE",
+                &format!("/me/messages/{}", Self::escape(id)),
+                None,
+            )
+            .map(Self::graph_response)
     }
     pub fn draft_create(&self, message: Value) -> Result<Value, GraphError> {
-        self.client.post_json("/me/messages", message)
+        self.client
+            .post_json("/me/messages", message)
+            .map(Self::graph_response)
     }
     pub fn draft_update(&self, id: &str, message: Value) -> Result<Value, GraphError> {
-        self.client.mutate_json(
-            "PATCH",
-            &format!("/me/messages/{}", Self::escape(id)),
-            Some(message),
-        )
+        self.client
+            .mutate_json(
+                "PATCH",
+                &format!("/me/messages/{}", Self::escape(id)),
+                Some(message),
+            )
+            .map(Self::graph_response)
     }
     pub fn send(&self, message: &Value) -> Result<Value, GraphError> {
-        self.client.post_json(
-            "/me/sendMail",
-            json!({"message":message,"saveToSentItems":true}),
-        )
+        self.client
+            .post_json(
+                "/me/sendMail",
+                json!({"message":message,"saveToSentItems":true}),
+            )
+            .map(Self::graph_response)
     }
     pub fn send_draft(&self, id: &str) -> Result<Value, GraphError> {
         self.client
             .post_empty(&format!("/me/messages/{}/send", Self::escape(id)))
+            .map(Self::graph_response)
     }
     pub fn reply(&self, id: &str, payload: Value, all: bool) -> Result<Value, GraphError> {
-        self.client.post_json(
-            &format!(
-                "/me/messages/{}/{}",
-                Self::escape(id),
-                if all { "replyAll" } else { "reply" }
-            ),
-            payload,
-        )
+        self.client
+            .post_json(
+                &format!(
+                    "/me/messages/{}/{}",
+                    Self::escape(id),
+                    if all { "replyAll" } else { "reply" }
+                ),
+                payload,
+            )
+            .map(Self::graph_response)
     }
     pub fn forward(&self, id: &str, payload: Value) -> Result<Value, GraphError> {
-        self.client.post_json(
-            &format!("/me/messages/{}/forward", Self::escape(id)),
-            payload,
-        )
+        self.client
+            .post_json(
+                &format!("/me/messages/{}/forward", Self::escape(id)),
+                payload,
+            )
+            .map(Self::graph_response)
     }
     pub fn delta(&self, folder: &str, continuation: Option<&str>) -> Result<Value, GraphError> {
         self.delta_limited(folder, continuation, None)
