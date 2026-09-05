@@ -6,9 +6,13 @@ use moff_core::{
     TokenVault,
 };
 
+type Form = BTreeMap<String, String>;
+type CapturedRequest = (String, Form);
+type CapturedRequests = Arc<Mutex<Vec<CapturedRequest>>>;
+
 #[derive(Clone, Default)]
 struct FakeHttp {
-    requests: Arc<Mutex<Vec<(String, BTreeMap<String, String>)>>>,
+    requests: CapturedRequests,
     responses: Arc<Mutex<VecDeque<HttpResponse>>>,
 }
 
