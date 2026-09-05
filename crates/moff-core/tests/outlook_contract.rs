@@ -36,3 +36,41 @@ fn graph_rejects_untrusted_next_links_and_marks_mutation_ambiguity() {
         Err(GraphError::OutcomeUnknown { .. })
     ));
 }
+
+#[test]
+fn graph_base_allows_only_official_graph_endpoint() {
+    let http = FakeHttp(Mutex::new(VecDeque::new()));
+    for base in [
+        "https://graph.microsoft.com",
+        "https://graph.microsoft.com/beta",
+        "https://graph.example/v1.0",
+        "https://graph.microsoft.com.evil.example/v1.0",
+    ] {
+        assert!(matches!(
+            GraphClient::new(&http, base, "token"),
+            Err(GraphError::InvalidBase)
+        ));
+    }
+    assert!(GraphClient::new(&http, "https://graph.microsoft.com/v1.0", "token").is_ok());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn debug_build_allows_only_loopback_http_graph_base() {
+    let http = FakeHttp(Mutex::new(VecDeque::new()));
+    assert!(GraphClient::new(&http, "http://127.0.0.1:8080/v1.0", "token").is_ok());
+    assert!(matches!(
+        GraphClient::new(&http, "http://example.test/v1.0", "token"),
+        Err(GraphError::InvalidBase)
+    ));
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn release_build_rejects_loopback_http_graph_base() {
+    let http = FakeHttp(Mutex::new(VecDeque::new()));
+    assert!(matches!(
+        GraphClient::new(&http, "http://127.0.0.1:8080/v1.0", "token"),
+        Err(GraphError::InvalidBase)
+    ));
+}

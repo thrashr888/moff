@@ -13,8 +13,8 @@ use std::process::ExitCode;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use moff_core::{
     AuthService, DeviceFlowError, ErrorCode, GraphClient, GraphError, GraphHttp, GraphRequest,
-    GraphResponse, HttpClient, HttpResponse, InMemoryVault, KeyringVault, MailService, Profile,
-    ProfileStore, ThreadSleeper, TokenVault, known_source, schema,
+    GraphResponse, HttpClient, HttpResponse, KeyringVault, MailService, Profile, ProfileStore,
+    ThreadSleeper, TokenVault, known_source, schema,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -341,23 +341,78 @@ fn write_attachment(path: &Path, bytes: &[u8], force: bool) -> Result<(), AppErr
         std::process::id(),
         nonce
     ));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(&temporary)
         .map_err(|_| AppError::new("output", "unable to create temporary attachment file"))?;
-    file.write_all(bytes)
+    if file
+        .write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|_| AppError::new("output", "unable to write attachment file"))?;
-    if path.exists() && !force {
+        .is_err()
+    {
         let _ = fs::remove_file(&temporary);
-        return Err(AppError::new(
-            "output_exists",
-            "output exists; use --force with --yes",
-        ));
+        return Err(AppError::new("output", "unable to write attachment file"));
     }
-    fs::rename(&temporary, path)
-        .map_err(|_| AppError::new("output", "unable to finalize attachment file"))
+    drop(file);
+    #[cfg(unix)]
+    if !force {
+        return fs::hard_link(&temporary, path)
+            .and_then(|()| fs::remove_file(&temporary))
+            .map_err(|error| {
+                let _ = fs::remove_file(&temporary);
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    AppError::new("output_exists", "output exists; use --force with --yes")
+                } else {
+                    AppError::new("output", "unable to finalize attachment file")
+                }
+            });
+    }
+    fs::rename(&temporary, path).map_err(|_| {
+        let _ = fs::remove_file(&temporary);
+        AppError::new("output", "unable to finalize attachment file")
+    })
+}
+
+fn sync_delta_cycle(
+    mail: &MailService<'_>,
+    vault: &dyn TokenVault,
+    profile_name: &str,
+    graph_base: &str,
+    folder: &str,
+) -> Result<Value, AppError> {
+    let mut continuation = vault
+        .get_delta_link(profile_name, graph_base, folder)
+        .map_err(storage_error)?;
+    let mut records = Vec::new();
+    loop {
+        let delta = mail
+            .delta(folder, continuation.as_deref())
+            .map_err(graph_error)?;
+        let values = delta["value"]
+            .as_array()
+            .ok_or_else(|| AppError::new("graph", "Graph returned an invalid delta page"))?;
+        records.extend(values.iter().cloned());
+        if let Some(next) = delta["next_link"].as_str() {
+            continuation = Some(next.to_owned());
+            continue;
+        }
+        let terminal = delta["delta_link"].as_str().ok_or_else(|| {
+            AppError::new("graph", "Graph delta response omitted terminal cursor")
+        })?;
+        mail.validate_delta_link(terminal).map_err(graph_error)?;
+        vault
+            .set_delta_link(profile_name, graph_base, folder, terminal)
+            .map_err(storage_error)?;
+        return Ok(
+            json!({"content_origin":"external_email_untrusted","value":records,"next_link":Value::Null,"delta_link":terminal}),
+        );
+    }
 }
 
 fn auth_data(command: AuthCommand, profile_name: String, dry_run: bool) -> Result<Value, AppError> {
@@ -616,21 +671,7 @@ fn execute_outlook(command: OutlookCommand, profile_name: &str) -> Result<Value,
             .map_err(|_| AppError::new("transport", "unable to create HTTPS client"))?,
     );
     let keyring_vault = KeyringVault;
-    #[cfg(debug_assertions)]
-    let test_vault = std::env::var_os("MOFF_TEST_REFRESH_TOKEN_FILE")
-        .map(|path| {
-            let refresh_token = fs::read_to_string(path)
-                .map_err(|_| AppError::new("test_vault", "unable to read test refresh token"))?;
-            let vault = InMemoryVault::default();
-            vault
-                .set(profile_name, refresh_token.trim_end())
-                .map_err(storage_error)?;
-            Ok(vault)
-        })
-        .transpose()?;
-    #[cfg(not(debug_assertions))]
-    let test_vault: Option<InMemoryVault> = None;
-    let vault: &dyn TokenVault = test_vault.as_ref().map_or(&keyring_vault, |vault| vault);
+    let vault: &dyn TokenVault = &keyring_vault;
     let sleeper = ThreadSleeper;
     let entra = std::env::var("MOFF_ENTRA_BASE_URL")
         .unwrap_or_else(|_| "https://login.microsoftonline.com".to_owned());
@@ -671,16 +712,7 @@ fn execute_outlook(command: OutlookCommand, profile_name: &str) -> Result<Value,
         OutlookCommand::Mail { command: MailCommand::ReplyAll { id, comment, .. } } => mail.reply(&id, json!({"comment":comment}), true).map(|_| json!({"accepted":true})),
         OutlookCommand::Mail { command: MailCommand::Forward { id, to, comment, .. } } => mail.forward(&id, json!({"comment":comment,"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>() })).map(|_| json!({"accepted":true})),
         OutlookCommand::Mail { command: MailCommand::Sync { folder } } => {
-            let continuation = vault
-                .get_delta_link(profile_name, &graph_base, &folder)
-                .map_err(storage_error)?;
-            let delta = mail.delta(&folder, continuation.as_deref()).map_err(graph_error)?;
-            if let Some(link) = delta["delta_link"].as_str() {
-                vault
-                    .set_delta_link(profile_name, &graph_base, &folder, link)
-                    .map_err(storage_error)?;
-            }
-            return Ok(delta);
+            return sync_delta_cycle(&mail, vault, profile_name, &graph_base, &folder);
         }
     };
     result.map_err(graph_error)
@@ -755,5 +787,199 @@ fn main() -> ExitCode {
             }
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use moff_core::InMemoryVault;
+
+    use super::*;
+
+    struct FakeGraph {
+        responses: Mutex<VecDeque<Result<GraphResponse, GraphError>>>,
+        requests: Mutex<Vec<GraphRequest>>,
+    }
+    impl FakeGraph {
+        fn with(responses: Vec<Result<GraphResponse, GraphError>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(vec![]),
+            }
+        }
+    }
+    impl GraphHttp for FakeGraph {
+        fn request(&self, request: GraphRequest) -> Result<GraphResponse, GraphError> {
+            self.requests.lock().unwrap().push(request);
+            self.responses.lock().unwrap().pop_front().unwrap()
+        }
+    }
+
+    #[test]
+    fn sync_consumes_every_page_emits_all_records_and_persists_only_terminal_cursor() {
+        let http = FakeGraph::with(vec![
+            Ok(GraphResponse::json(
+                200,
+                r#"{"value":[{"id":"first"}],"@odata.nextLink":"https://graph.microsoft.com/v1.0/next"}"#,
+            )),
+            Ok(GraphResponse::json(
+                200,
+                r#"{"value":[{"id":"second"}],"@odata.deltaLink":"https://graph.microsoft.com/v1.0/delta"}"#,
+            )),
+        ]);
+        let vault = InMemoryVault::default();
+        vault
+            .set_delta_link(
+                "work",
+                "https://graph.microsoft.com/v1.0",
+                "inbox",
+                "https://graph.microsoft.com/v1.0/old",
+            )
+            .unwrap();
+        let mail = MailService::new(
+            GraphClient::new(&http, "https://graph.microsoft.com/v1.0", "token").unwrap(),
+        );
+
+        let result = sync_delta_cycle(
+            &mail,
+            &vault,
+            "work",
+            "https://graph.microsoft.com/v1.0",
+            "inbox",
+        );
+        assert!(result.is_ok());
+        let result = result.ok().unwrap();
+
+        assert_eq!(result["value"], json!([{"id":"first"}, {"id":"second"}]));
+        assert_eq!(result["content_origin"], "external_email_untrusted");
+        assert_eq!(
+            vault
+                .get_delta_link("work", "https://graph.microsoft.com/v1.0", "inbox")
+                .unwrap()
+                .as_deref(),
+            Some("https://graph.microsoft.com/v1.0/delta")
+        );
+        let requests = http.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| {
+            request.headers.get("Authorization").map(String::as_str) == Some("Bearer token")
+        }));
+        assert!(requests[0].url.ends_with("/old"));
+        assert_eq!(requests[1].url, "https://graph.microsoft.com/v1.0/next");
+        let emitted = result.to_string();
+        assert!(!emitted.contains("token"));
+    }
+
+    #[test]
+    fn sync_failure_after_a_nonterminal_page_does_not_replace_cursor() {
+        let http = FakeGraph::with(vec![
+            Ok(GraphResponse::json(
+                200,
+                r#"{"value":[{"id":"first"}],"@odata.nextLink":"https://graph.microsoft.com/v1.0/next"}"#,
+            )),
+            Err(GraphError::Transport),
+            Err(GraphError::Transport),
+            Err(GraphError::Transport),
+        ]);
+        let vault = InMemoryVault::default();
+        vault
+            .set_delta_link(
+                "work",
+                "https://graph.microsoft.com/v1.0",
+                "inbox",
+                "https://graph.microsoft.com/v1.0/old",
+            )
+            .unwrap();
+        let mail = MailService::new(
+            GraphClient::new(&http, "https://graph.microsoft.com/v1.0", "token").unwrap(),
+        );
+
+        assert!(
+            sync_delta_cycle(
+                &mail,
+                &vault,
+                "work",
+                "https://graph.microsoft.com/v1.0",
+                "inbox"
+            )
+            .is_err()
+        );
+
+        assert_eq!(
+            vault
+                .get_delta_link("work", "https://graph.microsoft.com/v1.0", "inbox")
+                .unwrap()
+                .as_deref(),
+            Some("https://graph.microsoft.com/v1.0/old")
+        );
+    }
+
+    #[test]
+    fn sync_rejects_missing_or_untrusted_terminal_cursor_without_updating_state() {
+        for terminal in [None, Some("https://evil.example/delta")] {
+            let body = match terminal {
+                Some(link) => format!(r#"{{"value":[],"@odata.deltaLink":"{link}"}}"#),
+                None => r#"{"value":[]}"#.to_owned(),
+            };
+            let http = FakeGraph::with(vec![Ok(GraphResponse::json(200, &body))]);
+            let vault = InMemoryVault::default();
+            vault
+                .set_delta_link(
+                    "work",
+                    "https://graph.microsoft.com/v1.0",
+                    "inbox",
+                    "https://graph.microsoft.com/v1.0/old",
+                )
+                .unwrap();
+            let mail = MailService::new(
+                GraphClient::new(&http, "https://graph.microsoft.com/v1.0", "token").unwrap(),
+            );
+
+            assert!(
+                sync_delta_cycle(
+                    &mail,
+                    &vault,
+                    "work",
+                    "https://graph.microsoft.com/v1.0",
+                    "inbox"
+                )
+                .is_err()
+            );
+            assert_eq!(
+                vault
+                    .get_delta_link("work", "https://graph.microsoft.com/v1.0", "inbox")
+                    .unwrap()
+                    .as_deref(),
+                Some("https://graph.microsoft.com/v1.0/old")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_files_are_created_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "moff-attachment-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let output = directory.join("attachment.txt");
+
+        assert!(write_attachment(&output, b"sensitive", false).is_ok());
+
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -439,14 +439,16 @@ pub struct GraphClient<'a> {
 }
 impl<'a> GraphClient<'a> {
     pub fn new(http: &'a dyn GraphHttp, base: &str, token: &'a str) -> Result<Self, GraphError> {
-        let local_http =
-            base.starts_with("http://127.0.0.1:") || base.starts_with("http://localhost:");
-        if (!base.starts_with("https://") && !local_http) || base.contains('?') {
+        let base = base.trim_end_matches('/');
+        let local_http = cfg!(debug_assertions)
+            && (base.starts_with("http://127.0.0.1:") || base.starts_with("http://localhost:"))
+            && base.ends_with("/v1.0");
+        if (base != "https://graph.microsoft.com/v1.0" && !local_http) || base.contains('?') {
             return Err(GraphError::InvalidBase);
         }
         Ok(Self {
             http,
-            base: base.trim_end_matches('/').to_owned(),
+            base: base.to_owned(),
             token,
             sleeper: None,
         })
@@ -469,7 +471,7 @@ impl<'a> GraphClient<'a> {
         }
     }
     fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, GraphError> {
-        let url = if path.starts_with("https://") {
+        let url = if self.is_permitted_absolute_url(path) {
             path.to_owned()
         } else {
             format!(
@@ -580,11 +582,23 @@ impl<'a> GraphClient<'a> {
     ) -> Result<Value, GraphError> {
         self.request(method, path, body)
     }
-    pub fn next_json(&self, next: &str) -> Result<Value, GraphError> {
+    fn is_permitted_absolute_url(&self, url: &str) -> bool {
         let host = self.base.split('/').nth(2).unwrap_or_default();
-        if !next.starts_with("https://") || next.split('/').nth(2) != Some(host) {
+        let required_scheme = if self.base.starts_with("https://") {
+            "https://"
+        } else {
+            "http://"
+        };
+        url.starts_with(required_scheme) && url.split('/').nth(2) == Some(host)
+    }
+    pub fn validate_next_link(&self, next: &str) -> Result<(), GraphError> {
+        if !self.is_permitted_absolute_url(next) {
             return Err(GraphError::UntrustedNextLink);
         }
+        Ok(())
+    }
+    pub fn next_json(&self, next: &str) -> Result<Value, GraphError> {
+        self.validate_next_link(next)?;
         self.get_json(next)
     }
 }
@@ -728,8 +742,11 @@ impl<'a> MailService<'a> {
             ))?,
         };
         Ok(
-            json!({"value":value["value"].clone(),"next_link":value["@odata.nextLink"].clone(),"delta_link":value["@odata.deltaLink"].clone()}),
+            json!({"content_origin":"external_email_untrusted","value":value["value"].clone(),"next_link":value["@odata.nextLink"].clone(),"delta_link":value["@odata.deltaLink"].clone()}),
         )
+    }
+    pub fn validate_delta_link(&self, link: &str) -> Result<(), GraphError> {
+        self.client.validate_next_link(link)
     }
 }
 
