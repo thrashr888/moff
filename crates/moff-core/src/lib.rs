@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -190,6 +191,19 @@ pub trait TokenVault {
     fn get(&self, profile: &str) -> Result<Option<String>, DeviceFlowError>;
     fn set(&self, profile: &str, refresh_token: &str) -> Result<(), DeviceFlowError>;
     fn delete(&self, profile: &str) -> Result<(), DeviceFlowError>;
+    fn get_delta_link(
+        &self,
+        profile: &str,
+        graph_base: &str,
+        folder: &str,
+    ) -> Result<Option<String>, DeviceFlowError>;
+    fn set_delta_link(
+        &self,
+        profile: &str,
+        graph_base: &str,
+        folder: &str,
+        delta_link: &str,
+    ) -> Result<(), DeviceFlowError>;
 }
 pub struct KeyringVault;
 impl KeyringVault {
@@ -197,6 +211,18 @@ impl KeyringVault {
         let name = ProfileStore::validate_profile_name(profile)?;
         keyring::Entry::new("moff", &format!("profile:{name}:refresh-token"))
             .map_err(|_| DeviceFlowError::Storage)
+    }
+    fn delta_entry(
+        profile: &str,
+        graph_base: &str,
+        folder: &str,
+    ) -> Result<keyring::Entry, DeviceFlowError> {
+        let name = ProfileStore::validate_profile_name(profile)?;
+        keyring::Entry::new(
+            "moff",
+            &format!("profile:{name}:delta-link:{graph_base}:{folder}"),
+        )
+        .map_err(|_| DeviceFlowError::Storage)
     }
 }
 impl TokenVault for KeyringVault {
@@ -218,30 +244,96 @@ impl TokenVault for KeyringVault {
             Err(_) => Err(DeviceFlowError::Storage),
         }
     }
+    fn get_delta_link(
+        &self,
+        profile: &str,
+        graph_base: &str,
+        folder: &str,
+    ) -> Result<Option<String>, DeviceFlowError> {
+        match Self::delta_entry(profile, graph_base, folder)?.get_password() {
+            Ok(link) => Ok(Some(link)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(_) => Err(DeviceFlowError::Storage),
+        }
+    }
+    fn set_delta_link(
+        &self,
+        profile: &str,
+        graph_base: &str,
+        folder: &str,
+        delta_link: &str,
+    ) -> Result<(), DeviceFlowError> {
+        Self::delta_entry(profile, graph_base, folder)?
+            .set_password(delta_link)
+            .map_err(|_| DeviceFlowError::Storage)
+    }
 }
 #[derive(Default)]
-pub struct InMemoryVault(Mutex<HashMap<String, String>>);
+pub struct InMemoryVault {
+    tokens: Mutex<HashMap<String, String>>,
+    delta_links: Mutex<HashMap<(String, String, String), String>>,
+}
 impl TokenVault for InMemoryVault {
     fn get(&self, profile: &str) -> Result<Option<String>, DeviceFlowError> {
         Ok(self
-            .0
+            .tokens
             .lock()
             .map_err(|_| DeviceFlowError::Storage)?
             .get(profile)
             .cloned())
     }
     fn set(&self, profile: &str, secret: &str) -> Result<(), DeviceFlowError> {
-        self.0.lock().map_err(|_| DeviceFlowError::Storage)?.insert(
-            ProfileStore::validate_profile_name(profile)?,
-            secret.to_owned(),
-        );
+        self.tokens
+            .lock()
+            .map_err(|_| DeviceFlowError::Storage)?
+            .insert(
+                ProfileStore::validate_profile_name(profile)?,
+                secret.to_owned(),
+            );
         Ok(())
     }
     fn delete(&self, profile: &str) -> Result<(), DeviceFlowError> {
-        self.0
+        self.tokens
             .lock()
             .map_err(|_| DeviceFlowError::Storage)?
             .remove(profile);
+        Ok(())
+    }
+    fn get_delta_link(
+        &self,
+        profile: &str,
+        graph_base: &str,
+        folder: &str,
+    ) -> Result<Option<String>, DeviceFlowError> {
+        Ok(self
+            .delta_links
+            .lock()
+            .map_err(|_| DeviceFlowError::Storage)?
+            .get(&(
+                ProfileStore::validate_profile_name(profile)?,
+                graph_base.to_owned(),
+                folder.to_owned(),
+            ))
+            .cloned())
+    }
+    fn set_delta_link(
+        &self,
+        profile: &str,
+        graph_base: &str,
+        folder: &str,
+        delta_link: &str,
+    ) -> Result<(), DeviceFlowError> {
+        self.delta_links
+            .lock()
+            .map_err(|_| DeviceFlowError::Storage)?
+            .insert(
+                (
+                    ProfileStore::validate_profile_name(profile)?,
+                    graph_base.to_owned(),
+                    folder.to_owned(),
+                ),
+                delta_link.to_owned(),
+            );
         Ok(())
     }
 }
@@ -281,6 +373,7 @@ pub struct GraphResponse {
     pub status: u16,
     pub body: String,
     pub request_id: Option<String>,
+    pub retry_after_seconds: Option<u64>,
 }
 impl GraphResponse {
     #[must_use]
@@ -289,7 +382,13 @@ impl GraphResponse {
             status,
             body: body.to_owned(),
             request_id: None,
+            retry_after_seconds: None,
         }
+    }
+    #[must_use]
+    pub const fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after_seconds = Some(seconds);
+        self
     }
 }
 pub trait GraphHttp {
@@ -304,6 +403,9 @@ pub enum GraphError {
         request_id: Option<String>,
     },
     Protocol,
+    UnsupportedAttachment {
+        attachment_type: String,
+    },
     Http {
         status: u16,
         request_id: Option<String>,
@@ -321,6 +423,9 @@ impl fmt::Display for GraphError {
                 request_id.as_deref().unwrap_or("unavailable")
             ),
             Self::Protocol => f.write_str("Graph returned an invalid response"),
+            Self::UnsupportedAttachment { attachment_type } => {
+                write!(f, "unsupported attachment type: {attachment_type}")
+            }
             Self::Http { status, .. } => write!(f, "Graph returned HTTP {status}"),
         }
     }
@@ -330,17 +435,38 @@ pub struct GraphClient<'a> {
     http: &'a dyn GraphHttp,
     base: String,
     token: &'a str,
+    sleeper: Option<&'a dyn Sleeper>,
 }
 impl<'a> GraphClient<'a> {
     pub fn new(http: &'a dyn GraphHttp, base: &str, token: &'a str) -> Result<Self, GraphError> {
-        if !base.starts_with("https://") || base.contains('?') {
+        let local_http =
+            base.starts_with("http://127.0.0.1:") || base.starts_with("http://localhost:");
+        if (!base.starts_with("https://") && !local_http) || base.contains('?') {
             return Err(GraphError::InvalidBase);
         }
         Ok(Self {
             http,
             base: base.trim_end_matches('/').to_owned(),
             token,
+            sleeper: None,
         })
+    }
+    pub fn new_with_sleeper(
+        http: &'a dyn GraphHttp,
+        base: &str,
+        token: &'a str,
+        sleeper: &'a dyn Sleeper,
+    ) -> Result<Self, GraphError> {
+        let mut client = Self::new(http, base, token)?;
+        client.sleeper = Some(sleeper);
+        Ok(client)
+    }
+    fn wait(&self, seconds: u64) {
+        if let Some(sleeper) = self.sleeper {
+            sleeper.sleep_seconds(seconds);
+        } else {
+            ThreadSleeper.sleep_seconds(seconds);
+        }
     }
     fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, GraphError> {
         let url = if path.starts_with("https://") {
@@ -385,6 +511,13 @@ impl<'a> GraphClient<'a> {
                     } else {
                         serde_json::from_str(&response.body).map_err(|_| GraphError::Protocol)
                     };
+                }
+                Ok(response)
+                    if method == "GET"
+                        && attempts < 3
+                        && matches!(response.status, 408 | 429 | 500 | 502 | 503 | 504) =>
+                {
+                    self.wait(response.retry_after_seconds.unwrap_or(1).min(60));
                 }
                 Ok(response) => {
                     return Err(GraphError::Http {
@@ -502,6 +635,27 @@ impl<'a> MailService<'a> {
             "/me/messages/{}/attachments?$select=id,name,size,contentType,@odata.type",
             Self::escape(id)
         ))
+    }
+    pub fn download_attachment(
+        &self,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<Vec<u8>, GraphError> {
+        let attachment = self.client.get_json(&format!(
+            "/me/messages/{}/attachments/{}",
+            Self::escape(message_id),
+            Self::escape(attachment_id)
+        ))?;
+        let attachment_type = attachment["@odata.type"].as_str().unwrap_or_default();
+        if attachment_type != "#microsoft.graph.fileAttachment" {
+            return Err(GraphError::UnsupportedAttachment {
+                attachment_type: attachment_type.to_owned(),
+            });
+        }
+        let content = attachment["contentBytes"]
+            .as_str()
+            .ok_or(GraphError::Protocol)?;
+        STANDARD.decode(content).map_err(|_| GraphError::Protocol)
     }
     pub fn mark(&self, id: &str, read: bool) -> Result<Value, GraphError> {
         self.client.mutate_json(

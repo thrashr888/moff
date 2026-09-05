@@ -5,14 +5,16 @@
 )]
 
 use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use moff_core::{
     AuthService, DeviceFlowError, ErrorCode, GraphClient, GraphError, GraphHttp, GraphRequest,
-    GraphResponse, HttpClient, HttpResponse, KeyringVault, MailService, Profile, ProfileStore,
-    ThreadSleeper, TokenVault, known_source, schema,
+    GraphResponse, HttpClient, HttpResponse, InMemoryVault, KeyringVault, MailService, Profile,
+    ProfileStore, ThreadSleeper, TokenVault, known_source, schema,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -199,7 +201,7 @@ enum AttachmentsCommand {
         #[arg(long)]
         output: String,
         #[arg(long)]
-        overwrite: bool,
+        force: bool,
     },
 }
 #[derive(Debug, Subcommand)]
@@ -273,11 +275,17 @@ impl GraphHttp for ReqwestGraph {
             .get("request-id")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
+        let retry_after_seconds = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok());
         let body = response.text().map_err(|_| GraphError::Transport)?;
         Ok(GraphResponse {
             status,
             body,
             request_id,
+            retry_after_seconds,
         })
     }
 }
@@ -310,6 +318,46 @@ fn emit_json(value: &Value, pretty: bool) -> io::Result<()> {
         serde_json::to_writer(&mut output, value)?;
     }
     writeln!(output)
+}
+
+fn write_attachment(path: &Path, bytes: &[u8], force: bool) -> Result<(), AppError> {
+    if path.exists() && !force {
+        return Err(AppError::new(
+            "output_exists",
+            "output exists; use --force with --yes",
+        ));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| AppError::new("output", "output must name a file"))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| AppError::new("output", "system clock is unavailable"))?
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        nonce
+    ));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|_| AppError::new("output", "unable to create temporary attachment file"))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|_| AppError::new("output", "unable to write attachment file"))?;
+    if path.exists() && !force {
+        let _ = fs::remove_file(&temporary);
+        return Err(AppError::new(
+            "output_exists",
+            "output exists; use --force with --yes",
+        ));
+    }
+    fs::rename(&temporary, path)
+        .map_err(|_| AppError::new("output", "unable to finalize attachment file"))
 }
 
 fn auth_data(command: AuthCommand, profile_name: String, dry_run: bool) -> Result<Value, AppError> {
@@ -409,9 +457,9 @@ fn outlook_data(
             command: AttachmentsCommand::List { .. },
         } => ("outlook.attachments.list", false),
         OutlookCommand::Attachments {
-            command: AttachmentsCommand::Download { overwrite, .. },
+            command: AttachmentsCommand::Download { force, .. },
         } => {
-            if *overwrite && !yes {
+            if *force && !yes {
                 return Err(AppError::new(
                     "confirmation_required",
                     "attachment overwrite requires --yes",
@@ -522,6 +570,10 @@ fn outlook_data(
     execute_outlook(command, profile_name)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "command execution is deliberately co-located with CLI dispatch"
+)]
 fn execute_outlook(command: OutlookCommand, profile_name: &str) -> Result<Value, AppError> {
     let store = ProfileStore::platform_default();
     let profile = store
@@ -563,11 +615,26 @@ fn execute_outlook(command: OutlookCommand, profile_name: &str) -> Result<Value,
             .build()
             .map_err(|_| AppError::new("transport", "unable to create HTTPS client"))?,
     );
-    let vault = KeyringVault;
+    let keyring_vault = KeyringVault;
+    #[cfg(debug_assertions)]
+    let test_vault = std::env::var_os("MOFF_TEST_REFRESH_TOKEN_FILE")
+        .map(|path| {
+            let refresh_token = fs::read_to_string(path)
+                .map_err(|_| AppError::new("test_vault", "unable to read test refresh token"))?;
+            let vault = InMemoryVault::default();
+            vault
+                .set(profile_name, refresh_token.trim_end())
+                .map_err(storage_error)?;
+            Ok(vault)
+        })
+        .transpose()?;
+    #[cfg(not(debug_assertions))]
+    let test_vault: Option<InMemoryVault> = None;
+    let vault: &dyn TokenVault = test_vault.as_ref().map_or(&keyring_vault, |vault| vault);
     let sleeper = ThreadSleeper;
     let entra = std::env::var("MOFF_ENTRA_BASE_URL")
         .unwrap_or_else(|_| "https://login.microsoftonline.com".to_owned());
-    let token = AuthService::new(&http, &vault, &sleeper, &entra)
+    let token = AuthService::new(&http, vault, &sleeper, &entra)
         .access_token(profile_name, &profile.client_id, &profile.tenant)
         .map_err(auth_error)?;
     let graph_http = ReqwestGraph(
@@ -575,18 +642,20 @@ fn execute_outlook(command: OutlookCommand, profile_name: &str) -> Result<Value,
             .build()
             .map_err(|_| AppError::new("transport", "unable to create HTTPS client"))?,
     );
-    let graph = GraphClient::new(
-        &graph_http,
-        "https://graph.microsoft.com/v1.0",
-        token.expose_to_graph_only(),
-    )
-    .map_err(graph_error)?;
+    let graph_base = std::env::var("MOFF_GRAPH_BASE_URL")
+        .unwrap_or_else(|_| "https://graph.microsoft.com/v1.0".to_owned());
+    let graph = GraphClient::new(&graph_http, &graph_base, token.expose_to_graph_only())
+        .map_err(graph_error)?;
     let mail = MailService::new(graph);
     let message = |to: &[String], subject: &Option<String>, body: &str, body_type: &BodyType| json!({"subject":subject,"body":{"contentType":body_type.graph(),"content":body},"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>()});
     let result = match command {
         OutlookCommand::Folders { .. } => mail.folders(),
         OutlookCommand::Attachments { command: AttachmentsCommand::List { message_id } } => mail.attachments(&message_id),
-        OutlookCommand::Attachments { command: AttachmentsCommand::Download { .. } } => return Err(AppError::new("unsupported_attachment", "attachment download requires a fileAttachment implementation")),
+        OutlookCommand::Attachments { command: AttachmentsCommand::Download { message_id, attachment_id, output, force } } => {
+            let bytes = mail.download_attachment(&message_id, &attachment_id).map_err(graph_error)?;
+            write_attachment(Path::new(&output), &bytes, force)?;
+            return Ok(json!({"output":output,"bytes":bytes.len()}));
+        }
         OutlookCommand::Mail { command: MailCommand::List { folder, limit } } => mail.list(&folder, limit),
         OutlookCommand::Mail { command: MailCommand::Search { query, limit } } => mail.search(&query, limit),
         OutlookCommand::Mail { command: MailCommand::Get { id } } => mail.get(&id),
@@ -601,7 +670,18 @@ fn execute_outlook(command: OutlookCommand, profile_name: &str) -> Result<Value,
         OutlookCommand::Mail { command: MailCommand::Reply { id, comment, body, .. } } => mail.reply(&id, json!({"comment":comment.or(body)}), false).map(|_| json!({"accepted":true})),
         OutlookCommand::Mail { command: MailCommand::ReplyAll { id, comment, .. } } => mail.reply(&id, json!({"comment":comment}), true).map(|_| json!({"accepted":true})),
         OutlookCommand::Mail { command: MailCommand::Forward { id, to, comment, .. } } => mail.forward(&id, json!({"comment":comment,"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>() })).map(|_| json!({"accepted":true})),
-        OutlookCommand::Mail { command: MailCommand::Sync { folder } } => mail.delta(&folder, None),
+        OutlookCommand::Mail { command: MailCommand::Sync { folder } } => {
+            let continuation = vault
+                .get_delta_link(profile_name, &graph_base, &folder)
+                .map_err(storage_error)?;
+            let delta = mail.delta(&folder, continuation.as_deref()).map_err(graph_error)?;
+            if let Some(link) = delta["delta_link"].as_str() {
+                vault
+                    .set_delta_link(profile_name, &graph_base, &folder, link)
+                    .map_err(storage_error)?;
+            }
+            return Ok(delta);
+        }
     };
     result.map_err(graph_error)
 }
@@ -609,6 +689,8 @@ fn graph_error(error: GraphError) -> AppError {
     AppError::new(
         if matches!(error, GraphError::OutcomeUnknown { .. }) {
             "outcome_unknown"
+        } else if matches!(error, GraphError::UnsupportedAttachment { .. }) {
+            "unsupported_attachment"
         } else {
             "graph"
         },

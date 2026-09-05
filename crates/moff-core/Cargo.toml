@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Core contracts for the Moff agent-first CLI"
 
 [dependencies]
+base64 = "0.22.1"
 directories = "6.0.0"
 keyring = { version = "3.6.3", features = ["apple-native", "linux-native", "windows-native"] }
 serde = { version = "1.0.228", features = ["derive"] }

@@ -1,3 +1,9 @@
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
@@ -188,6 +194,72 @@ fn persisted_profile_preflights_typed_scope_before_touching_keychain_or_graph() 
         .stderr(contains("consent_required"))
         .stderr(contains("Mail.Send"));
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn persisted_profile_refreshes_through_local_http_then_calls_graph_without_leaking_tokens() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&requests);
+    let server = thread::spawn(move || -> Result<(), String> {
+        for _ in 0..2 {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err("timed out waiting for CLI request".to_owned());
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            };
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_string();
+            seen.lock().unwrap().push(request.clone());
+            let body = if request.starts_with("POST /common/oauth2/v2.0/token") {
+                r#"{"access_token":"access-secret","expires_in":3600}"#
+            } else {
+                r#"{"value":[]}"#
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        }
+        Ok(())
+    });
+    let root = std::env::temp_dir().join(format!("moff-cli-http-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("profiles")).unwrap();
+    std::fs::write(root.join("profiles/work.json"), r#"{"name":"work","client_id":"11111111-1111-1111-1111-111111111111","tenant":"common","scopes":["Mail.Read"],"account_display_name":null}"#).unwrap();
+    let refresh_token = root.join("refresh-token");
+    std::fs::write(&refresh_token, "refresh-secret").unwrap();
+    let output = moff()
+        .env("MOFF_DATA_DIR", &root)
+        .env("MOFF_ENTRA_BASE_URL", format!("http://{address}"))
+        .env("MOFF_GRAPH_BASE_URL", format!("http://{address}/v1.0"))
+        .env("MOFF_TEST_REFRESH_TOKEN_FILE", &refresh_token)
+        .args(["--profile", "work", "outlook", "mail", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    std::fs::remove_dir_all(root).unwrap();
+    server.join().unwrap().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!format!("{stdout}{stderr}").contains("refresh-secret"));
+    assert!(!format!("{stdout}{stderr}").contains("access-secret"));
+    let requests = requests.lock().unwrap();
+    assert!(requests[0].contains("grant_type=refresh_token"));
+    assert!(requests[1].starts_with("GET /v1.0/me/mailFolders/inbox/messages"));
+    assert!(requests[1].lines().any(|line| {
+        line.to_ascii_lowercase()
+            .starts_with("authorization: bearer ")
+    }));
+    assert!(!requests[1].contains("***"));
 }
 
 #[test]
