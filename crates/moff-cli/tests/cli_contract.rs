@@ -71,13 +71,13 @@ fn incompatible_json_and_pretty_modes_fail_with_a_typed_code() {
         .stderr(contains("incompatible_output_modes"));
 }
 #[test]
-fn unknown_outlook_source_fails_with_a_typed_code() {
+fn unknown_outlook_subcommand_fails_at_the_cli_boundary() {
     moff()
         .args(["outlook", "unknown"])
         .assert()
         .failure()
         .code(2)
-        .stderr(contains("unknown_source"));
+        .stderr(contains("unrecognized subcommand"));
 }
 #[test]
 fn schema_filters_to_the_requested_source() {
@@ -85,6 +85,30 @@ fn schema_filters_to_the_requested_source() {
     assert_eq!(value["schema"], "moff.schema/v1");
     assert_eq!(value["commands"].as_object().expect("command map").len(), 1);
     assert!(value["commands"]["outlook"].is_object());
+}
+
+#[test]
+fn outlook_mail_commands_expose_guarded_dry_run_and_send_confirmation() {
+    let value = json_stdout(&["--dry-run", "outlook", "mail", "list", "--folder", "inbox"]);
+    assert_eq!(value["command"], "outlook.mail.list");
+    moff()
+        .args([
+            "outlook",
+            "mail",
+            "send",
+            "--to",
+            "a@example.test",
+            "--body",
+            "hello",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("confirm-send"));
+    moff()
+        .args(["outlook", "mail", "delete", "id"])
+        .assert()
+        .failure()
+        .stderr(contains("--yes"));
 }
 
 #[test]

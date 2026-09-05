@@ -47,7 +47,7 @@ const COMMANDS: [(&str, CommandDefinition); 4] = [
     (
         "outlook",
         CommandDefinition {
-            summary: "Outlook command scaffolding (no provider calls)",
+            summary: "Microsoft Graph v1.0 Outlook Mail provider",
             source: Some("outlook"),
         },
     ),
@@ -265,6 +265,157 @@ pub struct ThreadSleeper;
 impl Sleeper for ThreadSleeper {
     fn sleep_seconds(&self, seconds: u64) {
         std::thread::sleep(std::time::Duration::from_secs(seconds));
+    }
+}
+
+/// Deterministic transport boundary for Microsoft Graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: BTreeMap<String, String>,
+    pub body: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphResponse {
+    pub status: u16,
+    pub body: String,
+    pub request_id: Option<String>,
+}
+impl GraphResponse {
+    #[must_use]
+    pub fn json(status: u16, body: &str) -> Self {
+        Self {
+            status,
+            body: body.to_owned(),
+            request_id: None,
+        }
+    }
+}
+pub trait GraphHttp {
+    fn request(&self, request: GraphRequest) -> Result<GraphResponse, GraphError>;
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphError {
+    InvalidBase,
+    UntrustedNextLink,
+    Transport,
+    OutcomeUnknown {
+        request_id: Option<String>,
+    },
+    Protocol,
+    Http {
+        status: u16,
+        request_id: Option<String>,
+    },
+}
+impl fmt::Display for GraphError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBase => f.write_str("invalid Graph base URL"),
+            Self::UntrustedNextLink => f.write_str("Graph next link has an untrusted host"),
+            Self::Transport => f.write_str("Graph request failed"),
+            Self::OutcomeUnknown { request_id } => write!(
+                f,
+                "mutation outcome is unknown (request id: {})",
+                request_id.as_deref().unwrap_or("unavailable")
+            ),
+            Self::Protocol => f.write_str("Graph returned an invalid response"),
+            Self::Http { status, .. } => write!(f, "Graph returned HTTP {status}"),
+        }
+    }
+}
+impl std::error::Error for GraphError {}
+pub struct GraphClient<'a> {
+    http: &'a dyn GraphHttp,
+    base: String,
+    token: &'a str,
+}
+impl<'a> GraphClient<'a> {
+    pub fn new(http: &'a dyn GraphHttp, base: &str, token: &'a str) -> Result<Self, GraphError> {
+        if !base.starts_with("https://") || base.contains('?') {
+            return Err(GraphError::InvalidBase);
+        }
+        Ok(Self {
+            http,
+            base: base.trim_end_matches('/').to_owned(),
+            token,
+        })
+    }
+    fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, GraphError> {
+        let url = if path.starts_with("https://") {
+            path.to_owned()
+        } else {
+            format!(
+                "{}{}",
+                self.base,
+                if path.starts_with('/') {
+                    path.to_owned()
+                } else {
+                    format!("/{path}")
+                }
+            )
+        };
+        let mut headers = BTreeMap::from([
+            ("Authorization".to_owned(), format!("Bearer {}", self.token)),
+            ("Accept".to_owned(), "application/json".to_owned()),
+        ]);
+        if url.contains("/messages") || url.contains("/attachments") {
+            headers.insert("Prefer".to_owned(), "IdType=\"ImmutableId\"".to_owned());
+        }
+        let encoded = body
+            .map(|value| serde_json::to_string(&value).map_err(|_| GraphError::Protocol))
+            .transpose()?;
+        if encoded.is_some() {
+            headers.insert("Content-Type".to_owned(), "application/json".to_owned());
+        }
+        let req = GraphRequest {
+            method: method.to_owned(),
+            url,
+            headers,
+            body: encoded,
+        };
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match self.http.request(req.clone()) {
+                Ok(response) if (200..300).contains(&response.status) => {
+                    return serde_json::from_str(&response.body).map_err(|_| GraphError::Protocol);
+                }
+                Ok(response) => {
+                    return Err(GraphError::Http {
+                        status: response.status,
+                        request_id: response.request_id,
+                    });
+                }
+                Err(GraphError::Transport) if method == "GET" && attempts < 3 => {}
+                Err(GraphError::Transport) if method != "GET" => {
+                    return Err(GraphError::OutcomeUnknown { request_id: None });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    pub fn get_json(&self, path: &str) -> Result<Value, GraphError> {
+        self.request("GET", path, None)
+    }
+    pub fn post_json(&self, path: &str, body: Value) -> Result<Value, GraphError> {
+        self.request("POST", path, Some(body))
+    }
+    pub fn mutate_json(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, GraphError> {
+        self.request(method, path, body)
+    }
+    pub fn next_json(&self, next: &str) -> Result<Value, GraphError> {
+        let host = self.base.split('/').nth(2).unwrap_or_default();
+        if !next.starts_with("https://") || next.split('/').nth(2) != Some(host) {
+            return Err(GraphError::UntrustedNextLink);
+        }
+        self.get_json(next)
     }
 }
 

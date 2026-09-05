@@ -10,8 +10,9 @@ use std::process::ExitCode;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use moff_core::{
-    AuthService, DeviceFlowError, ErrorCode, HttpClient, HttpResponse, KeyringVault, Profile,
-    ProfileStore, ThreadSleeper, TokenVault, known_source, schema,
+    AuthService, DeviceFlowError, ErrorCode, GraphError, GraphHttp, GraphRequest, GraphResponse,
+    HttpClient, HttpResponse, KeyringVault, Profile, ProfileStore, ThreadSleeper, TokenVault,
+    known_source, schema,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -52,7 +53,153 @@ enum Command {
         source: Option<String>,
     },
     Outlook {
-        source: Option<String>,
+        #[command(subcommand)]
+        command: OutlookCommand,
+    },
+}
+#[derive(Debug, Subcommand)]
+enum OutlookCommand {
+    Folders {
+        #[command(subcommand)]
+        command: FoldersCommand,
+    },
+    Mail {
+        #[command(subcommand)]
+        command: MailCommand,
+    },
+    Attachments {
+        #[command(subcommand)]
+        command: AttachmentsCommand,
+    },
+}
+#[derive(Debug, Subcommand)]
+enum FoldersCommand {
+    List,
+}
+#[derive(Debug, Subcommand)]
+enum MailCommand {
+    List {
+        #[arg(long, default_value = "inbox")]
+        folder: String,
+        #[arg(long, default_value_t = 25)]
+        limit: u16,
+    },
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 25)]
+        limit: u16,
+    },
+    Get {
+        id: String,
+    },
+    Mark {
+        id: String,
+        #[arg(long)]
+        read: bool,
+    },
+    Move {
+        id: String,
+        folder: String,
+    },
+    Copy {
+        id: String,
+        folder: String,
+    },
+    Delete {
+        id: String,
+    },
+    DraftCreate {
+        #[arg(long)]
+        to: Vec<String>,
+        #[arg(long)]
+        subject: Option<String>,
+        #[arg(long)]
+        body: String,
+        #[arg(long, value_enum, default_value_t = BodyType::Text)]
+        body_type: BodyType,
+    },
+    DraftUpdate {
+        id: String,
+        #[arg(long)]
+        subject: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long, value_enum, default_value_t = BodyType::Text)]
+        body_type: BodyType,
+    },
+    Send {
+        #[arg(long)]
+        to: Vec<String>,
+        #[arg(long)]
+        subject: Option<String>,
+        #[arg(long)]
+        body: String,
+        #[arg(long)]
+        confirm_send: bool,
+        #[arg(long, value_enum, default_value_t = BodyType::Text)]
+        body_type: BodyType,
+    },
+    SendDraft {
+        id: String,
+        #[arg(long)]
+        confirm_send: bool,
+    },
+    Reply {
+        id: String,
+        #[arg(long)]
+        comment: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        confirm_send: bool,
+    },
+    ReplyAll {
+        id: String,
+        #[arg(long)]
+        comment: Option<String>,
+        #[arg(long)]
+        confirm_send: bool,
+    },
+    Forward {
+        id: String,
+        #[arg(long)]
+        to: Vec<String>,
+        #[arg(long)]
+        comment: Option<String>,
+        #[arg(long)]
+        confirm_send: bool,
+    },
+    Sync {
+        #[arg(long, default_value = "inbox")]
+        folder: String,
+    },
+}
+#[derive(Clone, Debug, ValueEnum)]
+enum BodyType {
+    Text,
+    Html,
+}
+#[allow(dead_code)]
+impl BodyType {
+    const fn graph(&self) -> &'static str {
+        match self {
+            Self::Text => "Text",
+            Self::Html => "HTML",
+        }
+    }
+}
+#[derive(Debug, Subcommand)]
+enum AttachmentsCommand {
+    List {
+        message_id: String,
+    },
+    Download {
+        message_id: String,
+        attachment_id: String,
+        #[arg(long)]
+        output: String,
+        #[arg(long)]
+        overwrite: bool,
     },
 }
 #[derive(Debug, Subcommand)]
@@ -103,6 +250,35 @@ impl HttpClient for ReqwestHttp {
         let status = response.status().as_u16();
         let body = response.text().map_err(|_| DeviceFlowError::Transport)?;
         Ok(HttpResponse { status, body })
+    }
+}
+
+#[allow(dead_code)]
+struct ReqwestGraph(reqwest::blocking::Client);
+impl GraphHttp for ReqwestGraph {
+    fn request(&self, request: GraphRequest) -> Result<GraphResponse, GraphError> {
+        let method = reqwest::Method::from_bytes(request.method.as_bytes())
+            .map_err(|_| GraphError::Protocol)?;
+        let mut call = self.0.request(method, &request.url);
+        for (name, value) in request.headers {
+            call = call.header(name, value);
+        }
+        if let Some(body) = request.body {
+            call = call.body(body);
+        }
+        let response = call.send().map_err(|_| GraphError::Transport)?;
+        let status = response.status().as_u16();
+        let request_id = response
+            .headers()
+            .get("request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let body = response.text().map_err(|_| GraphError::Transport)?;
+        Ok(GraphResponse {
+            status,
+            body,
+            request_id,
+        })
     }
 }
 
@@ -215,10 +391,151 @@ fn storage_error(error: DeviceFlowError) -> AppError {
 fn auth_error(error: DeviceFlowError) -> AppError {
     AppError::new("authentication", error.to_string())
 }
+#[allow(
+    clippy::too_many_lines,
+    reason = "command policy is deliberately co-located"
+)]
+fn outlook_data(
+    command: OutlookCommand,
+    dry_run: bool,
+    yes: bool,
+    _profile_name: &str,
+) -> Result<Value, AppError> {
+    let (name, mutation) = match &command {
+        OutlookCommand::Folders {
+            command: FoldersCommand::List,
+        } => ("outlook.folders.list", false),
+        OutlookCommand::Attachments {
+            command: AttachmentsCommand::List { .. },
+        } => ("outlook.attachments.list", false),
+        OutlookCommand::Attachments {
+            command: AttachmentsCommand::Download { overwrite, .. },
+        } => {
+            if *overwrite && !yes {
+                return Err(AppError::new(
+                    "confirmation_required",
+                    "attachment overwrite requires --yes",
+                ));
+            }
+            ("outlook.attachments.download", false)
+        }
+        OutlookCommand::Mail {
+            command: MailCommand::List { limit, .. } | MailCommand::Search { limit, .. },
+        } => {
+            if *limit > 1000 {
+                return Err(AppError::new(
+                    "invalid_limit",
+                    "result limit must be <= 1000",
+                ));
+            }
+            (
+                if matches!(
+                    &command,
+                    OutlookCommand::Mail {
+                        command: MailCommand::Search { .. }
+                    }
+                ) {
+                    "outlook.mail.search"
+                } else {
+                    "outlook.mail.list"
+                },
+                false,
+            )
+        }
+        OutlookCommand::Mail {
+            command: MailCommand::Get { .. },
+        } => ("outlook.mail.get", false),
+        OutlookCommand::Mail {
+            command: MailCommand::Sync { .. },
+        } => ("outlook.mail.sync", false),
+        OutlookCommand::Mail {
+            command: MailCommand::Delete { .. },
+        } => {
+            if !yes {
+                return Err(AppError::new(
+                    "confirmation_required",
+                    "soft delete requires --yes",
+                ));
+            }
+            ("outlook.mail.delete", true)
+        }
+        OutlookCommand::Mail {
+            command:
+                MailCommand::Send { confirm_send, .. }
+                | MailCommand::SendDraft { confirm_send, .. }
+                | MailCommand::Reply { confirm_send, .. }
+                | MailCommand::ReplyAll { confirm_send, .. }
+                | MailCommand::Forward { confirm_send, .. },
+        } => {
+            if !confirm_send {
+                return Err(AppError::new(
+                    "confirmation_required",
+                    "sending mail requires --confirm-send",
+                ));
+            }
+            if let OutlookCommand::Mail {
+                command: MailCommand::Reply { comment, body, .. },
+            } = &command
+                && comment.is_some() == body.is_some()
+            {
+                return Err(AppError::new(
+                    "invalid_reply",
+                    "reply requires exactly one of --comment or --body",
+                ));
+            }
+            let name = match &command {
+                OutlookCommand::Mail {
+                    command: MailCommand::Send { .. },
+                } => "outlook.mail.send",
+                OutlookCommand::Mail {
+                    command: MailCommand::SendDraft { .. },
+                } => "outlook.mail.send-draft",
+                OutlookCommand::Mail {
+                    command: MailCommand::Reply { .. },
+                } => "outlook.mail.reply",
+                OutlookCommand::Mail {
+                    command: MailCommand::ReplyAll { .. },
+                } => "outlook.mail.reply-all",
+                _ => "outlook.mail.forward",
+            };
+            (name, true)
+        }
+        OutlookCommand::Mail {
+            command: MailCommand::Mark { .. },
+        } => ("outlook.mail.mark", true),
+        OutlookCommand::Mail {
+            command: MailCommand::Move { .. },
+        } => ("outlook.mail.move", true),
+        OutlookCommand::Mail {
+            command: MailCommand::Copy { .. },
+        } => ("outlook.mail.copy", true),
+        OutlookCommand::Mail {
+            command: MailCommand::DraftCreate { .. },
+        } => ("outlook.mail.draft-create", true),
+        OutlookCommand::Mail {
+            command: MailCommand::DraftUpdate { .. },
+        } => ("outlook.mail.draft-update", true),
+    };
+    if dry_run {
+        return Ok(json!({"command":name,"dry_run":true,"network_mutation":false}));
+    }
+    if mutation {
+        return Err(AppError::new(
+            "authentication",
+            "configure an authenticated profile before Graph mutations",
+        ));
+    }
+    Err(AppError::new(
+        "authentication",
+        "configure an authenticated profile before Graph reads",
+    ))
+}
+
 fn command_data(
     command: Option<Command>,
     profile: String,
     dry_run: bool,
+    yes: bool,
 ) -> Result<Value, AppError> {
     match command {
         None => Ok(json!({"command":"root","status":"scaffold"})),
@@ -237,17 +554,7 @@ fn command_data(
             }
             Ok(schema(source.as_deref()))
         }
-        Some(Command::Outlook { source }) => {
-            if let Some(value) = source.as_deref()
-                && !known_source(value)
-            {
-                return Err(AppError::new(
-                    ErrorCode::UnknownSource.as_str(),
-                    format!("unknown source: {value}"),
-                ));
-            }
-            Ok(json!({"command":"outlook","status":"scaffold"}))
-        }
+        Some(Command::Outlook { command }) => outlook_data(command, dry_run, yes, &profile),
     }
 }
 fn run(cli: Cli) -> Result<(), AppError> {
@@ -258,7 +565,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
         ));
     }
     let profile = profile_name(cli.profile)?;
-    let data = command_data(cli.command, profile, cli.dry_run)?;
+    let data = command_data(cli.command, profile, cli.dry_run, cli.yes)?;
     let response = if cli.envelope {
         json!({"ok":true,"data":data,"warnings":[],"request_id":"moff-local"})
     } else {
