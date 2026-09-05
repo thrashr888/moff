@@ -503,6 +503,7 @@ fn outlook_data(
     dry_run: bool,
     yes: bool,
     profile_name: &str,
+    vault: &dyn TokenVault,
 ) -> Result<Value, AppError> {
     let (name, _mutation) = match &command {
         OutlookCommand::Folders {
@@ -622,14 +623,18 @@ fn outlook_data(
     if dry_run {
         return Ok(json!({"command":name,"dry_run":true,"network_mutation":false}));
     }
-    execute_outlook(command, profile_name)
+    execute_outlook(command, profile_name, vault)
 }
 
 #[allow(
     clippy::too_many_lines,
     reason = "command execution is deliberately co-located with CLI dispatch"
 )]
-fn execute_outlook(command: OutlookCommand, profile_name: &str) -> Result<Value, AppError> {
+fn execute_outlook(
+    command: OutlookCommand,
+    profile_name: &str,
+    vault: &dyn TokenVault,
+) -> Result<Value, AppError> {
     let store = ProfileStore::platform_default();
     let profile = store
         .load(profile_name)
@@ -670,8 +675,6 @@ fn execute_outlook(command: OutlookCommand, profile_name: &str) -> Result<Value,
             .build()
             .map_err(|_| AppError::new("transport", "unable to create HTTPS client"))?,
     );
-    let keyring_vault = KeyringVault;
-    let vault: &dyn TokenVault = &keyring_vault;
     let sleeper = ThreadSleeper;
     let entra = std::env::var("MOFF_ENTRA_BASE_URL")
         .unwrap_or_else(|_| "https://login.microsoftonline.com".to_owned());
@@ -735,6 +738,7 @@ fn command_data(
     profile: String,
     dry_run: bool,
     yes: bool,
+    vault: &dyn TokenVault,
 ) -> Result<Value, AppError> {
     match command {
         None => Ok(json!({"command":"root","status":"scaffold"})),
@@ -753,10 +757,10 @@ fn command_data(
             }
             Ok(schema(source.as_deref()))
         }
-        Some(Command::Outlook { command }) => outlook_data(command, dry_run, yes, &profile),
+        Some(Command::Outlook { command }) => outlook_data(command, dry_run, yes, &profile, vault),
     }
 }
-fn run(cli: Cli) -> Result<(), AppError> {
+fn run(cli: Cli, vault: &dyn TokenVault) -> Result<(), AppError> {
     if cli.json && cli.pretty {
         return Err(AppError::new(
             ErrorCode::IncompatibleOutputModes.as_str(),
@@ -764,7 +768,7 @@ fn run(cli: Cli) -> Result<(), AppError> {
         ));
     }
     let profile = profile_name(cli.profile)?;
-    let data = command_data(cli.command, profile, cli.dry_run, cli.yes)?;
+    let data = command_data(cli.command, profile, cli.dry_run, cli.yes, vault)?;
     let response = if cli.envelope {
         json!({"ok":true,"data":data,"warnings":[],"request_id":"moff-local"})
     } else {
@@ -773,11 +777,11 @@ fn run(cli: Cli) -> Result<(), AppError> {
     emit_json(&response, cli.pretty).expect("stdout is writable");
     Ok(())
 }
-fn main() -> ExitCode {
+pub(crate) fn main_with_vault(vault: &dyn TokenVault) -> ExitCode {
     let cli = Cli::parse();
     let envelope = cli.envelope;
     let pretty = cli.pretty;
-    match run(cli) {
+    match run(cli, vault) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("moff: [{}] {}", error.code, error.message);
@@ -788,6 +792,14 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+#[allow(
+    dead_code,
+    reason = "the integration-only helper calls main_with_vault directly"
+)]
+fn main() -> ExitCode {
+    main_with_vault(&KeyringVault)
 }
 
 #[cfg(test)]

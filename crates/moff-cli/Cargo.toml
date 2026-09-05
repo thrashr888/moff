@@ -11,6 +11,14 @@ description = "Moff agent-first command line interface"
 name = "moff"
 path = "src/main.rs"
 
+[[bin]]
+name = "moff-test"
+path = "src/bin/moff-test.rs"
+required-features = ["test-support"]
+
+[features]
+test-support = []
+
 [dependencies]
 clap = { version = "4.5.48", features = ["derive"] }
 moff-core = { path = "../moff-core", version = "0.1.0" }
