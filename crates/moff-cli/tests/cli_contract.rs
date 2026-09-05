@@ -162,3 +162,56 @@ fn status_logout_and_doctor_are_prompt_free_and_safe() {
         );
     }
 }
+
+#[test]
+fn persisted_profile_preflights_typed_scope_before_touching_keychain_or_graph() {
+    let root = std::env::temp_dir().join(format!("moff-cli-contract-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("profiles")).unwrap();
+    std::fs::write(root.join("profiles/work.json"), r#"{"name":"work","client_id":"11111111-1111-1111-1111-111111111111","tenant":"common","scopes":["Mail.Read"],"account_display_name":null}"#).unwrap();
+    moff()
+        .env("MOFF_DATA_DIR", &root)
+        .args([
+            "--profile",
+            "work",
+            "outlook",
+            "mail",
+            "send",
+            "--to",
+            "a@example.test",
+            "--body",
+            "hello",
+            "--confirm-send",
+        ])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("consent_required"))
+        .stderr(contains("Mail.Send"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dry_run_dispatches_list_get_and_send_without_credentials_or_mutation() {
+    for args in [
+        ["--dry-run", "outlook", "mail", "list"].as_slice(),
+        ["--dry-run", "outlook", "mail", "get", "id"].as_slice(),
+        [
+            "--dry-run",
+            "outlook",
+            "mail",
+            "send",
+            "--to",
+            "a@example.test",
+            "--body",
+            "hello",
+            "--confirm-send",
+        ]
+        .as_slice(),
+    ] {
+        moff()
+            .args(args)
+            .assert()
+            .success()
+            .stdout(contains("network_mutation").and(contains("false")));
+    }
+}

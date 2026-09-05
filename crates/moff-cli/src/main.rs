@@ -10,9 +10,9 @@ use std::process::ExitCode;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use moff_core::{
-    AuthService, DeviceFlowError, ErrorCode, GraphError, GraphHttp, GraphRequest, GraphResponse,
-    HttpClient, HttpResponse, KeyringVault, Profile, ProfileStore, ThreadSleeper, TokenVault,
-    known_source, schema,
+    AuthService, DeviceFlowError, ErrorCode, GraphClient, GraphError, GraphHttp, GraphRequest,
+    GraphResponse, HttpClient, HttpResponse, KeyringVault, MailService, Profile, ProfileStore,
+    ThreadSleeper, TokenVault, known_source, schema,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -399,9 +399,9 @@ fn outlook_data(
     command: OutlookCommand,
     dry_run: bool,
     yes: bool,
-    _profile_name: &str,
+    profile_name: &str,
 ) -> Result<Value, AppError> {
-    let (name, mutation) = match &command {
+    let (name, _mutation) = match &command {
         OutlookCommand::Folders {
             command: FoldersCommand::List,
         } => ("outlook.folders.list", false),
@@ -519,16 +519,101 @@ fn outlook_data(
     if dry_run {
         return Ok(json!({"command":name,"dry_run":true,"network_mutation":false}));
     }
-    if mutation {
+    execute_outlook(command, profile_name)
+}
+
+fn execute_outlook(command: OutlookCommand, profile_name: &str) -> Result<Value, AppError> {
+    let store = ProfileStore::platform_default();
+    let profile = store
+        .load(profile_name)
+        .map_err(storage_error)?
+        .ok_or_else(|| AppError::new("authentication", "no credentials: run auth login first"))?;
+    let required = match &command {
+        OutlookCommand::Folders { .. }
+        | OutlookCommand::Attachments { .. }
+        | OutlookCommand::Mail {
+            command:
+                MailCommand::List { .. }
+                | MailCommand::Search { .. }
+                | MailCommand::Get { .. }
+                | MailCommand::Sync { .. },
+        } => "Mail.Read",
+        OutlookCommand::Mail {
+            command:
+                MailCommand::Send { .. }
+                | MailCommand::SendDraft { .. }
+                | MailCommand::Reply { .. }
+                | MailCommand::ReplyAll { .. }
+                | MailCommand::Forward { .. },
+        } => "Mail.Send",
+        OutlookCommand::Mail { .. } => "Mail.ReadWrite",
+    };
+    if !profile
+        .scopes
+        .iter()
+        .any(|scope| scope == required || (required == "Mail.Read" && scope == "Mail.ReadWrite"))
+    {
         return Err(AppError::new(
-            "authentication",
-            "configure an authenticated profile before Graph mutations",
+            "consent_required",
+            format!("typed consent requirement: {required}"),
         ));
     }
-    Err(AppError::new(
-        "authentication",
-        "configure an authenticated profile before Graph reads",
-    ))
+    let http = ReqwestHttp(
+        reqwest::blocking::Client::builder()
+            .build()
+            .map_err(|_| AppError::new("transport", "unable to create HTTPS client"))?,
+    );
+    let vault = KeyringVault;
+    let sleeper = ThreadSleeper;
+    let entra = std::env::var("MOFF_ENTRA_BASE_URL")
+        .unwrap_or_else(|_| "https://login.microsoftonline.com".to_owned());
+    let token = AuthService::new(&http, &vault, &sleeper, &entra)
+        .access_token(profile_name, &profile.client_id, &profile.tenant)
+        .map_err(auth_error)?;
+    let graph_http = ReqwestGraph(
+        reqwest::blocking::Client::builder()
+            .build()
+            .map_err(|_| AppError::new("transport", "unable to create HTTPS client"))?,
+    );
+    let graph = GraphClient::new(
+        &graph_http,
+        "https://graph.microsoft.com/v1.0",
+        token.expose_to_graph_only(),
+    )
+    .map_err(graph_error)?;
+    let mail = MailService::new(graph);
+    let message = |to: &[String], subject: &Option<String>, body: &str, body_type: &BodyType| json!({"subject":subject,"body":{"contentType":body_type.graph(),"content":body},"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>()});
+    let result = match command {
+        OutlookCommand::Folders { .. } => mail.folders(),
+        OutlookCommand::Attachments { command: AttachmentsCommand::List { message_id } } => mail.attachments(&message_id),
+        OutlookCommand::Attachments { command: AttachmentsCommand::Download { .. } } => return Err(AppError::new("unsupported_attachment", "attachment download requires a fileAttachment implementation")),
+        OutlookCommand::Mail { command: MailCommand::List { folder, limit } } => mail.list(&folder, limit),
+        OutlookCommand::Mail { command: MailCommand::Search { query, limit } } => mail.search(&query, limit),
+        OutlookCommand::Mail { command: MailCommand::Get { id } } => mail.get(&id),
+        OutlookCommand::Mail { command: MailCommand::Mark { id, read } } => mail.mark(&id, read),
+        OutlookCommand::Mail { command: MailCommand::Move { id, folder } } => mail.move_message(&id, &folder),
+        OutlookCommand::Mail { command: MailCommand::Copy { id, folder } } => mail.copy_message(&id, &folder),
+        OutlookCommand::Mail { command: MailCommand::Delete { id } } => mail.soft_delete(&id),
+        OutlookCommand::Mail { command: MailCommand::DraftCreate { to, subject, body, body_type } } => mail.draft_create(message(&to, &subject, &body, &body_type)),
+        OutlookCommand::Mail { command: MailCommand::DraftUpdate { id, subject, body, body_type } } => mail.draft_update(&id, json!({"subject":subject,"body":body.map(|content| json!({"contentType":body_type.graph(),"content":content}))})),
+        OutlookCommand::Mail { command: MailCommand::Send { to, subject, body, body_type, .. } } => mail.send(&message(&to, &subject, &body, &body_type)),
+        OutlookCommand::Mail { command: MailCommand::SendDraft { id, .. } } => mail.send_draft(&id).map(|_| json!({"accepted":true})),
+        OutlookCommand::Mail { command: MailCommand::Reply { id, comment, body, .. } } => mail.reply(&id, json!({"comment":comment.or(body)}), false).map(|_| json!({"accepted":true})),
+        OutlookCommand::Mail { command: MailCommand::ReplyAll { id, comment, .. } } => mail.reply(&id, json!({"comment":comment}), true).map(|_| json!({"accepted":true})),
+        OutlookCommand::Mail { command: MailCommand::Forward { id, to, comment, .. } } => mail.forward(&id, json!({"comment":comment,"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>() })).map(|_| json!({"accepted":true})),
+        OutlookCommand::Mail { command: MailCommand::Sync { folder } } => mail.delta(&folder, None),
+    };
+    result.map_err(graph_error)
+}
+fn graph_error(error: GraphError) -> AppError {
+    AppError::new(
+        if matches!(error, GraphError::OutcomeUnknown { .. }) {
+            "outcome_unknown"
+        } else {
+            "graph"
+        },
+        error.to_string(),
+    )
 }
 
 fn command_data(

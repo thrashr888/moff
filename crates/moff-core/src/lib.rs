@@ -380,7 +380,11 @@ impl<'a> GraphClient<'a> {
             attempts += 1;
             match self.http.request(req.clone()) {
                 Ok(response) if (200..300).contains(&response.status) => {
-                    return serde_json::from_str(&response.body).map_err(|_| GraphError::Protocol);
+                    return if response.body.is_empty() {
+                        Ok(json!({}))
+                    } else {
+                        serde_json::from_str(&response.body).map_err(|_| GraphError::Protocol)
+                    };
                 }
                 Ok(response) => {
                     return Err(GraphError::Http {
@@ -402,6 +406,39 @@ impl<'a> GraphClient<'a> {
     pub fn post_json(&self, path: &str, body: Value) -> Result<Value, GraphError> {
         self.request("POST", path, Some(body))
     }
+    pub fn post_empty(&self, path: &str) -> Result<Value, GraphError> {
+        let url = format!(
+            "{}{}",
+            self.base,
+            if path.starts_with('/') {
+                path.to_owned()
+            } else {
+                format!("/{path}")
+            }
+        );
+        let mut headers = BTreeMap::from([
+            ("Authorization".to_owned(), format!("Bearer {}", self.token)),
+            ("Accept".to_owned(), "application/json".to_owned()),
+            ("Content-Length".to_owned(), "0".to_owned()),
+        ]);
+        if url.contains("/messages/") {
+            headers.insert("Prefer".to_owned(), "IdType=\"ImmutableId\"".to_owned());
+        }
+        match self.http.request(GraphRequest {
+            method: "POST".to_owned(),
+            url,
+            headers,
+            body: Some(String::new()),
+        }) {
+            Ok(response) if (200..300).contains(&response.status) => Ok(json!({})),
+            Ok(response) => Err(GraphError::Http {
+                status: response.status,
+                request_id: response.request_id,
+            }),
+            Err(GraphError::Transport) => Err(GraphError::OutcomeUnknown { request_id: None }),
+            Err(error) => Err(error),
+        }
+    }
     pub fn mutate_json(
         &self,
         method: &str,
@@ -416,6 +453,129 @@ impl<'a> GraphClient<'a> {
             return Err(GraphError::UntrustedNextLink);
         }
         self.get_json(next)
+    }
+}
+
+/// Graph Mail routes with deterministic, injectable HTTP transport.
+pub struct MailService<'a> {
+    client: GraphClient<'a>,
+}
+impl<'a> MailService<'a> {
+    #[must_use]
+    pub fn new(client: GraphClient<'a>) -> Self {
+        Self { client }
+    }
+    fn escape(value: &str) -> String {
+        value
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    char::from(b).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+    fn messages(result: &Value) -> Value {
+        json!({"content_origin":"external_email_untrusted","value":result["value"].clone(),"next_link":result["@odata.nextLink"].clone()})
+    }
+    pub fn folders(&self) -> Result<Value, GraphError> {
+        self.client.get_json(
+            "/me/mailFolders?$select=id,displayName,parentFolderId,totalItemCount,unreadItemCount",
+        )
+    }
+    pub fn list(&self, folder: &str, limit: u16) -> Result<Value, GraphError> {
+        Ok(Self::messages(&self.client.get_json(&format!("/me/mailFolders/{}/messages?$select=id%2Csubject%2Cfrom%2CreceivedDateTime%2CisRead&$top={limit}", Self::escape(folder)))?))
+    }
+    pub fn search(&self, query: &str, limit: u16) -> Result<Value, GraphError> {
+        Ok(Self::messages(&self.client.get_json(&format!("/me/messages?$search=%22{}%22&$select=id%2Csubject%2Cfrom%2CreceivedDateTime%2CisRead&$top={limit}", Self::escape(query)))?))
+    }
+    pub fn get(&self, id: &str) -> Result<Value, GraphError> {
+        let mut result = self
+            .client
+            .get_json(&format!("/me/messages/{}", Self::escape(id)))?;
+        result["content_origin"] = json!("external_email_untrusted");
+        Ok(result)
+    }
+    pub fn attachments(&self, id: &str) -> Result<Value, GraphError> {
+        self.client.get_json(&format!(
+            "/me/messages/{}/attachments?$select=id,name,size,contentType,@odata.type",
+            Self::escape(id)
+        ))
+    }
+    pub fn mark(&self, id: &str, read: bool) -> Result<Value, GraphError> {
+        self.client.mutate_json(
+            "PATCH",
+            &format!("/me/messages/{}", Self::escape(id)),
+            Some(json!({"isRead":read})),
+        )
+    }
+    pub fn move_message(&self, id: &str, folder: &str) -> Result<Value, GraphError> {
+        self.client.post_json(
+            &format!("/me/messages/{}/move", Self::escape(id)),
+            json!({"destinationId":folder}),
+        )
+    }
+    pub fn copy_message(&self, id: &str, folder: &str) -> Result<Value, GraphError> {
+        self.client.post_json(
+            &format!("/me/messages/{}/copy", Self::escape(id)),
+            json!({"destinationId":folder}),
+        )
+    }
+    pub fn soft_delete(&self, id: &str) -> Result<Value, GraphError> {
+        self.client.mutate_json(
+            "DELETE",
+            &format!("/me/messages/{}", Self::escape(id)),
+            None,
+        )
+    }
+    pub fn draft_create(&self, message: Value) -> Result<Value, GraphError> {
+        self.client.post_json("/me/messages", message)
+    }
+    pub fn draft_update(&self, id: &str, message: Value) -> Result<Value, GraphError> {
+        self.client.mutate_json(
+            "PATCH",
+            &format!("/me/messages/{}", Self::escape(id)),
+            Some(message),
+        )
+    }
+    pub fn send(&self, message: &Value) -> Result<Value, GraphError> {
+        self.client.post_json(
+            "/me/sendMail",
+            json!({"message":message,"saveToSentItems":true}),
+        )
+    }
+    pub fn send_draft(&self, id: &str) -> Result<Value, GraphError> {
+        self.client
+            .post_empty(&format!("/me/messages/{}/send", Self::escape(id)))
+    }
+    pub fn reply(&self, id: &str, payload: Value, all: bool) -> Result<Value, GraphError> {
+        self.client.post_json(
+            &format!(
+                "/me/messages/{}/{}",
+                Self::escape(id),
+                if all { "replyAll" } else { "reply" }
+            ),
+            payload,
+        )
+    }
+    pub fn forward(&self, id: &str, payload: Value) -> Result<Value, GraphError> {
+        self.client.post_json(
+            &format!("/me/messages/{}/forward", Self::escape(id)),
+            payload,
+        )
+    }
+    pub fn delta(&self, folder: &str, continuation: Option<&str>) -> Result<Value, GraphError> {
+        let value = match continuation {
+            Some(link) => self.client.next_json(link)?,
+            None => self.client.get_json(&format!(
+                "/me/mailFolders/{}/messages/delta",
+                Self::escape(folder)
+            ))?,
+        };
+        Ok(
+            json!({"value":value["value"].clone(),"next_link":value["@odata.nextLink"].clone(),"delta_link":value["@odata.deltaLink"].clone()}),
+        )
     }
 }
 
