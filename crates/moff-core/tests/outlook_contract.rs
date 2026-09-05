@@ -125,3 +125,24 @@ fn test_graph_client_allows_only_loopback_http_graph_base() {
         Err(GraphError::InvalidBase)
     ));
 }
+
+#[cfg(feature = "test-support")]
+#[test]
+fn test_graph_client_rejects_spoofed_or_malformed_loopback_bases() {
+    let http = FakeHttp(Mutex::new(VecDeque::new()));
+    for base in [
+        "http://localhost:ignored@evil.example/v1.0",
+        "http://127.0.0.1:8080/v1.0?query",
+        "http://127.0.0.1:8080/v1.0#fragment",
+        "http://127.0.0.1/v1.0",
+        "http://127.0.0.1:0/v1.0",
+        "http://example.test:8080/v1.0",
+        "http://127.0.0.1:8080/not-v1.0",
+        "http://127.0.0.1:8080/v1.0/",
+    ] {
+        assert!(matches!(
+            GraphClient::new_for_test(&http, base, "token"),
+            Err(GraphError::InvalidBase)
+        ));
+    }
+}

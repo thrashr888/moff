@@ -723,6 +723,7 @@ dependencies = [
  "keyring",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]

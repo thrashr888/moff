@@ -489,11 +489,17 @@ impl<'a> GraphClient<'a> {
         base: &str,
         token: &'a str,
     ) -> Result<Self, GraphError> {
-        let base = base.trim_end_matches('/');
-        let local_http = (base.starts_with("http://127.0.0.1:")
-            || base.starts_with("http://localhost:"))
-            && base.ends_with("/v1.0");
-        if !local_http || base.contains('?') {
+        let parsed = url::Url::parse(base).map_err(|_| GraphError::InvalidBase)?;
+        let loopback = matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"));
+        if parsed.scheme() != "http"
+            || !loopback
+            || parsed.port().is_none_or(|port| port == 0)
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.path() != "/v1.0"
+        {
             return Err(GraphError::InvalidBase);
         }
         Ok(Self {
