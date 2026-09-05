@@ -23,6 +23,10 @@ Mail mutations include mark, move, copy, soft delete, draft-create/update, send,
 
 Graph item/message calls request stable immutable IDs. Only Graph-host pagination links are followed. The transport retries safe reads, never ambiguous mutations; callers must inspect an `outcome_unknown` failure before retrying a send or mutation. Attachment links/references are reported as unsupported rather than downloaded.
 
+### Experimental local macOS Outlook UI provider
+
+`moff outlook --provider local-macos doctor` and `moff outlook --provider local-macos mail visible --limit 25` are an explicit, read-only personal-machine experiment. They never use Moff credentials, Keychain, Graph, or the Outlook account/database model: they inspect only the currently rendered Outlook accessibility UI through `/usr/bin/osascript -l JavaScript`. Visible row locators are ephemeral local UI references, not Graph IDs. The provider never opens mail, navigates, resizes, moves UI, syncs a mailbox, or performs mutations; selector drift and empty/unrecognised lists fail safely.
+
 ## Install with Homebrew
 
 After a versioned release is published, install Moff from the shared tap:

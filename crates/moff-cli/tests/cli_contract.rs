@@ -88,6 +88,38 @@ fn schema_filters_to_the_requested_source() {
 }
 
 #[test]
+fn local_macos_provider_doctor_is_explicit_and_never_requires_auth() {
+    let value = json_stdout(&[
+        "--dry-run",
+        "outlook",
+        "--provider",
+        "local-macos",
+        "doctor",
+    ]);
+    assert_eq!(value["provider"], "local-macos");
+    assert_eq!(value["auth_calls"], false);
+    assert_eq!(value["network"], false);
+}
+
+#[test]
+fn local_macos_visible_requires_a_bounded_limit() {
+    moff()
+        .args([
+            "--dry-run",
+            "outlook",
+            "--provider",
+            "local-macos",
+            "mail",
+            "visible",
+            "--limit",
+            "101",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid_limit"));
+}
+
+#[test]
 fn outlook_mail_commands_expose_guarded_dry_run_and_send_confirmation() {
     let value = json_stdout(&["--dry-run", "outlook", "mail", "list", "--folder", "inbox"]);
     assert_eq!(value["command"], "outlook.mail.list");

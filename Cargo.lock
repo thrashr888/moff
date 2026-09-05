@@ -707,6 +707,7 @@ dependencies = [
  "clap",
  "libc",
  "moff-core",
+ "moff-outlook-local",
  "predicates",
  "reqwest",
  "serde_json",
@@ -724,6 +725,14 @@ dependencies = [
  "serde",
  "serde_json",
  "url",
+]
+
+[[package]]
+name = "moff-outlook-local"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -17,6 +17,9 @@ use moff_core::{
     ListMessagesOptions, MailService, Profile, ProfileStore, ThreadSleeper, TokenVault,
     known_source, schema,
 };
+use moff_outlook_local::{
+    OsaScriptOutlookUi, doctor as local_doctor, visible_mail as local_visible_mail,
+};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
@@ -57,12 +60,21 @@ enum Command {
         source: Option<String>,
     },
     Outlook {
+        #[arg(long, value_enum, default_value_t = Provider::Graph)]
+        provider: Provider,
         #[command(subcommand)]
         command: OutlookCommand,
     },
 }
+#[derive(Clone, Debug, ValueEnum, PartialEq, Eq)]
+enum Provider {
+    Graph,
+    #[value(name = "local-macos")]
+    LocalMacos,
+}
 #[derive(Debug, Subcommand)]
 enum OutlookCommand {
+    Doctor,
     Folders {
         #[command(subcommand)]
         command: FoldersCommand,
@@ -82,6 +94,10 @@ enum FoldersCommand {
 }
 #[derive(Debug, Subcommand)]
 enum MailCommand {
+    Visible {
+        #[arg(long, default_value_t = 25)]
+        limit: u16,
+    },
     List {
         #[arg(long, default_value = "inbox")]
         folder: String,
@@ -865,6 +881,10 @@ fn outlook_data(
     resolve_compose_body(&mut command)?;
     validate_outlook_command(&command)?;
     let (name, _mutation) = match &command {
+        OutlookCommand::Doctor => ("outlook.doctor", false),
+        OutlookCommand::Mail {
+            command: MailCommand::Visible { .. },
+        } => ("outlook.mail.visible", false),
         OutlookCommand::Folders {
             command: FoldersCommand::List,
         } => ("outlook.folders.list", false),
@@ -1017,7 +1037,8 @@ fn execute_outlook(
         .map_err(storage_error)?
         .ok_or_else(|| AppError::new("authentication", "no credentials: run auth login first"))?;
     let required = match &command {
-        OutlookCommand::Folders { .. }
+        OutlookCommand::Doctor
+        | OutlookCommand::Folders { .. }
         | OutlookCommand::Attachments { .. }
         | OutlookCommand::Mail {
             command:
@@ -1079,6 +1100,10 @@ fn execute_outlook(
     let mail = MailService::new(graph);
     let message = |to: &[String], subject: &Option<String>, body: &str, body_type: &BodyType| json!({"subject":subject,"body":{"contentType":body_type.graph(),"content":body},"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>()});
     let result = match command {
+        OutlookCommand::Doctor
+        | OutlookCommand::Mail {
+            command: MailCommand::Visible { .. },
+        } => unreachable!("local-only command is dispatched before Graph"),
         OutlookCommand::Folders { .. } => mail.folders(),
         OutlookCommand::Attachments { command: AttachmentsCommand::List { id } }
         | OutlookCommand::Mail { command: MailCommand::Attachments { command: AttachmentsCommand::List { id } } } => mail.attachments(&id),
@@ -1136,6 +1161,58 @@ fn graph_error(error: GraphError) -> AppError {
     )
 }
 
+fn local_error(error: moff_outlook_local::LocalError) -> AppError {
+    AppError::new(error.code(), error.to_string())
+}
+fn local_outlook_data(command: OutlookCommand, dry_run: bool) -> Result<Value, AppError> {
+    let limit = match &command {
+        OutlookCommand::Mail {
+            command: MailCommand::Visible { limit },
+        } => *limit,
+        _ => 25,
+    };
+    if matches!(
+        &command,
+        OutlookCommand::Mail {
+            command: MailCommand::Visible { .. }
+        }
+    ) && limit > 100
+    {
+        return Err(AppError::new(
+            "invalid_limit",
+            "visible result limit must be <= 100",
+        ));
+    }
+    if dry_run {
+        let name = match command {
+            OutlookCommand::Doctor => "outlook.doctor",
+            OutlookCommand::Mail {
+                command: MailCommand::Visible { .. },
+            } => "outlook.mail.visible",
+            _ => {
+                return Err(AppError::new(
+                    "ui_unsupported",
+                    "local-macos supports only doctor and mail visible",
+                ));
+            }
+        };
+        return Ok(
+            json!({"command":name,"provider":"local-macos","network":false,"auth_calls":false,"dry_run":true}),
+        );
+    }
+    let ui = OsaScriptOutlookUi;
+    match command {
+        OutlookCommand::Doctor => local_doctor(&ui).map_err(local_error),
+        OutlookCommand::Mail {
+            command: MailCommand::Visible { limit },
+        } => local_visible_mail(&ui, limit).map_err(local_error),
+        _ => Err(AppError::new(
+            "ui_unsupported",
+            "local-macos supports only doctor and mail visible",
+        )),
+    }
+}
+
 fn command_data(
     command: Option<Command>,
     profile: String,
@@ -1161,8 +1238,12 @@ fn command_data(
             }
             Ok(schema(source.as_deref()))
         }
-        Some(Command::Outlook { command }) => {
-            outlook_data(command, dry_run, yes, &profile, vault, test_endpoints)
+        Some(Command::Outlook { provider, command }) => {
+            if provider == Provider::LocalMacos {
+                local_outlook_data(command, dry_run)
+            } else {
+                outlook_data(command, dry_run, yes, &profile, vault, test_endpoints)
+            }
         }
     }
 }
