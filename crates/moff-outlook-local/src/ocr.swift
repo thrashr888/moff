@@ -16,7 +16,8 @@ if CommandLine.arguments.dropFirst().first == "windows" {
   let request = VNRecognizeTextRequest()
   request.recognitionLevel = .accurate
   request.usesLanguageCorrection = true
-  request.regionOfInterest = CGRect(x: 0.18, y: 0.10, width: 0.50, height: 0.82)
+  // Full-window OCR is required: the Rust parser derives a safe list edge from
+  // aligned date anchors and rejects anything it cannot prove is a list row.
   let handler = VNImageRequestHandler(cgImage: image)
   try! handler.perform([request])
   let output = (request.results ?? []).compactMap { result -> Observation? in

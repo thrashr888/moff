@@ -171,6 +171,9 @@ impl Drop for Cleanup {
 }
 
 fn capture(window: &Window) -> Result<PathBuf, LocalError> {
+    if std::env::var_os("MOFF_TEST_CAPTURE_DENIED").is_some() {
+        return Err(LocalError::ScreenRecordingDenied);
+    }
     let path = secure_capture_path()?;
     let cleanup = Cleanup(path.clone());
     if std::env::var_os("MOFF_TEST_OCR_JSON").is_some() {
@@ -197,71 +200,119 @@ fn capture(window: &Window) -> Result<PathBuf, LocalError> {
 }
 
 /// # Errors
-/// Returns `ui_changed` for unstructured OCR and `invalid_limit` for an invalid bound.
+/// Returns `ui_changed` unless OCR proves a bounded, columnar message list.
+///
+/// Invariants: at least two exact date/time anchors share one right-hand column; each
+/// emitted row has three ordered, non-overlapping text lines to that column's left; and
+/// the list's right edge is derived from that anchor column. Text at or beyond that edge
+/// is preview-pane content and is never considered. A mail header label anywhere in an
+/// otherwise eligible row makes the whole capture ambiguous rather than risking a leak.
 pub fn parse_visible_rows(ocr: &str, limit: u16) -> Result<Vec<VisibleRow>, LocalError> {
     checked_limit(limit)?;
-    let mut items: Vec<Observation> =
-        serde_json::from_str(ocr).map_err(|_| LocalError::UiChanged)?;
-    // Defense in depth: never use observations outside the center message-list crop.
-    items.retain(|item| {
-        item.x >= 0.05
-            && item.x < 0.75
-            && item.y >= 0.08
-            && item.y < 0.94
-            && item.w > 0.0
-            && item.h > 0.0
-    });
-    let mut times: Vec<_> = items
-        .iter()
-        .filter(|item| item.x >= 0.50 && is_time(&item.text))
-        .collect();
-    times.sort_by(|a, b| b.y.total_cmp(&a.y));
-    let rows = times
+    let items: Vec<Observation> = serde_json::from_str::<Vec<Observation>>(ocr)
+        .map_err(|_| LocalError::UiChanged)?
         .into_iter()
-        .filter_map(|time| {
-            let mut left: Vec<_> = items
-                .iter()
-                .filter(|item| item.x < 0.50 && (item.y - time.y).abs() <= 0.075)
-                .collect();
-            left.sort_by(|a, b| b.y.total_cmp(&a.y));
-            if left.len() < 3 {
-                return None;
-            }
-            Some(VisibleRow {
-                unread: None,
-                sender: left[0].text.clone(),
-                subject: left[1].text.clone(),
-                preview: left[2..]
-                    .iter()
-                    .map(|v| v.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                time: time.text.clone(),
-                locator: String::new(),
-                locator_scope: "ephemeral_local_screen_capture",
-            })
+        .filter(|item| {
+            item.x >= 0.0
+                && item.y >= 0.0
+                && item.x + item.w <= 1.0
+                && item.y + item.h <= 1.0
+                && item.w > 0.0
+                && item.h > 0.0
         })
-        .take(usize::from(limit))
-        .collect::<Vec<_>>();
+        .collect();
+    let mut anchors: Vec<_> = items
+        .iter()
+        .filter(|item| item.x >= 0.20 && item.x <= 0.80 && is_time(&item.text))
+        .collect();
+    if anchors.len() < 2 {
+        return Err(LocalError::UiChanged);
+    }
+    anchors.sort_by(|a, b| b.y.total_cmp(&a.y));
+    let min_anchor_x = anchors.iter().map(|item| item.x).fold(1.0, f64::min);
+    let max_anchor_x = anchors.iter().map(|item| item.x).fold(0.0, f64::max);
+    // A real list has one date column. A wider set can be document/body dates.
+    if max_anchor_x - min_anchor_x > 0.08 {
+        return Err(LocalError::UiChanged);
+    }
+    let list_right = max_anchor_x + 0.08;
+    let mut rows = Vec::new();
+    for (index, anchor) in anchors.iter().enumerate() {
+        let next_anchor_y = anchors.get(index + 1).map_or(-1.0, |next| next.y);
+        // Row bands must not overlap; this prevents an anchor from borrowing another row.
+        if anchor.y - next_anchor_y < 0.08 && index + 1 < anchors.len() {
+            return Err(LocalError::UiChanged);
+        }
+        let mut row_items: Vec<_> = items
+            .iter()
+            .filter(|item| {
+                item.x >= 0.18
+                    && item.x + item.w <= list_right
+                    && item.x + item.w < anchor.x + 0.04
+                    && item.y <= anchor.y + 0.05
+                    && item.y >= anchor.y - 0.10
+            })
+            .collect();
+        if row_items.iter().any(|item| forbidden_row_text(&item.text)) {
+            return Err(LocalError::UiChanged);
+        }
+        row_items.sort_by(|a, b| b.y.total_cmp(&a.y));
+        if row_items.len() != 3
+            || row_items[0].y - row_items[1].y < 0.008
+            || row_items[1].y - row_items[2].y < 0.008
+            || row_items.iter().any(|item| is_time(&item.text))
+        {
+            return Err(LocalError::UiChanged);
+        }
+        rows.push(VisibleRow {
+            unread: None,
+            sender: row_items[0].text.clone(),
+            subject: row_items[1].text.clone(),
+            preview: row_items[2].text.clone(),
+            time: anchor.text.clone(),
+            locator: format!("capture-row:{}", rows.len() + 1),
+            locator_scope: "ephemeral_local_screen_capture",
+        });
+    }
     if rows.is_empty() {
         return Err(LocalError::UiChanged);
     }
-    Ok(rows
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut row)| {
-            row.locator = format!("capture-row:{}", index + 1);
-            row
-        })
-        .collect())
+    rows.truncate(usize::from(limit));
+    Ok(rows)
 }
+
+fn forbidden_row_text(value: &str) -> bool {
+    let lowered = value.trim().to_ascii_lowercase();
+    [
+        "from:", "to:", "cc:", "date:", "subject:", "pinned", "today",
+    ]
+    .iter()
+    .any(|label| lowered.starts_with(label))
+}
+
 fn is_time(value: &str) -> bool {
     let value = value.trim();
-    value.eq_ignore_ascii_case("yesterday")
-        || value.contains(':')
-        || value
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '/' || c == '-')
+    if value.eq_ignore_ascii_case("yesterday") {
+        return true;
+    }
+    let upper = value.to_ascii_uppercase();
+    let clock = upper
+        .strip_suffix(" AM")
+        .or_else(|| upper.strip_suffix(" PM"))
+        .unwrap_or(&upper);
+    let clock_parts: Vec<_> = clock.split(':').collect();
+    if clock_parts.len() == 2
+        && clock_parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+    {
+        return true;
+    }
+    let date_parts: Vec<_> = value.split('/').collect();
+    (date_parts.len() == 2 || date_parts.len() == 3)
+        && date_parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn ocr(path: &Path) -> Result<String, LocalError> {
@@ -294,6 +345,10 @@ fn ocr(path: &Path) -> Result<String, LocalError> {
 /// Returns a typed platform or visible-window selection error without reading email text.
 pub fn doctor() -> Result<Value, LocalError> {
     let window = selected_window()?;
+    // Permission is demonstrated with a window-only capture; its Cleanup guard
+    // deletes it immediately and doctor never hands it to OCR.
+    let path = capture(&window)?;
+    drop(Cleanup(path));
     Ok(
         json!({"command":"outlook.doctor","provider":"local-macos-screen-ocr","source":"outlook-screen-local","platform":"macos","screen_recording":"ready","email_content":false,"network":false,"window":{"number":window.number,"frame":{"x":window.x,"y":window.y,"width":window.width,"height":window.height}}}),
     )
