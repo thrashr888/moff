@@ -178,6 +178,37 @@ fn outlook_mail_read_grammar_validates_typed_inputs_before_any_networking() {
 
 #[test]
 fn compose_requires_one_utf8_body_source_and_valid_recipients() {
+    for args in [
+        [
+            "--dry-run",
+            "outlook",
+            "mail",
+            "send",
+            "--body",
+            "hello",
+            "--confirm-send",
+        ]
+        .as_slice(),
+        [
+            "--dry-run",
+            "outlook",
+            "mail",
+            "forward",
+            "--id",
+            "immutable-id",
+            "--body",
+            "hello",
+            "--confirm-send",
+        ]
+        .as_slice(),
+    ] {
+        moff()
+            .args(args)
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(contains("recipient_required"));
+    }
     moff()
         .args([
             "--dry-run",
@@ -338,6 +369,35 @@ fn compose_body_sources_are_required_exclusive_and_validated_before_authenticati
         .assert()
         .failure()
         .stderr(contains("invalid_reply"));
+}
+
+#[test]
+fn draft_update_requires_a_change_and_rejects_invalid_rfc3339_dates() {
+    moff()
+        .args([
+            "--dry-run",
+            "outlook",
+            "mail",
+            "draft-update",
+            "--id",
+            "immutable-id",
+        ])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("draft_update_required"));
+    for invalid in [
+        "2026-99-99T12:30:00Z",
+        "2026-02-30T12:30:00Z",
+        "2026-09-05T25:30:00Z",
+    ] {
+        moff()
+            .args(["--dry-run", "outlook", "mail", "list", "--since", invalid])
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(contains("invalid_rfc3339"));
+    }
 }
 
 #[test]

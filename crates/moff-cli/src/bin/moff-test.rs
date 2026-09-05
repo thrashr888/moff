@@ -17,5 +17,5 @@ fn main() -> std::process::ExitCode {
         eprintln!("moff-test: unable to prepare controlled credentials");
         return std::process::ExitCode::from(2);
     }
-    application::main_with_vault(&vault)
+    application::main_with_test_endpoints(&vault)
 }

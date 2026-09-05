@@ -228,7 +228,7 @@ fn compose_operations_preserve_graph_body_and_comment_contracts() {
 }
 
 #[test]
-fn continuation_requires_same_configured_host_and_delta_link_is_exposed_only_at_end() {
+fn continuation_requires_the_configured_base_path_and_delta_link_is_exposed_only_at_end() {
     let http = FakeHttp::with(vec![Ok(GraphResponse::json(
         200,
         r#"{"value":[],"@odata.deltaLink":"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=x"}"#,
@@ -239,10 +239,17 @@ fn continuation_requires_same_configured_host_and_delta_link_is_exposed_only_at_
         result["delta_link"],
         "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=x"
     );
-    assert!(matches!(
-        mail.delta("inbox", Some("https://evil.example/next")),
-        Err(GraphError::UntrustedNextLink)
-    ));
+    for link in [
+        "https://evil.example/next",
+        "https://graph.microsoft.com/beta/me/messages",
+        "https://graph.microsoft.com/v1.1/me/messages",
+        "https://graph.microsoft.com/v1.0evil/me/messages",
+    ] {
+        assert!(matches!(
+            client(&http).validate_next_link(link),
+            Err(GraphError::UntrustedNextLink)
+        ));
+    }
 }
 
 #[test]
@@ -278,6 +285,20 @@ fn file_attachment_download_decodes_bytes_and_rejects_non_file_types() {
             .url
             .ends_with("/me/messages/message/attachments/file")
     );
+}
+
+#[test]
+fn attachment_listing_labels_external_attachment_content_as_untrusted() {
+    let http = FakeHttp::with(vec![Ok(GraphResponse::json(
+        200,
+        r#"{"value":[{"id":"file","name":"report.pdf"}]}"#,
+    ))]);
+    let mail = MailService::new(client(&http));
+
+    let listed = mail.attachments("message").unwrap();
+
+    assert_eq!(listed["content_origin"], "external_attachment_untrusted");
+    assert_eq!(listed["value"][0]["name"], "report.pdf");
 }
 
 #[test]

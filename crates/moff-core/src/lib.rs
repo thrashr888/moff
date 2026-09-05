@@ -473,10 +473,27 @@ pub struct GraphClient<'a> {
 impl<'a> GraphClient<'a> {
     pub fn new(http: &'a dyn GraphHttp, base: &str, token: &'a str) -> Result<Self, GraphError> {
         let base = base.trim_end_matches('/');
-        let local_http = cfg!(debug_assertions)
-            && (base.starts_with("http://127.0.0.1:") || base.starts_with("http://localhost:"))
+        if base != "https://graph.microsoft.com/v1.0" || base.contains('?') {
+            return Err(GraphError::InvalidBase);
+        }
+        Ok(Self {
+            http,
+            base: base.to_owned(),
+            token,
+            sleeper: None,
+        })
+    }
+    #[cfg(feature = "test-support")]
+    pub fn new_for_test(
+        http: &'a dyn GraphHttp,
+        base: &str,
+        token: &'a str,
+    ) -> Result<Self, GraphError> {
+        let base = base.trim_end_matches('/');
+        let local_http = (base.starts_with("http://127.0.0.1:")
+            || base.starts_with("http://localhost:"))
             && base.ends_with("/v1.0");
-        if (base != "https://graph.microsoft.com/v1.0" && !local_http) || base.contains('?') {
+        if !local_http || base.contains('?') {
             return Err(GraphError::InvalidBase);
         }
         Ok(Self {
@@ -633,13 +650,8 @@ impl<'a> GraphClient<'a> {
         self.request(method, path, body)
     }
     fn is_permitted_absolute_url(&self, url: &str) -> bool {
-        let host = self.base.split('/').nth(2).unwrap_or_default();
-        let required_scheme = if self.base.starts_with("https://") {
-            "https://"
-        } else {
-            "http://"
-        };
-        url.starts_with(required_scheme) && url.split('/').nth(2) == Some(host)
+        url.strip_prefix(&self.base)
+            .is_some_and(|suffix| suffix.starts_with('/') || suffix.starts_with('?'))
     }
     pub fn validate_next_link(&self, next: &str) -> Result<(), GraphError> {
         if !self.is_permitted_absolute_url(next) {
@@ -783,10 +795,13 @@ impl<'a> MailService<'a> {
         Ok(result)
     }
     pub fn attachments(&self, id: &str) -> Result<Value, GraphError> {
-        self.client.get_json(&format!(
+        let result = self.client.get_json(&format!(
             "/me/messages/{}/attachments?$select=id,name,size,contentType,@odata.type",
             Self::escape(id)
-        ))
+        ))?;
+        Ok(
+            json!({"content_origin":"external_attachment_untrusted","value":result["value"].clone()}),
+        )
     }
     pub fn download_attachment(
         &self,

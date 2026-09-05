@@ -18,6 +18,7 @@ use moff_core::{
     known_source, schema,
 };
 use serde_json::{Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -410,18 +411,7 @@ fn valid_email(value: &str) -> bool {
         && value.matches('@').count() == 1
 }
 fn valid_rfc3339(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() >= 20
-        && bytes.get(4) == Some(&b'-')
-        && bytes.get(7) == Some(&b'-')
-        && bytes.get(10) == Some(&b'T')
-        && bytes.get(13) == Some(&b':')
-        && bytes.get(16) == Some(&b':')
-        && (value.ends_with('Z') || value[19..].starts_with('+') || value[19..].starts_with('-'))
-        && bytes[..19]
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit())
+    OffsetDateTime::parse(value, &Rfc3339).is_ok()
 }
 const MAX_BODY_BYTES: u64 = 1_048_576;
 
@@ -444,6 +434,12 @@ fn resolve_body_source(
     body_stdin: bool,
     required: bool,
 ) -> Result<(), AppError> {
+    if body
+        .as_ref()
+        .is_some_and(|value| value.len() as u64 > MAX_BODY_BYTES)
+    {
+        return Err(AppError::new("body_too_large", "body source exceeds 1 MiB"));
+    }
     let sources =
         usize::from(body.is_some()) + usize::from(body_file.is_some()) + usize::from(body_stdin);
     if sources == 0 && required {
@@ -459,16 +455,39 @@ fn resolve_body_source(
         ));
     }
     if let Some(path) = body_file {
-        let metadata = fs::symlink_metadata(path)
-            .map_err(|_| AppError::new("body_file", "body file must be a readable regular file"))?;
-        if !metadata.file_type().is_file() {
-            return Err(AppError::new(
-                "body_file",
-                "body file must be a readable regular file",
-            ));
-        }
-        let mut file = fs::File::open(path)
-            .map_err(|_| AppError::new("body_file", "body file must be a readable regular file"))?;
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+                .map_err(|_| {
+                    AppError::new("body_file", "body file must be a readable regular file")
+                })?;
+            if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+                return Err(AppError::new(
+                    "body_file",
+                    "body file must be a readable regular file",
+                ));
+            }
+            file
+        };
+        #[cfg(not(unix))]
+        let mut file = {
+            let metadata = fs::symlink_metadata(path).map_err(|_| {
+                AppError::new("body_file", "body file must be a readable regular file")
+            })?;
+            if !metadata.file_type().is_file() {
+                return Err(AppError::new(
+                    "body_file",
+                    "body file must be a readable regular file",
+                ));
+            }
+            fs::File::open(path).map_err(|_| {
+                AppError::new("body_file", "body file must be a readable regular file")
+            })?
+        };
         *body = Some(read_utf8_body(&mut file)?);
     } else if body_stdin {
         *body = Some(read_utf8_body(&mut io::stdin().lock())?);
@@ -567,6 +586,14 @@ fn validate_outlook_command(command: &OutlookCommand) -> Result<(), AppError> {
             }
         }
         OutlookCommand::Mail {
+            command: MailCommand::Send { to, .. } | MailCommand::Forward { to, .. },
+        } if to.is_empty() => {
+            return Err(AppError::new(
+                "recipient_required",
+                "at least one recipient is required",
+            ));
+        }
+        OutlookCommand::Mail {
             command:
                 MailCommand::Send { to, .. }
                 | MailCommand::Forward { to, .. }
@@ -575,6 +602,14 @@ fn validate_outlook_command(command: &OutlookCommand) -> Result<(), AppError> {
             return Err(AppError::new(
                 "invalid_email",
                 "recipient must be a valid email address",
+            ));
+        }
+        OutlookCommand::Mail {
+            command: MailCommand::DraftUpdate { subject, body, .. },
+        } if subject.is_none() && body.is_none() => {
+            return Err(AppError::new(
+                "draft_update_required",
+                "draft update requires --subject or a body source",
             ));
         }
         _ => {}
@@ -688,7 +723,53 @@ fn sync_delta_cycle(
     }
 }
 
-fn auth_data(command: AuthCommand, profile_name: String, dry_run: bool) -> Result<Value, AppError> {
+#[cfg(feature = "test-support")]
+fn test_endpoint(name: &str, graph: bool) -> Result<String, AppError> {
+    let endpoint = std::env::var(name)
+        .map_err(|_| AppError::new("test_endpoint", "test endpoint is required"))?;
+    let loopback =
+        endpoint.starts_with("http://127.0.0.1:") || endpoint.starts_with("http://localhost:");
+    if !loopback || (graph && !endpoint.trim_end_matches('/').ends_with("/v1.0")) {
+        return Err(AppError::new(
+            "test_endpoint",
+            "test endpoint must be loopback",
+        ));
+    }
+    Ok(endpoint)
+}
+
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "feature-gated test endpoints can return validation errors"
+)]
+fn entra_base(test_endpoints: bool) -> Result<String, AppError> {
+    #[cfg(feature = "test-support")]
+    if test_endpoints {
+        return test_endpoint("MOFF_ENTRA_BASE_URL", false);
+    }
+    let _ = test_endpoints;
+    Ok("https://login.microsoftonline.com".to_owned())
+}
+
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "feature-gated test endpoints can return validation errors"
+)]
+fn graph_base(test_endpoints: bool) -> Result<String, AppError> {
+    #[cfg(feature = "test-support")]
+    if test_endpoints {
+        return test_endpoint("MOFF_GRAPH_BASE_URL", true);
+    }
+    let _ = test_endpoints;
+    Ok("https://graph.microsoft.com/v1.0".to_owned())
+}
+
+fn auth_data(
+    command: AuthCommand,
+    profile_name: String,
+    dry_run: bool,
+    test_endpoints: bool,
+) -> Result<Value, AppError> {
     let store = ProfileStore::platform_default();
     let vault = KeyringVault;
     match command {
@@ -729,8 +810,7 @@ fn auth_data(command: AuthCommand, profile_name: String, dry_run: bool) -> Resul
                     .map_err(|_| AppError::new("transport", "unable to create HTTPS client"))?,
             );
             let sleeper = ThreadSleeper;
-            let base = std::env::var("MOFF_ENTRA_BASE_URL")
-                .unwrap_or_else(|_| "https://login.microsoftonline.com".to_owned());
+            let base = entra_base(test_endpoints)?;
             let service = AuthService::new(&http, &vault, &sleeper, &base);
             service
                 .login_with_instructions(
@@ -777,6 +857,7 @@ fn outlook_data(
     yes: bool,
     profile_name: &str,
     vault: &dyn TokenVault,
+    test_endpoints: bool,
 ) -> Result<Value, AppError> {
     resolve_compose_body(&mut command)?;
     validate_outlook_command(&command)?;
@@ -914,7 +995,7 @@ fn outlook_data(
     if dry_run {
         return Ok(json!({"command":name,"dry_run":true,"network_mutation":false}));
     }
-    execute_outlook(command, profile_name, vault)
+    execute_outlook(command, profile_name, vault, test_endpoints)
 }
 
 #[allow(
@@ -925,6 +1006,7 @@ fn execute_outlook(
     command: OutlookCommand,
     profile_name: &str,
     vault: &dyn TokenVault,
+    test_endpoints: bool,
 ) -> Result<Value, AppError> {
     let store = ProfileStore::platform_default();
     let profile = store
@@ -967,8 +1049,7 @@ fn execute_outlook(
             .map_err(|_| AppError::new("transport", "unable to create HTTPS client"))?,
     );
     let sleeper = ThreadSleeper;
-    let entra = std::env::var("MOFF_ENTRA_BASE_URL")
-        .unwrap_or_else(|_| "https://login.microsoftonline.com".to_owned());
+    let entra = entra_base(test_endpoints)?;
     let token = AuthService::new(&http, vault, &sleeper, &entra)
         .access_token(profile_name, &profile.client_id, &profile.tenant)
         .map_err(auth_error)?;
@@ -977,10 +1058,21 @@ fn execute_outlook(
             .build()
             .map_err(|_| AppError::new("transport", "unable to create HTTPS client"))?,
     );
-    let graph_base = std::env::var("MOFF_GRAPH_BASE_URL")
-        .unwrap_or_else(|_| "https://graph.microsoft.com/v1.0".to_owned());
-    let graph = GraphClient::new(&graph_http, &graph_base, token.expose_to_graph_only())
-        .map_err(graph_error)?;
+    let graph_base = graph_base(test_endpoints)?;
+    let graph = {
+        #[cfg(feature = "test-support")]
+        if test_endpoints {
+            GraphClient::new_for_test(&graph_http, &graph_base, token.expose_to_graph_only())
+        } else {
+            GraphClient::new(&graph_http, &graph_base, token.expose_to_graph_only())
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            let _ = test_endpoints;
+            GraphClient::new(&graph_http, &graph_base, token.expose_to_graph_only())
+        }
+    }
+    .map_err(graph_error)?;
     let mail = MailService::new(graph);
     let message = |to: &[String], subject: &Option<String>, body: &str, body_type: &BodyType| json!({"subject":subject,"body":{"contentType":body_type.graph(),"content":body},"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>()});
     let result = match command {
@@ -991,7 +1083,7 @@ fn execute_outlook(
         | OutlookCommand::Mail { command: MailCommand::Attachments { command: AttachmentsCommand::Download { id, attachment_id, output, force } } } => {
             let bytes = mail.download_attachment(&id, &attachment_id).map_err(graph_error)?;
             write_attachment(Path::new(&output), &bytes, force)?;
-            return Ok(json!({"output":output,"bytes":bytes.len()}));
+            return Ok(json!({"content_origin":"external_attachment_untrusted","output":output,"bytes":bytes.len()}));
         }
         OutlookCommand::Mail { command: MailCommand::List { folder, limit, unread, from, since } } => mail.list_with_options(&folder, ListMessagesOptions { limit, unread, from: from.as_deref(), since: since.as_deref() }),
         OutlookCommand::Mail { command: MailCommand::Search { query, folder, limit } } => mail.search_in_folder(&query, folder.as_deref(), limit),
@@ -1001,7 +1093,19 @@ fn execute_outlook(
         OutlookCommand::Mail { command: MailCommand::Copy { id, folder } } => mail.copy_message(&id, &folder),
         OutlookCommand::Mail { command: MailCommand::Delete { id } } => mail.soft_delete(&id),
         OutlookCommand::Mail { command: MailCommand::DraftCreate { to, subject, body, body_type, .. } } => mail.draft_create(message(&to, &subject, body.as_deref().expect("validated body"), &body_type)),
-        OutlookCommand::Mail { command: MailCommand::DraftUpdate { id, legacy_id, subject, body, body_type, .. } } => mail.draft_update(id.as_deref().or(legacy_id.as_deref()).expect("validated id"), json!({"subject":subject,"body":body.map(|content| json!({"contentType":body_type.graph(),"content":content}))})),
+        OutlookCommand::Mail { command: MailCommand::DraftUpdate { id, legacy_id, subject, body, body_type, .. } } => {
+            let mut update = serde_json::Map::new();
+            if let Some(subject) = subject {
+                update.insert("subject".to_owned(), json!(subject));
+            }
+            if let Some(content) = body {
+                update.insert("body".to_owned(), json!({"contentType":body_type.graph(),"content":content}));
+            }
+            mail.draft_update(
+                id.as_deref().or(legacy_id.as_deref()).expect("validated id"),
+                Value::Object(update),
+            )
+        }
         OutlookCommand::Mail { command: MailCommand::Send { to, subject, body, body_type, .. } } => mail.send(&message(&to, &subject, body.as_deref().expect("validated body"), &body_type)),
         OutlookCommand::Mail { command: MailCommand::SendDraft { id, .. } } => mail.send_draft(&id).map(|_| json!({"accepted":true})),
         OutlookCommand::Mail { command: MailCommand::Reply { id, comment, body, body_type, .. } } => mail.reply(&id, comment.map_or_else(|| json!({"message":{"body":{"contentType":body_type.graph(),"content":body.expect("validated body")}}}), |comment| json!({"comment":comment})), false).map(|_| json!({"accepted":true})),
@@ -1035,10 +1139,11 @@ fn command_data(
     dry_run: bool,
     yes: bool,
     vault: &dyn TokenVault,
+    test_endpoints: bool,
 ) -> Result<Value, AppError> {
     match command {
         None => Ok(json!({"command":"root","status":"scaffold"})),
-        Some(Command::Auth { command }) => auth_data(command, profile, dry_run),
+        Some(Command::Auth { command }) => auth_data(command, profile, dry_run, test_endpoints),
         Some(Command::Doctor { network }) => Ok(
             json!({"command":"doctor","status":"local_only","network_requested":network,"auth_calls":false}),
         ),
@@ -1053,10 +1158,12 @@ fn command_data(
             }
             Ok(schema(source.as_deref()))
         }
-        Some(Command::Outlook { command }) => outlook_data(command, dry_run, yes, &profile, vault),
+        Some(Command::Outlook { command }) => {
+            outlook_data(command, dry_run, yes, &profile, vault, test_endpoints)
+        }
     }
 }
-fn run(cli: Cli, vault: &dyn TokenVault) -> Result<(), AppError> {
+fn run(cli: Cli, vault: &dyn TokenVault, test_endpoints: bool) -> Result<(), AppError> {
     if cli.json && cli.pretty {
         return Err(AppError::new(
             ErrorCode::IncompatibleOutputModes.as_str(),
@@ -1064,7 +1171,14 @@ fn run(cli: Cli, vault: &dyn TokenVault) -> Result<(), AppError> {
         ));
     }
     let profile = profile_name(cli.profile)?;
-    let data = command_data(cli.command, profile, cli.dry_run, cli.yes, vault)?;
+    let data = command_data(
+        cli.command,
+        profile,
+        cli.dry_run,
+        cli.yes,
+        vault,
+        test_endpoints,
+    )?;
     let response = if cli.envelope {
         json!({"ok":true,"data":data,"warnings":[],"request_id":"moff-local"})
     } else {
@@ -1074,10 +1188,23 @@ fn run(cli: Cli, vault: &dyn TokenVault) -> Result<(), AppError> {
     Ok(())
 }
 pub(crate) fn main_with_vault(vault: &dyn TokenVault) -> ExitCode {
+    main_with_vault_and_test_endpoints(vault, false)
+}
+
+#[cfg(feature = "test-support")]
+#[allow(
+    dead_code,
+    reason = "called only by the feature-gated moff-test binary"
+)]
+pub(crate) fn main_with_test_endpoints(vault: &dyn TokenVault) -> ExitCode {
+    main_with_vault_and_test_endpoints(vault, true)
+}
+
+fn main_with_vault_and_test_endpoints(vault: &dyn TokenVault, test_endpoints: bool) -> ExitCode {
     let cli = Cli::parse();
     let envelope = cli.envelope;
     let pretty = cli.pretty;
-    match run(cli, vault) {
+    match run(cli, vault, test_endpoints) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("moff: [{}] {}", error.code, error.message);
@@ -1124,6 +1251,43 @@ mod tests {
             self.requests.lock().unwrap().push(request);
             self.responses.lock().unwrap().pop_front().unwrap()
         }
+    }
+
+    #[test]
+    fn inline_body_over_one_mib_is_rejected_before_authentication() {
+        let mut body = Some("x".repeat(1_048_577));
+        let error = resolve_body_source(&mut body, None, false, true).unwrap_err();
+        assert_eq!(error.code, "body_too_large");
+    }
+
+    #[test]
+    fn production_endpoint_selection_ignores_environment_overrides() {
+        assert!(matches!(
+            entra_base(false),
+            Ok(base) if base == "https://login.microsoftonline.com"
+        ));
+        assert!(matches!(
+            graph_base(false),
+            Ok(base) if base == "https://graph.microsoft.com/v1.0"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn body_file_symlink_is_rejected_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let directory = std::env::temp_dir().join(format!("moff-body-link-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("target.txt");
+        let link = directory.join("body.txt");
+        fs::write(&target, "body").unwrap();
+        symlink(&target, &link).unwrap();
+        let link = link.to_string_lossy().into_owned();
+        let mut body = None;
+        let error = resolve_body_source(&mut body, Some(&link), false, true).unwrap_err();
+        assert_eq!(error.code, "body_file");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

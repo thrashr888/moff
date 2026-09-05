@@ -54,23 +54,22 @@ fn graph_base_allows_only_official_graph_endpoint() {
     assert!(GraphClient::new(&http, "https://graph.microsoft.com/v1.0", "token").is_ok());
 }
 
-#[cfg(debug_assertions)]
 #[test]
-fn debug_build_allows_only_loopback_http_graph_base() {
+fn production_graph_client_rejects_loopback_http_graph_base() {
     let http = FakeHttp(Mutex::new(VecDeque::new()));
-    assert!(GraphClient::new(&http, "http://127.0.0.1:8080/v1.0", "token").is_ok());
     assert!(matches!(
-        GraphClient::new(&http, "http://example.test/v1.0", "token"),
+        GraphClient::new(&http, "http://127.0.0.1:8080/v1.0", "token"),
         Err(GraphError::InvalidBase)
     ));
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(feature = "test-support")]
 #[test]
-fn release_build_rejects_loopback_http_graph_base() {
+fn test_graph_client_allows_only_loopback_http_graph_base() {
     let http = FakeHttp(Mutex::new(VecDeque::new()));
+    assert!(GraphClient::new_for_test(&http, "http://127.0.0.1:8080/v1.0", "token").is_ok());
     assert!(matches!(
-        GraphClient::new(&http, "http://127.0.0.1:8080/v1.0", "token"),
+        GraphClient::new_for_test(&http, "http://example.test/v1.0", "token"),
         Err(GraphError::InvalidBase)
     ));
 }
