@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -134,16 +134,30 @@ enum MailCommand {
         #[arg(long)]
         subject: Option<String>,
         #[arg(long)]
-        body: String,
+        body: Option<String>,
+        #[arg(long)]
+        body_file: Option<String>,
+        #[arg(long)]
+        body_stdin: bool,
         #[arg(long, value_enum, default_value_t = BodyType::Text)]
         body_type: BodyType,
     },
     DraftUpdate {
-        id: String,
+        #[arg(
+            long,
+            required_unless_present = "legacy_id",
+            conflicts_with = "legacy_id"
+        )]
+        id: Option<String>,
+        legacy_id: Option<String>,
         #[arg(long)]
         subject: Option<String>,
         #[arg(long)]
         body: Option<String>,
+        #[arg(long)]
+        body_file: Option<String>,
+        #[arg(long)]
+        body_stdin: bool,
         #[arg(long, value_enum, default_value_t = BodyType::Text)]
         body_type: BodyType,
     },
@@ -153,8 +167,10 @@ enum MailCommand {
         #[arg(long)]
         subject: Option<String>,
         #[arg(long)]
-        body: String,
-        #[arg(long, conflicts_with = "body")]
+        body: Option<String>,
+        #[arg(long)]
+        body_file: Option<String>,
+        #[arg(long)]
         body_stdin: bool,
         #[arg(long)]
         confirm_send: bool,
@@ -174,23 +190,51 @@ enum MailCommand {
         #[arg(long)]
         body: Option<String>,
         #[arg(long)]
+        body_file: Option<String>,
+        #[arg(long)]
+        body_stdin: bool,
+        #[arg(long)]
         confirm_send: bool,
+        #[arg(long, value_enum, default_value_t = BodyType::Text)]
+        body_type: BodyType,
     },
     ReplyAll {
         id: String,
         #[arg(long)]
         comment: Option<String>,
         #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        body_file: Option<String>,
+        #[arg(long)]
+        body_stdin: bool,
+        #[arg(long)]
         confirm_send: bool,
+        #[arg(long, value_enum, default_value_t = BodyType::Text)]
+        body_type: BodyType,
     },
     Forward {
-        id: String,
+        #[arg(
+            long,
+            required_unless_present = "legacy_id",
+            conflicts_with = "legacy_id"
+        )]
+        id: Option<String>,
+        legacy_id: Option<String>,
         #[arg(long)]
         to: Vec<String>,
         #[arg(long)]
         comment: Option<String>,
         #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        body_file: Option<String>,
+        #[arg(long)]
+        body_stdin: bool,
+        #[arg(long)]
         confirm_send: bool,
+        #[arg(long, value_enum, default_value_t = BodyType::Text)]
+        body_type: BodyType,
     },
     Sync {
         #[arg(long, default_value = "inbox")]
@@ -379,6 +423,134 @@ fn valid_rfc3339(value: &str) -> bool {
             .enumerate()
             .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit())
 }
+const MAX_BODY_BYTES: u64 = 1_048_576;
+
+fn read_utf8_body(reader: &mut dyn Read) -> Result<String, AppError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_BODY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| AppError::new("body_read", "unable to read body source"))?;
+    if bytes.len() as u64 > MAX_BODY_BYTES {
+        return Err(AppError::new("body_too_large", "body source exceeds 1 MiB"));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| AppError::new("invalid_body_utf8", "body source must be valid UTF-8"))
+}
+
+fn resolve_body_source(
+    body: &mut Option<String>,
+    body_file: Option<&String>,
+    body_stdin: bool,
+    required: bool,
+) -> Result<(), AppError> {
+    let sources =
+        usize::from(body.is_some()) + usize::from(body_file.is_some()) + usize::from(body_stdin);
+    if sources == 0 && required {
+        return Err(AppError::new(
+            "body_source_required",
+            "exactly one body source is required",
+        ));
+    }
+    if sources > 1 {
+        return Err(AppError::new(
+            "body_source_conflict",
+            "only one body source may be used",
+        ));
+    }
+    if let Some(path) = body_file {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| AppError::new("body_file", "body file must be a readable regular file"))?;
+        if !metadata.file_type().is_file() {
+            return Err(AppError::new(
+                "body_file",
+                "body file must be a readable regular file",
+            ));
+        }
+        let mut file = fs::File::open(path)
+            .map_err(|_| AppError::new("body_file", "body file must be a readable regular file"))?;
+        *body = Some(read_utf8_body(&mut file)?);
+    } else if body_stdin {
+        *body = Some(read_utf8_body(&mut io::stdin().lock())?);
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::unnested_or_patterns,
+    reason = "shared compose source validation"
+)]
+fn resolve_compose_body(command: &mut OutlookCommand) -> Result<(), AppError> {
+    match command {
+        OutlookCommand::Mail {
+            command:
+                MailCommand::DraftCreate {
+                    body,
+                    body_file,
+                    body_stdin,
+                    ..
+                },
+        }
+        | OutlookCommand::Mail {
+            command:
+                MailCommand::Send {
+                    body,
+                    body_file,
+                    body_stdin,
+                    ..
+                },
+        } => resolve_body_source(body, body_file.as_ref(), *body_stdin, true),
+        OutlookCommand::Mail {
+            command:
+                MailCommand::DraftUpdate {
+                    body,
+                    body_file,
+                    body_stdin,
+                    ..
+                },
+        } => resolve_body_source(body, body_file.as_ref(), *body_stdin, false),
+        OutlookCommand::Mail {
+            command:
+                MailCommand::Reply {
+                    comment,
+                    body,
+                    body_file,
+                    body_stdin,
+                    ..
+                },
+        }
+        | OutlookCommand::Mail {
+            command:
+                MailCommand::ReplyAll {
+                    comment,
+                    body,
+                    body_file,
+                    body_stdin,
+                    ..
+                },
+        }
+        | OutlookCommand::Mail {
+            command:
+                MailCommand::Forward {
+                    comment,
+                    body,
+                    body_file,
+                    body_stdin,
+                    ..
+                },
+        } => {
+            if comment.is_some() && (body.is_some() || body_file.is_some() || *body_stdin) {
+                return Err(AppError::new(
+                    "invalid_reply",
+                    "reply requires exactly one of --comment or a body source",
+                ));
+            }
+            resolve_body_source(body, body_file.as_ref(), *body_stdin, comment.is_none())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn validate_outlook_command(command: &OutlookCommand) -> Result<(), AppError> {
     match command {
         OutlookCommand::Mail {
@@ -600,12 +772,13 @@ fn auth_error(error: DeviceFlowError) -> AppError {
     reason = "command policy is deliberately co-located"
 )]
 fn outlook_data(
-    command: OutlookCommand,
+    mut command: OutlookCommand,
     dry_run: bool,
     yes: bool,
     profile_name: &str,
     vault: &dyn TokenVault,
 ) -> Result<Value, AppError> {
+    resolve_compose_body(&mut command)?;
     validate_outlook_command(&command)?;
     let (name, _mutation) = match &command {
         OutlookCommand::Folders {
@@ -703,16 +876,6 @@ fn outlook_data(
                 return Err(AppError::new(
                     "confirmation_required",
                     "sending mail requires --confirm-send",
-                ));
-            }
-            if let OutlookCommand::Mail {
-                command: MailCommand::Reply { comment, body, .. },
-            } = &command
-                && comment.is_some() == body.is_some()
-            {
-                return Err(AppError::new(
-                    "invalid_reply",
-                    "reply requires exactly one of --comment or --body",
                 ));
             }
             let name = match &command {
@@ -837,13 +1000,13 @@ fn execute_outlook(
         OutlookCommand::Mail { command: MailCommand::Move { id, folder } } => mail.move_message(&id, &folder),
         OutlookCommand::Mail { command: MailCommand::Copy { id, folder } } => mail.copy_message(&id, &folder),
         OutlookCommand::Mail { command: MailCommand::Delete { id } } => mail.soft_delete(&id),
-        OutlookCommand::Mail { command: MailCommand::DraftCreate { to, subject, body, body_type } } => mail.draft_create(message(&to, &subject, &body, &body_type)),
-        OutlookCommand::Mail { command: MailCommand::DraftUpdate { id, subject, body, body_type } } => mail.draft_update(&id, json!({"subject":subject,"body":body.map(|content| json!({"contentType":body_type.graph(),"content":content}))})),
-        OutlookCommand::Mail { command: MailCommand::Send { to, subject, body, body_type, .. } } => mail.send(&message(&to, &subject, &body, &body_type)),
+        OutlookCommand::Mail { command: MailCommand::DraftCreate { to, subject, body, body_type, .. } } => mail.draft_create(message(&to, &subject, body.as_deref().expect("validated body"), &body_type)),
+        OutlookCommand::Mail { command: MailCommand::DraftUpdate { id, legacy_id, subject, body, body_type, .. } } => mail.draft_update(id.as_deref().or(legacy_id.as_deref()).expect("validated id"), json!({"subject":subject,"body":body.map(|content| json!({"contentType":body_type.graph(),"content":content}))})),
+        OutlookCommand::Mail { command: MailCommand::Send { to, subject, body, body_type, .. } } => mail.send(&message(&to, &subject, body.as_deref().expect("validated body"), &body_type)),
         OutlookCommand::Mail { command: MailCommand::SendDraft { id, .. } } => mail.send_draft(&id).map(|_| json!({"accepted":true})),
-        OutlookCommand::Mail { command: MailCommand::Reply { id, comment, body, .. } } => mail.reply(&id, json!({"comment":comment.or(body)}), false).map(|_| json!({"accepted":true})),
-        OutlookCommand::Mail { command: MailCommand::ReplyAll { id, comment, .. } } => mail.reply(&id, json!({"comment":comment}), true).map(|_| json!({"accepted":true})),
-        OutlookCommand::Mail { command: MailCommand::Forward { id, to, comment, .. } } => mail.forward(&id, json!({"comment":comment,"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>() })).map(|_| json!({"accepted":true})),
+        OutlookCommand::Mail { command: MailCommand::Reply { id, comment, body, body_type, .. } } => mail.reply(&id, comment.map_or_else(|| json!({"message":{"body":{"contentType":body_type.graph(),"content":body.expect("validated body")}}}), |comment| json!({"comment":comment})), false).map(|_| json!({"accepted":true})),
+        OutlookCommand::Mail { command: MailCommand::ReplyAll { id, comment, body, body_type, .. } } => mail.reply(&id, comment.map_or_else(|| json!({"message":{"body":{"contentType":body_type.graph(),"content":body.expect("validated body")}}}), |comment| json!({"comment":comment})), true).map(|_| json!({"accepted":true})),
+        OutlookCommand::Mail { command: MailCommand::Forward { id, legacy_id, to, comment, body, body_type, .. } } => mail.forward(id.as_deref().or(legacy_id.as_deref()).expect("validated id"), comment.map_or_else(|| json!({"message":{"body":{"contentType":body_type.graph(),"content":body.expect("validated body")},"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>()}}), |comment| json!({"comment":comment,"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>() }))).map(|_| json!({"accepted":true})),
         OutlookCommand::Mail { command: MailCommand::Sync { folder, reset, limit } } => {
             if reset {
                 vault.delete_delta_link(profile_name, &graph_base, &folder).map_err(storage_error)?;

@@ -168,6 +168,66 @@ fn mail_operations_use_documented_routes_and_bodies() {
 }
 
 #[test]
+fn compose_operations_preserve_graph_body_and_comment_contracts() {
+    let http = FakeHttp::with(vec![
+        Ok(GraphResponse::json(201, r#"{"id":"draft"}"#)),
+        Ok(GraphResponse::json(200, r#"{"id":"draft"}"#)),
+        Ok(GraphResponse::json(202, "")),
+        Ok(GraphResponse::json(202, "")),
+        Ok(GraphResponse::json(202, "")),
+        Ok(GraphResponse::json(202, "")),
+    ]);
+    let mail = MailService::new(client(&http));
+    let body = serde_json::json!({"contentType":"HTML","content":"<p>hello</p>"});
+    mail.draft_create(serde_json::json!({"body":body})).unwrap();
+    mail.draft_update("id", serde_json::json!({"body":body}))
+        .unwrap();
+    mail.send(&serde_json::json!({"body":body})).unwrap();
+    mail.reply("id", serde_json::json!({"message":{"body":body}}), false)
+        .unwrap();
+    mail.reply("id", serde_json::json!({"comment":"thanks"}), true)
+        .unwrap();
+    mail.forward("id", serde_json::json!({"message":{"body":body,"toRecipients":[{"emailAddress":{"address":"a@example.test"}}]}})).unwrap();
+
+    let requests = http.requests.lock().unwrap();
+    for request in [
+        &requests[0],
+        &requests[1],
+        &requests[2],
+        &requests[3],
+        &requests[5],
+    ] {
+        assert!(
+            request
+                .body
+                .as_deref()
+                .unwrap()
+                .contains(r#""contentType":"HTML""#)
+        );
+        assert!(
+            request
+                .body
+                .as_deref()
+                .unwrap()
+                .contains(r#""content":"<p>hello</p>""#)
+        );
+    }
+    assert_eq!(
+        requests[3].url,
+        "https://graph.microsoft.com/v1.0/me/messages/id/reply"
+    );
+    assert_eq!(
+        requests[4].url,
+        "https://graph.microsoft.com/v1.0/me/messages/id/replyAll"
+    );
+    assert_eq!(requests[4].body.as_deref(), Some(r#"{"comment":"thanks"}"#));
+    assert_eq!(
+        requests[5].url,
+        "https://graph.microsoft.com/v1.0/me/messages/id/forward"
+    );
+}
+
+#[test]
 fn continuation_requires_same_configured_host_and_delta_link_is_exposed_only_at_end() {
     let http = FakeHttp::with(vec![Ok(GraphResponse::json(
         200,

@@ -208,7 +208,7 @@ fn compose_requires_one_utf8_body_source_and_valid_recipients() {
         ])
         .assert()
         .failure()
-        .stderr(contains("cannot be used with"));
+        .stderr(contains("body_source_conflict"));
     moff()
         .args([
             "--dry-run",
@@ -221,6 +221,118 @@ fn compose_requires_one_utf8_body_source_and_valid_recipients() {
             "thanks",
             "--body",
             "hello",
+            "--confirm-send",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid_reply"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn compose_body_sources_are_required_exclusive_and_validated_before_authentication() {
+    for args in [
+        [
+            "--dry-run",
+            "outlook",
+            "mail",
+            "send",
+            "--to",
+            "a@example.test",
+            "--confirm-send",
+        ]
+        .as_slice(),
+        [
+            "--dry-run",
+            "outlook",
+            "mail",
+            "draft-create",
+            "--to",
+            "a@example.test",
+        ]
+        .as_slice(),
+    ] {
+        moff()
+            .args(args)
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(contains("body_source_required"));
+    }
+
+    let root = std::env::temp_dir().join(format!("moff-invalid-body-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let invalid = root.join("invalid.txt");
+    std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
+    let oversized = root.join("oversized.txt");
+    std::fs::write(&oversized, vec![b'x'; 1_048_577]).unwrap();
+    for (path, code) in [
+        (&invalid, "invalid_body_utf8"),
+        (&oversized, "body_too_large"),
+    ] {
+        moff()
+            .args([
+                "outlook",
+                "mail",
+                "send",
+                "--to",
+                "a@example.test",
+                "--body-file",
+                path.to_str().unwrap(),
+                "--confirm-send",
+            ])
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(contains(code))
+            .stderr(contains("authentication").not());
+    }
+    let valid = root.join("valid.txt");
+    std::fs::write(&valid, "file body\n").unwrap();
+    moff()
+        .args([
+            "--dry-run",
+            "outlook",
+            "mail",
+            "send",
+            "--to",
+            "a@example.test",
+            "--body-file",
+            valid.to_str().unwrap(),
+            "--confirm-send",
+        ])
+        .assert()
+        .success();
+    moff()
+        .args([
+            "--dry-run",
+            "outlook",
+            "mail",
+            "reply",
+            "--id",
+            "immutable-id",
+            "--body-stdin",
+            "--body-type",
+            "html",
+            "--confirm-send",
+        ])
+        .write_stdin("<p>stdin body</p>")
+        .assert()
+        .success();
+    std::fs::remove_dir_all(root).unwrap();
+
+    moff()
+        .args([
+            "--dry-run",
+            "outlook",
+            "mail",
+            "reply",
+            "--id",
+            "immutable-id",
+            "--comment",
+            "thanks",
+            "--body-file",
+            "missing.txt",
             "--confirm-send",
         ])
         .assert()
