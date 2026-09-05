@@ -112,6 +112,147 @@ fn outlook_mail_commands_expose_guarded_dry_run_and_send_confirmation() {
 }
 
 #[test]
+fn outlook_mail_read_grammar_validates_typed_inputs_before_any_networking() {
+    let value = json_stdout(&[
+        "--dry-run",
+        "outlook",
+        "mail",
+        "list",
+        "--unread",
+        "--from",
+        "alice@example.test",
+        "--since",
+        "2026-09-05T12:30:00Z",
+    ]);
+    assert_eq!(value["command"], "outlook.mail.list");
+    moff()
+        .args([
+            "--dry-run",
+            "outlook",
+            "mail",
+            "list",
+            "--from",
+            "not-an-address",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid_email"));
+    moff()
+        .args([
+            "--dry-run",
+            "outlook",
+            "mail",
+            "list",
+            "--since",
+            "yesterday",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid_rfc3339"));
+    moff()
+        .args([
+            "--dry-run",
+            "outlook",
+            "mail",
+            "get",
+            "--id",
+            "immutable-id",
+            "--body",
+            "none",
+        ])
+        .assert()
+        .success();
+    moff()
+        .args([
+            "--dry-run",
+            "outlook",
+            "mail",
+            "attachments",
+            "list",
+            "--id",
+            "immutable-id",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn compose_requires_one_utf8_body_source_and_valid_recipients() {
+    moff()
+        .args([
+            "--dry-run",
+            "outlook",
+            "mail",
+            "send",
+            "--to",
+            "not-an-address",
+            "--body",
+            "hello",
+            "--confirm-send",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid_email"));
+    moff()
+        .args([
+            "--dry-run",
+            "outlook",
+            "mail",
+            "send",
+            "--to",
+            "a@example.test",
+            "--body",
+            "hello",
+            "--body-stdin",
+            "--confirm-send",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("cannot be used with"));
+    moff()
+        .args([
+            "--dry-run",
+            "outlook",
+            "mail",
+            "reply",
+            "--id",
+            "immutable-id",
+            "--comment",
+            "thanks",
+            "--body",
+            "hello",
+            "--confirm-send",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid_reply"));
+}
+
+#[test]
+fn sync_reset_requires_explicit_local_state_confirmation_and_supports_limit() {
+    moff()
+        .args(["outlook", "mail", "sync", "--reset"])
+        .assert()
+        .failure()
+        .stderr(contains("--yes"));
+    json_stdout(&[
+        "--dry-run",
+        "--yes",
+        "outlook",
+        "mail",
+        "sync",
+        "--reset",
+        "--limit",
+        "1000",
+    ]);
+    moff()
+        .args(["--dry-run", "outlook", "mail", "sync", "--limit", "1001"])
+        .assert()
+        .failure()
+        .stderr(contains("invalid_limit"));
+}
+
+#[test]
 fn auth_login_rejects_invalid_client_id_before_networking() {
     moff()
         .args(["auth", "login", "--client-id", "not-a-uuid"])
@@ -207,7 +348,7 @@ fn persisted_profile_preflights_typed_scope_before_touching_keychain_or_graph() 
 fn dry_run_dispatches_list_get_and_send_without_credentials_or_mutation() {
     for args in [
         ["--dry-run", "outlook", "mail", "list"].as_slice(),
-        ["--dry-run", "outlook", "mail", "get", "id"].as_slice(),
+        ["--dry-run", "outlook", "mail", "get", "--id", "id"].as_slice(),
         [
             "--dry-run",
             "outlook",

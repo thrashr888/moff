@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use moff_core::{
-    GraphClient, GraphError, GraphHttp, GraphRequest, GraphResponse, InMemoryVault, MailService,
-    Sleeper, TokenVault,
+    BodyPreference, GetMessageOptions, GraphClient, GraphError, GraphHttp, GraphRequest,
+    GraphResponse, InMemoryVault, ListMessagesOptions, MailService, Sleeper, TokenVault,
 };
 
 struct FakeHttp {
@@ -55,6 +55,83 @@ fn list_and_search_map_to_safe_graph_requests_and_label_untrusted_email() {
         requests
             .iter()
             .all(|request| request.headers["Authorization"] != "secret-token")
+    );
+}
+
+#[test]
+fn typed_list_filters_and_folder_search_are_encoded_without_raw_query_injection() {
+    let http = FakeHttp::with(vec![
+        Ok(GraphResponse::json(200, r#"{"value":[]}"#)),
+        Ok(GraphResponse::json(200, r#"{"value":[]}"#)),
+    ]);
+    let mail = MailService::new(client(&http));
+    mail.list_with_options(
+        "inbox",
+        ListMessagesOptions {
+            limit: 25,
+            unread: true,
+            from: Some("alice@example.test"),
+            since: Some("2026-09-05T12:30:00Z"),
+        },
+    )
+    .unwrap();
+    mail.search_in_folder("project & urgent", Some("archive"), 25)
+        .unwrap();
+    let requests = http.requests.lock().unwrap();
+    assert!(requests[0].url.contains("%24filter=isRead%20eq%20false%20and%20from%2FemailAddress%2Faddress%20eq%20%27alice%40example.test%27%20and%20receivedDateTime%20ge%202026-09-05T12%3A30%3A00Z"));
+    assert!(!requests[0].url.contains("$filter"));
+    assert!(
+        requests[1]
+            .url
+            .starts_with("https://graph.microsoft.com/v1.0/me/mailFolders/archive/messages?")
+    );
+    assert!(
+        requests[1]
+            .url
+            .contains("%24search=%22project%20%26%20urgent%22")
+    );
+    assert!(!requests[1].headers.contains_key("ConsistencyLevel"));
+}
+
+#[test]
+fn get_options_use_minimal_selection_and_explicit_body_preference() {
+    let http = FakeHttp::with(vec![
+        Ok(GraphResponse::json(200, r#"{"id":"m"}"#)),
+        Ok(GraphResponse::json(200, r#"{"id":"m"}"#)),
+    ]);
+    let mail = MailService::new(client(&http));
+    mail.get_with_options(
+        "immutable-id",
+        GetMessageOptions {
+            body: BodyPreference::None,
+            include_headers: false,
+        },
+    )
+    .unwrap();
+    mail.get_with_options(
+        "immutable-id",
+        GetMessageOptions {
+            body: BodyPreference::Text,
+            include_headers: true,
+        },
+    )
+    .unwrap();
+    let requests = http.requests.lock().unwrap();
+    assert!(
+        requests[0]
+            .url
+            .contains("%24select=id%2Csubject%2Cfrom%2CtoRecipients%2CreceivedDateTime%2CisRead")
+    );
+    assert!(!requests[0].url.contains("body"));
+    assert!(requests[1].url.contains("%2Cbody%2CinternetMessageHeaders"));
+    assert!(
+        requests[1]
+            .url
+            .contains("%24expand=attachments%28%24select%3Did%2Cname%2Csize%2CcontentType%29")
+    );
+    assert_eq!(
+        requests[1].headers["Prefer"],
+        "IdType=\"ImmutableId\", outlook.body-content-type=\"text\""
     );
 }
 

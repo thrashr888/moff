@@ -204,6 +204,12 @@ pub trait TokenVault {
         folder: &str,
         delta_link: &str,
     ) -> Result<(), DeviceFlowError>;
+    fn delete_delta_link(
+        &self,
+        profile: &str,
+        graph_base: &str,
+        folder: &str,
+    ) -> Result<(), DeviceFlowError>;
 }
 pub struct KeyringVault;
 impl KeyringVault {
@@ -266,6 +272,17 @@ impl TokenVault for KeyringVault {
         Self::delta_entry(profile, graph_base, folder)?
             .set_password(delta_link)
             .map_err(|_| DeviceFlowError::Storage)
+    }
+    fn delete_delta_link(
+        &self,
+        profile: &str,
+        graph_base: &str,
+        folder: &str,
+    ) -> Result<(), DeviceFlowError> {
+        match Self::delta_entry(profile, graph_base, folder)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err(DeviceFlowError::Storage),
+        }
     }
 }
 #[derive(Default)]
@@ -334,6 +351,22 @@ impl TokenVault for InMemoryVault {
                 ),
                 delta_link.to_owned(),
             );
+        Ok(())
+    }
+    fn delete_delta_link(
+        &self,
+        profile: &str,
+        graph_base: &str,
+        folder: &str,
+    ) -> Result<(), DeviceFlowError> {
+        self.delta_links
+            .lock()
+            .map_err(|_| DeviceFlowError::Storage)?
+            .remove(&(
+                ProfileStore::validate_profile_name(profile)?,
+                graph_base.to_owned(),
+                folder.to_owned(),
+            ));
         Ok(())
     }
 }
@@ -471,6 +504,15 @@ impl<'a> GraphClient<'a> {
         }
     }
     fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, GraphError> {
+        self.request_with_headers(method, path, body, BTreeMap::new())
+    }
+    fn request_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        extra_headers: BTreeMap<String, String>,
+    ) -> Result<Value, GraphError> {
         let url = if self.is_permitted_absolute_url(path) {
             path.to_owned()
         } else {
@@ -491,6 +533,7 @@ impl<'a> GraphClient<'a> {
         if url.contains("/messages") || url.contains("/attachments") {
             headers.insert("Prefer".to_owned(), "IdType=\"ImmutableId\"".to_owned());
         }
+        headers.extend(extra_headers);
         let encoded = body
             .map(|value| serde_json::to_string(&value).map_err(|_| GraphError::Protocol))
             .transpose()?;
@@ -537,6 +580,13 @@ impl<'a> GraphClient<'a> {
     }
     pub fn get_json(&self, path: &str) -> Result<Value, GraphError> {
         self.request("GET", path, None)
+    }
+    pub fn get_json_with_headers(
+        &self,
+        path: &str,
+        headers: BTreeMap<String, String>,
+    ) -> Result<Value, GraphError> {
+        self.request_with_headers("GET", path, None, headers)
     }
     pub fn post_json(&self, path: &str, body: Value) -> Result<Value, GraphError> {
         self.request("POST", path, Some(body))
@@ -604,6 +654,24 @@ impl<'a> GraphClient<'a> {
 }
 
 /// Graph Mail routes with deterministic, injectable HTTP transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyPreference {
+    Html,
+    Text,
+    None,
+}
+#[derive(Debug, Clone, Copy)]
+pub struct GetMessageOptions {
+    pub body: BodyPreference,
+    pub include_headers: bool,
+}
+#[derive(Debug, Clone, Copy)]
+pub struct ListMessagesOptions<'a> {
+    pub limit: u16,
+    pub unread: bool,
+    pub from: Option<&'a str>,
+    pub since: Option<&'a str>,
+}
 pub struct MailService<'a> {
     client: GraphClient<'a>,
 }
@@ -634,13 +702,83 @@ impl<'a> MailService<'a> {
     pub fn list(&self, folder: &str, limit: u16) -> Result<Value, GraphError> {
         Ok(Self::messages(&self.client.get_json(&format!("/me/mailFolders/{}/messages?$select=id%2Csubject%2Cfrom%2CreceivedDateTime%2CisRead&$top={limit}", Self::escape(folder)))?))
     }
+    pub fn list_with_options(
+        &self,
+        folder: &str,
+        options: ListMessagesOptions<'_>,
+    ) -> Result<Value, GraphError> {
+        let mut predicates = Vec::new();
+        if options.unread {
+            predicates.push("isRead eq false".to_owned());
+        }
+        if let Some(address) = options.from {
+            predicates.push(format!("from/emailAddress/address eq '{address}'"));
+        }
+        if let Some(since) = options.since {
+            predicates.push(format!("receivedDateTime ge {since}"));
+        }
+        let mut query = format!(
+            "%24select=id%2Csubject%2Cfrom%2CreceivedDateTime%2CisRead&%24top={}",
+            options.limit
+        );
+        if !predicates.is_empty() {
+            query.push_str("&%24filter=");
+            query.push_str(&Self::escape(&predicates.join(" and ")));
+        }
+        Ok(Self::messages(&self.client.get_json(&format!(
+            "/me/mailFolders/{}/messages?{query}",
+            Self::escape(folder)
+        ))?))
+    }
     pub fn search(&self, query: &str, limit: u16) -> Result<Value, GraphError> {
         Ok(Self::messages(&self.client.get_json(&format!("/me/messages?$search=%22{}%22&$select=id%2Csubject%2Cfrom%2CreceivedDateTime%2CisRead&$top={limit}", Self::escape(query)))?))
+    }
+    pub fn search_in_folder(
+        &self,
+        query: &str,
+        folder: Option<&str>,
+        limit: u16,
+    ) -> Result<Value, GraphError> {
+        let route = folder.map_or_else(
+            || "/me/messages".to_owned(),
+            |folder| format!("/me/mailFolders/{}/messages", Self::escape(folder)),
+        );
+        Ok(Self::messages(&self.client.get_json(&format!(
+            "{route}?%24search=%22{}%22&%24select=id%2Csubject%2Cfrom%2CreceivedDateTime%2CisRead&%24top={limit}",
+            Self::escape(query)
+        ))?))
     }
     pub fn get(&self, id: &str) -> Result<Value, GraphError> {
         let mut result = self
             .client
             .get_json(&format!("/me/messages/{}", Self::escape(id)))?;
+        result["content_origin"] = json!("external_email_untrusted");
+        Ok(result)
+    }
+    pub fn get_with_options(
+        &self,
+        id: &str,
+        options: GetMessageOptions,
+    ) -> Result<Value, GraphError> {
+        let mut select = "id,subject,from,toRecipients,receivedDateTime,isRead".to_owned();
+        if options.body != BodyPreference::None {
+            select.push_str(",body");
+        }
+        if options.include_headers {
+            select.push_str(",internetMessageHeaders");
+        }
+        let query = format!(
+            "%24select={}&%24expand=attachments%28%24select%3Did%2Cname%2Csize%2CcontentType%29",
+            Self::escape(&select)
+        );
+        let prefer = match options.body {
+            BodyPreference::Text => "IdType=\"ImmutableId\", outlook.body-content-type=\"text\"",
+            BodyPreference::Html | BodyPreference::None => "IdType=\"ImmutableId\"",
+        };
+        let mut result = self.client.get_json_with_headers(
+            &format!("/me/messages/{}?{query}", Self::escape(id)),
+            BTreeMap::from([("Prefer".to_owned(), prefer.to_owned())]),
+        )?;
         result["content_origin"] = json!("external_email_untrusted");
         Ok(result)
     }
@@ -734,12 +872,23 @@ impl<'a> MailService<'a> {
         )
     }
     pub fn delta(&self, folder: &str, continuation: Option<&str>) -> Result<Value, GraphError> {
-        let value = match continuation {
-            Some(link) => self.client.next_json(link)?,
-            None => self.client.get_json(&format!(
-                "/me/mailFolders/{}/messages/delta",
-                Self::escape(folder)
-            ))?,
+        self.delta_limited(folder, continuation, None)
+    }
+    pub fn delta_limited(
+        &self,
+        folder: &str,
+        continuation: Option<&str>,
+        limit: Option<u16>,
+    ) -> Result<Value, GraphError> {
+        let value = if let Some(link) = continuation {
+            self.client.next_json(link)?
+        } else {
+            let route = format!("/me/mailFolders/{}/messages/delta", Self::escape(folder));
+            let route = match limit {
+                Some(limit) => format!("{route}?%24top={limit}"),
+                None => route,
+            };
+            self.client.get_json(&route)?
         };
         Ok(
             json!({"content_origin":"external_email_untrusted","value":value["value"].clone(),"next_link":value["@odata.nextLink"].clone(),"delta_link":value["@odata.deltaLink"].clone()}),

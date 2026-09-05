@@ -12,9 +12,10 @@ use std::process::ExitCode;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use moff_core::{
-    AuthService, DeviceFlowError, ErrorCode, GraphClient, GraphError, GraphHttp, GraphRequest,
-    GraphResponse, HttpClient, HttpResponse, KeyringVault, MailService, Profile, ProfileStore,
-    ThreadSleeper, TokenVault, known_source, schema,
+    AuthService, BodyPreference, DeviceFlowError, ErrorCode, GetMessageOptions, GraphClient,
+    GraphError, GraphHttp, GraphRequest, GraphResponse, HttpClient, HttpResponse, KeyringVault,
+    ListMessagesOptions, MailService, Profile, ProfileStore, ThreadSleeper, TokenVault,
+    known_source, schema,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -85,14 +86,31 @@ enum MailCommand {
         folder: String,
         #[arg(long, default_value_t = 25)]
         limit: u16,
+        #[arg(long)]
+        unread: bool,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
     },
     Search {
         query: String,
+        #[arg(long)]
+        folder: Option<String>,
         #[arg(long, default_value_t = 25)]
         limit: u16,
     },
     Get {
+        #[arg(long)]
         id: String,
+        #[arg(long, value_enum, default_value_t = GetBody::Html)]
+        body: GetBody,
+        #[arg(long)]
+        include_headers: bool,
+    },
+    Attachments {
+        #[command(subcommand)]
+        command: AttachmentsCommand,
     },
     Mark {
         id: String,
@@ -136,6 +154,8 @@ enum MailCommand {
         subject: Option<String>,
         #[arg(long)]
         body: String,
+        #[arg(long, conflicts_with = "body")]
+        body_stdin: bool,
         #[arg(long)]
         confirm_send: bool,
         #[arg(long, value_enum, default_value_t = BodyType::Text)]
@@ -147,6 +167,7 @@ enum MailCommand {
         confirm_send: bool,
     },
     Reply {
+        #[arg(long)]
         id: String,
         #[arg(long)]
         comment: Option<String>,
@@ -174,6 +195,10 @@ enum MailCommand {
     Sync {
         #[arg(long, default_value = "inbox")]
         folder: String,
+        #[arg(long)]
+        reset: bool,
+        #[arg(long, default_value_t = 100)]
+        limit: u16,
     },
 }
 #[derive(Clone, Debug, ValueEnum)]
@@ -190,13 +215,31 @@ impl BodyType {
         }
     }
 }
+#[derive(Clone, Debug, ValueEnum)]
+enum GetBody {
+    Html,
+    Text,
+    None,
+}
+impl GetBody {
+    const fn preference(&self) -> BodyPreference {
+        match self {
+            Self::Html => BodyPreference::Html,
+            Self::Text => BodyPreference::Text,
+            Self::None => BodyPreference::None,
+        }
+    }
+}
 #[derive(Debug, Subcommand)]
 enum AttachmentsCommand {
     List {
-        message_id: String,
+        #[arg(long)]
+        id: String,
     },
     Download {
-        message_id: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
         attachment_id: String,
         #[arg(long)]
         output: String,
@@ -309,6 +352,63 @@ fn profile_name(value: Option<String>) -> Result<String, AppError> {
 fn valid_tenant(value: &str) -> bool {
     matches!(value, "common" | "consumers" | "organizations") || Uuid::parse_str(value).is_ok()
 }
+fn valid_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && !value.contains(char::is_whitespace)
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && domain.contains('.')
+        && !domain.contains("..")
+        && value.matches('@').count() == 1
+}
+fn valid_rfc3339(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 20
+        && bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && bytes.get(10) == Some(&b'T')
+        && bytes.get(13) == Some(&b':')
+        && bytes.get(16) == Some(&b':')
+        && (value.ends_with('Z') || value[19..].starts_with('+') || value[19..].starts_with('-'))
+        && bytes[..19]
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit())
+}
+fn validate_outlook_command(command: &OutlookCommand) -> Result<(), AppError> {
+    match command {
+        OutlookCommand::Mail {
+            command: MailCommand::List { from, since, .. },
+        } => {
+            if from.as_deref().is_some_and(|value| !valid_email(value)) {
+                return Err(AppError::new(
+                    "invalid_email",
+                    "--from must be a valid email address",
+                ));
+            }
+            if since.as_deref().is_some_and(|value| !valid_rfc3339(value)) {
+                return Err(AppError::new("invalid_rfc3339", "--since must be RFC3339"));
+            }
+        }
+        OutlookCommand::Mail {
+            command:
+                MailCommand::Send { to, .. }
+                | MailCommand::Forward { to, .. }
+                | MailCommand::DraftCreate { to, .. },
+        } if to.iter().any(|value| !valid_email(value)) => {
+            return Err(AppError::new(
+                "invalid_email",
+                "recipient must be a valid email address",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
 fn emit_json(value: &Value, pretty: bool) -> io::Result<()> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -385,6 +485,7 @@ fn sync_delta_cycle(
     profile_name: &str,
     graph_base: &str,
     folder: &str,
+    limit: u16,
 ) -> Result<Value, AppError> {
     let mut continuation = vault
         .get_delta_link(profile_name, graph_base, folder)
@@ -392,7 +493,7 @@ fn sync_delta_cycle(
     let mut records = Vec::new();
     loop {
         let delta = mail
-            .delta(folder, continuation.as_deref())
+            .delta_limited(folder, continuation.as_deref(), Some(limit))
             .map_err(graph_error)?;
         let values = delta["value"]
             .as_array()
@@ -505,15 +606,28 @@ fn outlook_data(
     profile_name: &str,
     vault: &dyn TokenVault,
 ) -> Result<Value, AppError> {
+    validate_outlook_command(&command)?;
     let (name, _mutation) = match &command {
         OutlookCommand::Folders {
             command: FoldersCommand::List,
         } => ("outlook.folders.list", false),
         OutlookCommand::Attachments {
             command: AttachmentsCommand::List { .. },
+        }
+        | OutlookCommand::Mail {
+            command:
+                MailCommand::Attachments {
+                    command: AttachmentsCommand::List { .. },
+                },
         } => ("outlook.attachments.list", false),
         OutlookCommand::Attachments {
             command: AttachmentsCommand::Download { force, .. },
+        }
+        | OutlookCommand::Mail {
+            command:
+                MailCommand::Attachments {
+                    command: AttachmentsCommand::Download { force, .. },
+                },
         } => {
             if *force && !yes {
                 return Err(AppError::new(
@@ -550,8 +664,22 @@ fn outlook_data(
             command: MailCommand::Get { .. },
         } => ("outlook.mail.get", false),
         OutlookCommand::Mail {
-            command: MailCommand::Sync { .. },
-        } => ("outlook.mail.sync", false),
+            command: MailCommand::Sync { limit, reset, .. },
+        } => {
+            if *limit > 1000 {
+                return Err(AppError::new(
+                    "invalid_limit",
+                    "result limit must be <= 1000",
+                ));
+            }
+            if *reset && !yes {
+                return Err(AppError::new(
+                    "confirmation_required",
+                    "sync reset requires --yes",
+                ));
+            }
+            ("outlook.mail.sync", false)
+        }
         OutlookCommand::Mail {
             command: MailCommand::Delete { .. },
         } => {
@@ -694,15 +822,17 @@ fn execute_outlook(
     let message = |to: &[String], subject: &Option<String>, body: &str, body_type: &BodyType| json!({"subject":subject,"body":{"contentType":body_type.graph(),"content":body},"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>()});
     let result = match command {
         OutlookCommand::Folders { .. } => mail.folders(),
-        OutlookCommand::Attachments { command: AttachmentsCommand::List { message_id } } => mail.attachments(&message_id),
-        OutlookCommand::Attachments { command: AttachmentsCommand::Download { message_id, attachment_id, output, force } } => {
-            let bytes = mail.download_attachment(&message_id, &attachment_id).map_err(graph_error)?;
+        OutlookCommand::Attachments { command: AttachmentsCommand::List { id } }
+        | OutlookCommand::Mail { command: MailCommand::Attachments { command: AttachmentsCommand::List { id } } } => mail.attachments(&id),
+        OutlookCommand::Attachments { command: AttachmentsCommand::Download { id, attachment_id, output, force } }
+        | OutlookCommand::Mail { command: MailCommand::Attachments { command: AttachmentsCommand::Download { id, attachment_id, output, force } } } => {
+            let bytes = mail.download_attachment(&id, &attachment_id).map_err(graph_error)?;
             write_attachment(Path::new(&output), &bytes, force)?;
             return Ok(json!({"output":output,"bytes":bytes.len()}));
         }
-        OutlookCommand::Mail { command: MailCommand::List { folder, limit } } => mail.list(&folder, limit),
-        OutlookCommand::Mail { command: MailCommand::Search { query, limit } } => mail.search(&query, limit),
-        OutlookCommand::Mail { command: MailCommand::Get { id } } => mail.get(&id),
+        OutlookCommand::Mail { command: MailCommand::List { folder, limit, unread, from, since } } => mail.list_with_options(&folder, ListMessagesOptions { limit, unread, from: from.as_deref(), since: since.as_deref() }),
+        OutlookCommand::Mail { command: MailCommand::Search { query, folder, limit } } => mail.search_in_folder(&query, folder.as_deref(), limit),
+        OutlookCommand::Mail { command: MailCommand::Get { id, body, include_headers } } => mail.get_with_options(&id, GetMessageOptions { body: body.preference(), include_headers }),
         OutlookCommand::Mail { command: MailCommand::Mark { id, read } } => mail.mark(&id, read),
         OutlookCommand::Mail { command: MailCommand::Move { id, folder } } => mail.move_message(&id, &folder),
         OutlookCommand::Mail { command: MailCommand::Copy { id, folder } } => mail.copy_message(&id, &folder),
@@ -714,8 +844,11 @@ fn execute_outlook(
         OutlookCommand::Mail { command: MailCommand::Reply { id, comment, body, .. } } => mail.reply(&id, json!({"comment":comment.or(body)}), false).map(|_| json!({"accepted":true})),
         OutlookCommand::Mail { command: MailCommand::ReplyAll { id, comment, .. } } => mail.reply(&id, json!({"comment":comment}), true).map(|_| json!({"accepted":true})),
         OutlookCommand::Mail { command: MailCommand::Forward { id, to, comment, .. } } => mail.forward(&id, json!({"comment":comment,"toRecipients":to.iter().map(|address| json!({"emailAddress":{"address":address}})).collect::<Vec<_>>() })).map(|_| json!({"accepted":true})),
-        OutlookCommand::Mail { command: MailCommand::Sync { folder } } => {
-            return sync_delta_cycle(&mail, vault, profile_name, &graph_base, &folder);
+        OutlookCommand::Mail { command: MailCommand::Sync { folder, reset, limit } } => {
+            if reset {
+                vault.delete_delta_link(profile_name, &graph_base, &folder).map_err(storage_error)?;
+            }
+            return sync_delta_cycle(&mail, vault, profile_name, &graph_base, &folder, limit);
         }
     };
     result.map_err(graph_error)
@@ -861,6 +994,7 @@ mod tests {
             "work",
             "https://graph.microsoft.com/v1.0",
             "inbox",
+            100,
         );
         assert!(result.is_ok());
         let result = result.ok().unwrap();
@@ -915,7 +1049,8 @@ mod tests {
                 &vault,
                 "work",
                 "https://graph.microsoft.com/v1.0",
-                "inbox"
+                "inbox",
+                100,
             )
             .is_err()
         );
@@ -956,7 +1091,8 @@ mod tests {
                     &vault,
                     "work",
                     "https://graph.microsoft.com/v1.0",
-                    "inbox"
+                    "inbox",
+                    100,
                 )
                 .is_err()
             );

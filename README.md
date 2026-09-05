@@ -6,11 +6,12 @@ Moff is an **agent-first Microsoft 365 CLI**. Outlook Mail uses delegated Micros
 
 ```sh
 moff outlook folders list
-moff outlook mail list --folder inbox --limit 25
-moff outlook mail search 'from:alice@example.com' --limit 25
-moff outlook mail get MESSAGE_ID
-moff outlook attachments list MESSAGE_ID
-moff outlook attachments download MESSAGE_ID ATTACHMENT_ID --output ./file
+moff outlook mail list --folder inbox --limit 25 --unread --from alice@example.com --since 2026-09-05T12:30:00Z
+moff outlook mail search 'from:alice@example.com' --folder inbox --limit 25
+moff outlook mail get --id MESSAGE_ID --body text --include-headers
+moff outlook mail attachments list --id MESSAGE_ID
+moff outlook mail attachments download --id MESSAGE_ID --attachment-id ATTACHMENT_ID --output ./file
+moff --yes outlook mail sync --folder inbox --reset --limit 100
 moff --yes outlook mail delete MESSAGE_ID
 moff --dry-run outlook mail move MESSAGE_ID FOLDER_ID
 ```
