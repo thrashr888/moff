@@ -17,7 +17,7 @@ path = "src/bin/moff-test.rs"
 required-features = ["test-support"]
 
 [features]
-test-support = ["moff-core/test-support"]
+test-support = ["moff-core/test-support", "moff-outlook-local/test-support"]
 
 [dependencies]
 clap = { version = "4.5.48", features = ["derive"] }

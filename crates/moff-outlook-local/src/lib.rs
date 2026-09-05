@@ -48,7 +48,14 @@ impl LocalError {
 }
 impl fmt::Display for LocalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.code())
+        f.write_str(match self {
+            Self::OutlookNotRunning => "Microsoft Outlook is not running",
+            Self::AccessibilityUntrusted => "Accessibility permission is not granted",
+            Self::UiUnsupported => {
+                "Outlook UI is unavailable or exposes no accessible content tree"
+            }
+            Self::UiChanged => "Outlook UI changed while it was being inspected",
+        })
     }
 }
 impl std::error::Error for LocalError {}
@@ -72,6 +79,14 @@ impl OutlookUi for OsaScriptOutlookUi {
         }
         #[cfg(target_os = "macos")]
         {
+            #[cfg(feature = "test-support")]
+            if matches!(request, UiRequest::Doctor)
+                && let Some(path) = std::env::var_os("MOFF_TEST_OUTLOOK_AX_FIXTURE")
+            {
+                let stdout =
+                    std::fs::read_to_string(path).map_err(|_| LocalError::UiUnsupported)?;
+                return Ok(UiReply::json(stdout));
+            }
             let script = match request {
                 UiRequest::Doctor => DOCTOR_JXA.to_owned(),
                 UiRequest::VisibleMail { limit } => visible_jxa(limit),
@@ -99,7 +114,26 @@ const DOCTOR_JXA: &str = r"
 const se = Application('System Events');
 const p = se.processes.byName('Microsoft Outlook');
 if (!p.exists()) JSON.stringify({state:'outlook_not_running'});
-else { let version='unknown'; try { version=String(p.applicationFile.version()); } catch (_) {} JSON.stringify({state:'ok', running:true, version:version, ui_available:p.windows().length > 0}); }
+else {
+  let version='unknown'; try { version=String(p.applicationFile.version()); } catch (_) {}
+  const w = p.windows[0];
+  if (!w || !w.exists()) JSON.stringify({state:'ui_changed'});
+  else {
+    const roles={}; let descendants=0;
+    const walk=(node, depth)=>{
+      if (depth>8 || descendants>=256) return;
+      let children=[]; try { children=node.UIElements(); } catch (_) { return; }
+      children.forEach(child=>{
+        if (descendants>=256) return;
+        let role=''; try { role=String(child.role()); } catch (_) { return; }
+        descendants+=1; roles[role]=(roles[role] || 0)+1; walk(child, depth+1);
+      });
+    };
+    walk(w, 0);
+    JSON.stringify({state:'ok', running:true, version:version, ui_available:true,
+      ax_descendant_count:descendants, ax_roles:roles});
+  }
+}
 ";
 fn visible_jxa(limit: u16) -> String {
     // This is inspection only: no activate, keystroke, click, set, or navigation.
@@ -148,8 +182,14 @@ pub fn doctor(ui: &dyn OutlookUi) -> Result<Value, LocalError> {
     let reply = ui.run(UiRequest::Doctor)?;
     let value = decoded(&reply)?;
     state(&value)?;
+    let descendant_count = value["ax_descendant_count"]
+        .as_u64()
+        .ok_or(LocalError::UiUnsupported)?;
+    if descendant_count == 0 {
+        return Err(LocalError::UiUnsupported);
+    }
     Ok(
-        json!({"command":"outlook.doctor","provider":"local-macos","platform":"macos","supported":true,"bundle_id":"com.microsoft.Outlook","version":value["version"],"running":true,"ui_available":value["ui_available"],"ax_preflight":"usable","network":false,"auth_calls":false}),
+        json!({"command":"outlook.doctor","provider":"local-macos","platform":"macos","supported":true,"bundle_id":"com.microsoft.Outlook","version":value["version"],"running":true,"ui_available":value["ui_available"],"ax_preflight":"usable","ax_descendant_count":descendant_count,"ax_roles":value["ax_roles"],"network":false,"auth_calls":false}),
     )
 }
 
@@ -211,10 +251,20 @@ mod tests {
     #[test]
     fn doctor_does_not_return_mail_data() {
         let ui = Fixture {
-            reply: UiReply::json(r#"{"state":"ok","ui_available":true}"#),
+            reply: UiReply::json(
+                r#"{"state":"ok","ui_available":true,"ax_descendant_count":1,"ax_roles":{"AXGroup":1}}"#,
+            ),
         };
         let result = doctor(&ui).unwrap();
         assert!(result.get("rows").is_none());
         assert_eq!(result["auth_calls"], false);
+    }
+
+    #[test]
+    fn doctor_rejects_a_window_without_accessible_descendants() {
+        let ui = Fixture {
+            reply: UiReply::json(include_str!("../fixtures/inaccessible-ax-tree.json")),
+        };
+        assert_eq!(doctor(&ui).unwrap_err().code(), "ui_unsupported");
     }
 }

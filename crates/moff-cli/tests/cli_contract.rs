@@ -101,6 +101,22 @@ fn local_macos_provider_doctor_is_explicit_and_never_requires_auth() {
     assert_eq!(value["network"], false);
 }
 
+#[cfg(feature = "test-support")]
+#[test]
+fn local_macos_doctor_rejects_inaccessible_ax_fixture() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../moff-outlook-local/fixtures/inaccessible-ax-tree.json"
+    );
+    moff()
+        .env("MOFF_TEST_OUTLOOK_AX_FIXTURE", fixture)
+        .args(["outlook", "--provider", "local-macos", "doctor"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("[ui_unsupported]").and(contains("accessible content tree")));
+}
+
 #[test]
 fn local_macos_visible_requires_a_bounded_limit() {
     moff()
