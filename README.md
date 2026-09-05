@@ -19,11 +19,20 @@ Mail mutations include mark, move, copy, soft delete, draft-create/update, send,
 
 Graph item/message calls request stable immutable IDs. Only Graph-host pagination links are followed. The transport retries safe reads, never ambiguous mutations; callers must inspect an `outcome_unknown` failure before retrying a send or mutation. Attachment links/references are reported as unsupported rather than downloaded.
 
+## Install with Homebrew
+
+After a versioned release is published, install Moff from the shared tap:
+
+```sh
+brew install thrashr888/tap/moff
+```
+
 ## Build and test
 
 Requires Rust 1.98 or newer (edition 2024).
 
 ```sh
+cargo build --release
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
