@@ -141,6 +141,19 @@ fn auth_login_dry_run_prints_a_safe_plan_without_provider_calls() {
         );
 }
 #[test]
+fn auth_login_mail_write_dry_run_requests_mail_read_write() {
+    let value = json_stdout(&[
+        "--dry-run",
+        "auth",
+        "login",
+        "--client-id",
+        "11111111-1111-1111-1111-111111111111",
+        "--scope",
+        "mail.write",
+    ]);
+    assert_eq!(value["scopes"][0], "Mail.ReadWrite");
+}
+#[test]
 fn invalid_profile_is_rejected_by_prompt_free_auth_status() {
     moff()
         .args(["--profile", "../bad", "auth", "status"])

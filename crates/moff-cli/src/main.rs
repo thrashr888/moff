@@ -230,7 +230,7 @@ impl Scope {
     const fn as_entra(&self) -> &'static str {
         match self {
             Self::MailRead => "Mail.Read",
-            Self::MailWrite => "Mail.Write",
+            Self::MailWrite => "Mail.ReadWrite",
             Self::MailSend => "Mail.Send",
         }
     }
