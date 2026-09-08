@@ -1,0 +1,137 @@
+use moff_outlook_owa::{
+    DraftInput, EventInput, GraphWebSession, OutlookWebSession, create_draft_request,
+    create_event_request, delete_event_request, delete_message_request, search_item_request,
+    update_draft_request, update_event_request,
+};
+use serde_json::json;
+
+#[test]
+fn draft_writes_use_observed_exchange_envelopes_and_never_send() {
+    let input: DraftInput =
+        serde_json::from_value(json!({"subject":"synthetic", "body":"<text>"})).unwrap();
+    let create = create_draft_request(&input).unwrap();
+    assert_eq!(create["__type"], "CreateItemJsonRequest:#Exchange");
+    assert_eq!(create["Body"]["MessageDisposition"], "SaveOnly");
+    assert_eq!(create["Body"]["Items"][0]["__type"], "Message:#Exchange");
+    assert!(create["Body"].get("SendOnNotFoundError").is_none());
+    let update = update_draft_request("synthetic-id", "synthetic-key", &input).unwrap();
+    assert_eq!(
+        update["Body"]["ItemChanges"][0]["ItemId"]["ChangeKey"],
+        "synthetic-key"
+    );
+    assert_eq!(
+        update["Body"]["ItemChanges"][0]["Updates"][0]["Path"]["FieldURI"],
+        "Subject"
+    );
+    assert_eq!(update["Body"]["MessageDisposition"], "SaveOnly");
+    let delete = delete_message_request("synthetic-id", "synthetic-key").unwrap();
+    assert_eq!(delete["Body"]["DeleteType"], "HardDelete");
+    assert_eq!(delete["Body"]["SuppressReadReceipts"], true);
+}
+
+#[test]
+fn search_uses_minimal_properties_instead_of_all_properties() {
+    let request = search_item_request("synthetic-id");
+    let shape = &request["Body"]["ItemShape"];
+    assert_eq!(shape["BaseShape"], "IdOnly");
+    assert_eq!(shape["BodyType"], "Text");
+    assert_eq!(
+        shape["AdditionalProperties"],
+        json!([
+            {"__type":"PropertyUri:#Exchange","FieldURI":"Subject"},
+            {"__type":"PropertyUri:#Exchange","FieldURI":"Body"}
+        ])
+    );
+}
+
+#[test]
+fn calendar_writes_use_distinct_observed_actions_and_single_event_scope() {
+    let input: EventInput = serde_json::from_value(json!({
+        "subject":"synthetic", "body":"test",
+        "start":"2026-09-20T12:00:00Z", "end":"2026-09-20T13:00:00Z"
+    }))
+    .unwrap();
+    let create = create_event_request("synthetic-folder", &input).unwrap();
+    assert_eq!(create["__type"], "CreateItemJsonRequest:#Exchange");
+    assert_eq!(
+        create["Body"]["Items"][0]["__type"],
+        "CalendarItem:#Exchange"
+    );
+    assert_eq!(create["Body"]["SendMeetingInvitations"], "SendToNone");
+    assert_eq!(create["Body"]["Items"][0]["ReminderIsSet"], false);
+    let update = update_event_request("synthetic-id", &input).unwrap();
+    assert_eq!(update["__type"], "UpdateCalendarEventJsonRequest:#Exchange");
+    assert_eq!(update["Body"]["EventScope"], 0);
+    assert_eq!(update["Body"]["ShouldSendUpdateToAttendees"], false);
+    let delete = delete_event_request("synthetic-id").unwrap();
+    assert_eq!(
+        delete["Body"]["__type"],
+        "DeleteCalendarEventRequest:#Exchange"
+    );
+    assert_eq!(delete["Body"]["EventScope"], 0);
+}
+
+#[test]
+fn typed_inputs_reject_arbitrary_payloads_and_invalid_intervals() {
+    assert!(serde_json::from_value::<DraftInput>(json!({"toRecipients":[]})).is_err());
+    assert!(serde_json::from_value::<EventInput>(json!({"attendees":[]})).is_err());
+    let empty: DraftInput = serde_json::from_value(json!({})).unwrap();
+    assert!(create_draft_request(&empty).is_ok());
+    assert!(update_draft_request("id", "key", &empty).is_err());
+    for (start, end) in [
+        ("not-a-date", "2026-09-20T13:00:00Z"),
+        ("2026-02-30T12:00:00Z", "2026-03-01T13:00:00Z"),
+        ("2026-09-20T13:00:00Z", "2026-09-20T12:00:00Z"),
+    ] {
+        let input: EventInput =
+            serde_json::from_value(json!({"subject":"synthetic","start":start,"end":end})).unwrap();
+        assert!(create_event_request("folder", &input).is_err());
+    }
+}
+
+#[test]
+fn calendar_times_preserve_fractional_seconds_when_normalized() {
+    let input: EventInput = serde_json::from_value(json!({
+        "subject":"synthetic", "start":"2026-09-20T14:00:00.125+02:00",
+        "end":"2026-09-20T14:00:00.875+02:00"
+    }))
+    .unwrap();
+    let request = create_event_request("synthetic-folder", &input).unwrap();
+    assert_eq!(
+        request["Body"]["Items"][0]["Start"],
+        "2026-09-20T12:00:00.125Z"
+    );
+    assert_eq!(
+        request["Body"]["Items"][0]["End"],
+        "2026-09-20T12:00:00.875Z"
+    );
+}
+
+#[test]
+fn read_escape_hatch_stays_read_only_and_graph_cannot_access_outlook() {
+    let owa =
+        OutlookWebSession::from_curl_text("curl 'https://outlook.cloud.microsoft/owa/service.svc'")
+            .unwrap();
+    for action in [
+        "CreateItem",
+        "UpdateItem",
+        "DeleteItem",
+        "CreateCalendarEvent",
+        "UpdateCalendarEvent",
+        "DeleteCalendarEvent",
+        "SendItem",
+    ] {
+        assert!(owa.request_parts(action, &json!({})).is_err());
+    }
+    let graph =
+        GraphWebSession::from_curl_text("curl 'https://graph.microsoft.com/v1.0/organization'")
+            .unwrap();
+    for path in [
+        "/v1.0/me/messages",
+        "/v1.0/me/events",
+        "/v1.0/search/query",
+        "/v1.0/users/id/messages",
+    ] {
+        assert!(graph.request_parts(path).is_err());
+    }
+}
