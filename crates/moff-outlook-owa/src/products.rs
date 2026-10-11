@@ -2,6 +2,18 @@ use crate::{OutlookWebError, OutlookWebSession};
 use serde_json::{Value, json};
 use url::Url;
 
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 250_000_000;
+pub const MAX_FILE_BYTES: u64 = 250_000_000;
+
+pub fn validate_file_size(size: u64, max_bytes: u64) -> Result<(), OutlookWebError> {
+    if max_bytes == 0 || max_bytes > MAX_FILE_BYTES || size > max_bytes {
+        return Err(invalid(
+            "file exceeds --max-bytes or maximum is outside 1..=250000000",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn product_url(path: &str) -> Result<Url, OutlookWebError> {
     let reject = || OutlookWebError::InvalidInput("unsupported product read path or query");
     let raw_path = path.split_once('?').map_or(path, |(path, _)| path);
@@ -107,24 +119,38 @@ impl OutlookWebSession {
         }
     }
 
-    pub fn drive_download(&self, id: &str) -> Result<Vec<u8>, OutlookWebError> {
+    pub fn drive_download(
+        &self,
+        id: &str,
+        output: &mut impl std::io::Write,
+        max_bytes: u64,
+    ) -> Result<u64, OutlookWebError> {
         let url = format!(
             "https://graph.microsoft.com/v1.0/me/drive/items/{}",
             product_segment(id)?
         );
-        let value = match &self.transport {
-            crate::SessionTransport::Safari(safari) => safari.product_download(&url)?,
+        match &self.transport {
+            crate::SessionTransport::Safari(safari) => {
+                safari.product_download(&url, output, max_bytes)
+            }
             #[cfg(test)]
-            crate::SessionTransport::Mock(_) => return Err(OutlookWebError::InvalidAction),
-        };
-        let bytes: Vec<u8> = serde_json::from_value(value["bytes"].clone())
-            .map_err(|_| OutlookWebError::InvalidResponse)?;
-        if bytes.len() > 128_000 {
-            return Err(invalid(
-                "browser file transfers are limited to 128000 bytes",
-            ));
+            crate::SessionTransport::Mock(_) => Err(OutlookWebError::InvalidAction),
         }
-        Ok(bytes)
+    }
+
+    pub fn drive_upload(
+        &self,
+        request: &ProductWrite,
+        input: &mut impl std::io::Read,
+        max_bytes: u64,
+    ) -> Result<Value, OutlookWebError> {
+        match &self.transport {
+            crate::SessionTransport::Safari(safari) => {
+                safari.product_upload(request, input, max_bytes)
+            }
+            #[cfg(test)]
+            crate::SessionTransport::Mock(_) => Err(OutlookWebError::InvalidAction),
+        }
     }
 }
 
@@ -135,7 +161,7 @@ pub struct ProductWrite {
     pub(crate) method: &'static str,
     pub(crate) body: Option<Value>,
     pub(crate) etag: Option<String>,
-    pub(crate) bytes: Option<Vec<u8>>,
+    pub(crate) upload_size: Option<u64>,
 }
 
 fn invalid(message: &'static str) -> OutlookWebError {
@@ -184,14 +210,10 @@ impl ProductWrite {
         parent: Option<&str>,
         id: Option<&str>,
         name: Option<&str>,
-        bytes: Vec<u8>,
+        size: u64,
         etag: Option<&str>,
     ) -> Result<Self, OutlookWebError> {
-        if bytes.len() > 128_000 {
-            return Err(invalid(
-                "browser file transfers are limited to 128000 bytes",
-            ));
-        }
+        validate_file_size(size, MAX_FILE_BYTES)?;
         let path = if let Some(id) = id {
             if parent.is_some() || name.is_some() || etag.is_none() {
                 return Err(invalid(
@@ -208,7 +230,7 @@ impl ProductWrite {
             format!("/v1.0/me/drive/{base}:/{name}:/content?@microsoft.graph.conflictBehavior=fail")
         };
         let mut request = Self::new(path, "PUT", None, etag)?;
-        request.bytes = Some(bytes);
+        request.upload_size = Some(size);
         Ok(request)
     }
 
@@ -232,7 +254,7 @@ impl ProductWrite {
             method,
             body,
             etag: etag.map(str::to_owned),
-            bytes: None,
+            upload_size: None,
         })
     }
 
@@ -503,20 +525,20 @@ mod tests {
             ProductWrite::contact(Some("id"), "DELETE", Some(json!({"givenName":"x"})), None)
                 .is_err()
         );
-        let upload =
-            ProductWrite::drive_upload(None, None, Some("test.bin"), vec![0, 255], None).unwrap();
+        let upload = ProductWrite::drive_upload(None, None, Some("test.bin"), 2, None).unwrap();
         assert_eq!(upload.method, "PUT");
         assert!(
             upload
                 .url
                 .ends_with("test.bin:/content?@microsoft.graph.conflictBehavior=fail")
         );
-        assert_eq!(upload.bytes, Some(vec![0, 255]));
+        assert_eq!(upload.upload_size, Some(2));
+        assert!(ProductWrite::drive_upload(None, None, Some("large.bin"), 1_500_000, None).is_ok());
         assert!(
-            ProductWrite::drive_upload(None, None, Some("test.bin"), vec![0; 128_001], None)
+            ProductWrite::drive_upload(None, None, Some("test.bin"), MAX_FILE_BYTES + 1, None)
                 .is_err()
         );
-        assert!(ProductWrite::drive_upload(None, Some("id"), None, vec![], None).is_err());
+        assert!(ProductWrite::drive_upload(None, Some("id"), None, 0, None).is_err());
         assert!(ProductWrite::contact(None, "DELETE", None, None).is_err());
         assert!(
             ProductWrite::group(
@@ -577,5 +599,19 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn transfer_limits_are_required_ceilings() {
+        assert!(validate_file_size(0, 1).is_ok());
+        assert!(validate_file_size(1_500_000, DEFAULT_MAX_FILE_BYTES).is_ok());
+        assert!(validate_file_size(DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_FILE_BYTES).is_ok());
+        for (size, maximum) in [
+            (0, 0),
+            (2, 1),
+            (1, MAX_FILE_BYTES + 1),
+            (MAX_FILE_BYTES + 1, MAX_FILE_BYTES),
+        ] {
+            assert!(validate_file_size(size, maximum).is_err());
+        }
     }
 }

@@ -3,8 +3,12 @@
 mod contacts;
 mod operations;
 pub use contacts::validate_contact_input;
+mod loop_workspaces;
 mod products;
-pub use products::{ProductWrite, product_segment};
+pub use loop_workspaces::LoopWorkspaceRequest;
+pub use products::{
+    DEFAULT_MAX_FILE_BYTES, MAX_FILE_BYTES, ProductWrite, product_segment, validate_file_size,
+};
 mod safari;
 mod scheduling;
 #[cfg(test)]
@@ -25,6 +29,11 @@ pub enum OutlookWebError {
     InvalidResponse,
     SessionExpired,
     InvalidInput(&'static str),
+    FileTransferIo(std::io::Error),
+    FileUploadOutcomeUnknown {
+        stage: &'static str,
+        status: Option<u16>,
+    },
     OperationRejected {
         action: &'static str,
         code: ServiceCode,
@@ -75,6 +84,9 @@ impl fmt::Display for OutlookWebError {
             Self::InvalidResponse => "Outlook Web returned an invalid response",
             Self::SessionExpired => "the browser session expired (HTTP 401); run moff outlook auth refresh --confirm, then complete any sign-in steps yourself in Safari",
             Self::InvalidInput(message) => message,
+            Self::FileTransferIo(error) => return write!(f, "local file transfer failed (a partial download may remain): {error}"),
+            Self::FileUploadOutcomeUnknown { stage, status } => return write!(f,
+                "file upload outcome is unknown during {stage} (last HTTP status: {status:?}); inspect OneDrive before retrying; no write was retried"),
             Self::UnsupportedItem => "this mutation requires an unsent mail draft, mail message, or single organizer-owned appointment without attendees, as applicable",
             Self::TruncatedSearch => "Outlook returned incomplete search data; narrow the folder or calendar range",
             Self::SafariUnavailable => "select exactly one loaded Outlook Safari tab, or provide both --safari-window and --safari-tab",

@@ -9,8 +9,6 @@ async function(config, acquireToken, readResponse) {
     }
     const url = new URL(config.url);
     const method = config.method || "GET";
-    const uploadNew = /^\/v1\.0\/me\/drive\/(root|items\/[^/]+):\/[^/]+:\/content$/.test(url.pathname);
-    const uploadExisting = /^\/v1\.0\/me\/drive\/items\/[^/]+\/content$/.test(url.pathname);
     const paths = [
         /^\/v1\.0\/me\/(people|manager|directReports)$/,
         /^\/v1\.0\/me$/,
@@ -21,8 +19,6 @@ async function(config, acquireToken, readResponse) {
         /^\/v1\.0\/me\/drive\/(root|items\/[^/]+)\/children$/,
         /^\/v1\.0\/me\/drive\/items\/[^/]+$/,
         /^\/v1\.0\/me\/drive\/root\/search\(q='[^/]*'\)$/,
-        /^\/v1\.0\/me\/drive\/(root|items\/[^/]+):\/[^/]+:\/content$/,
-        /^\/v1\.0\/me\/drive\/items\/[^/]+\/content$/,
     ];
     if (url.origin !== "https://graph.microsoft.com" || url.username || url.password || url.hash
         || !paths.some(pattern => pattern.test(url.pathname))
@@ -38,8 +34,7 @@ async function(config, acquireToken, readResponse) {
             || key === "$select" && user && value === "id,displayName,mail,userPrincipalName,userType"
             || key === "$filter" && url.pathname === "/v1.0/groups" && value === "groupTypes/any(c:c eq 'Unified')"
             || key === "$skiptoken" && paged && value.length > 0 && value.length <= 4096
-            || key === "$skip" && paged && /^\d+$/.test(value) && Number(value) <= 4294967295
-            || key === "@microsoft.graph.conflictBehavior" && method === "PUT" && uploadNew && value === "fail";
+            || key === "$skip" && paged && /^\d+$/.test(value) && Number(value) <= 4294967295;
         if (!allowed) throw new Error("Unsupported product read query");
     }
     const write = method !== "GET";
@@ -54,8 +49,8 @@ async function(config, acquireToken, readResponse) {
     const segment = value => typeof value === "string" && value.trim()
         && !/[\\/%\x00-\x1f]/.test(value) && value !== "." && value !== "..";
     if (write) {
-        if (config.allow_mutation !== true || !["POST", "PATCH", "DELETE", "PUT"].includes(method)
-            || (url.search && !(method === "PUT" && uploadNew))
+        if (config.allow_mutation !== true || !["POST", "PATCH", "DELETE"].includes(method)
+            || url.search
             || JSON.stringify(config.body || {}).length > 200000) throw new Error("Product writes require an explicit gate");
         const contact = /^\/v1\.0\/me\/contacts\/[^/]+$/.test(url.pathname);
         const drive = /^\/v1\.0\/me\/drive\/items\/[^/]+$/.test(url.pathname);
@@ -63,16 +58,7 @@ async function(config, acquireToken, readResponse) {
         const folder = /^\/v1\.0\/me\/drive\/(root|items\/[^/]+)\/children$/.test(url.pathname);
         const memberAdd = /^\/v1\.0\/groups\/[^/]+\/members\/\$ref$/.test(url.pathname);
         const memberRemove = /^\/v1\.0\/groups\/[^/]+\/members\/[^/]+\/\$ref$/.test(url.pathname);
-        if (method === "PUT") {
-            if (!(uploadNew || uploadExisting) || config.body != null || !Array.isArray(config.bytes)
-                || config.bytes.length > 128000 || config.bytes.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)
-                || (uploadNew && url.searchParams.get("@microsoft.graph.conflictBehavior") !== "fail")
-                || (uploadExisting && !config.etag)) throw new Error("Invalid bounded file upload");
-            if (uploadNew) {
-                const filename = decodeURIComponent(url.pathname.split("/").at(-2).slice(0,-1));
-                if (!segment(filename)) throw new Error("Invalid upload filename");
-            }
-        } else if (method === "DELETE") {
+        if (method === "DELETE") {
             if (!(contact || drive || group || memberRemove) || config.body != null) throw new Error("Unsupported product delete");
         } else if (method === "POST" && memberAdd) {
             strings(config.body, ["@odata.id"]);
@@ -121,10 +107,9 @@ async function(config, acquireToken, readResponse) {
                 || config.body.mailEnabled !== true || config.body.securityEnabled !== false)) throw new Error("Only Microsoft 365 groups can be created");
         } else throw new Error("Unsupported product write route");
         if (drive && !config.etag) throw new Error("Drive writes require the current entity tag");
-    } else if (config.body != null || config.etag != null || config.bytes != null || uploadNew || uploadExisting
+    } else if (config.body != null || config.etag != null || config.bytes != null
         || url.pathname.endsWith("/$ref")) throw new Error("Read cannot carry write fields");
-    if (method !== "PUT" && config.bytes != null) throw new Error("Only uploads accept bytes");
-    if (config.download === true && (write || !/^\/v1\.0\/me\/drive\/items\/[^/]+$/.test(url.pathname))) throw new Error("Only drive files can be downloaded");
+    if (config.bytes != null || config.download === true) throw new Error("Use the streamed transfer adapter");
     if (config.etag != null && (typeof config.etag !== "string" || !config.etag || /[\r\n]/.test(config.etag))) throw new Error("Invalid entity tag");
     let token = await acquireToken("https://graph.microsoft.com");
     if (token.status !== 200) {
@@ -138,10 +123,8 @@ async function(config, acquireToken, readResponse) {
             method, mode: "cors", credentials: "omit", redirect: "error",
             headers: {accept: "application/json", authorization: "Bearer " + token.accessToken,
                 ...(config.body != null ? {"content-type":"application/json"} : {}),
-                ...(method === "PUT" ? {"content-type":"application/octet-stream"} : {}),
                 ...(config.etag ? {"if-match":config.etag} : {})},
             ...(config.body != null ? {body:JSON.stringify(config.body)} : {}),
-            ...(method === "PUT" ? {body:new Uint8Array(config.bytes)} : {}),
             signal: controller.signal
         });
         token = null;
@@ -149,30 +132,11 @@ async function(config, acquireToken, readResponse) {
         const result = await readResponse(response);
         if (result.body !== undefined) {
             const value = JSON.parse(result.body);
-            if (config.download === true) {
-                if (!value.file || !Number.isSafeInteger(value.size) || value.size < 0 || value.size > 128000)
-                    throw new Error("Downloads require a file no larger than 128000 bytes");
-                const download = new URL(value["@microsoft.graph.downloadUrl"]);
-                if (download.protocol !== "https:" || download.username || download.password
-                    || !(download.hostname.endsWith(".sharepoint.com") || download.hostname.endsWith(".1drv.com")
-                        || download.hostname.endsWith(".onedrive.com") || download.hostname === "onedrive.live.com"))
-                    throw new Error("Unsupported Microsoft file download location");
-                const content = await fetch(download.href, {method:"GET",mode:"cors",credentials:"omit",redirect:"error",signal:controller.signal});
-                if (!content.ok) return {status:content.status};
-                const reader = content.body.getReader(), bytes = [];
-                try {
-                    while (true) {
-                        const chunk = await reader.read();
-                        if (chunk.done) break;
-                        if (bytes.length + chunk.value.length > 128000) throw new Error("File exceeds browser transfer limit");
-                        for (const byte of chunk.value) bytes.push(byte);
-                    }
-                } finally { await reader.cancel(); }
-                return {status:200,body:JSON.stringify({bytes})};
-            }
             const scrub = item => {
                 if (!item || typeof item !== "object") return;
-                delete item["@microsoft.graph.downloadUrl"];
+                for (const key of Object.keys(item)) {
+                    if (key.startsWith("@microsoft.graph.downloadUrl")) delete item[key];
+                }
                 for (const child of Object.values(item)) scrub(child);
             };
             scrub(value);

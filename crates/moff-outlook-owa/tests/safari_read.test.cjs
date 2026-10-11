@@ -33,8 +33,17 @@ function fixture(options = {}) {
     const read = vm.runInNewContext(`(${source})`, context);
     const auth = vm.runInNewContext(`(${authSource})`, context);
     const response = vm.runInNewContext(`(${responseSource})`, context);
-    return {call: config => read(config, auth, response), requests, chunks};
+    return {call: config => read(config, auth, response), auth, requests, chunks};
 }
+
+test("authentication allowlist adds only the exact Substrate resource", async () => {
+    const f = fixture();
+    assert.equal((await f.auth("https://substrate.office.com")).status,200);
+    assert.equal(f.chunks.length,0);
+    for (const resource of ["http://substrate.office.com","https://substrate.office.com/","https://substrate.office.com.evil","https://evil.example"]) {
+        await assert.rejects(f.auth(resource),/Unsupported/);
+    }
+});
 
 test("read authenticates inside page and returns no credential", async () => {
     const f = fixture();

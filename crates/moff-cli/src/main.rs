@@ -1,15 +1,16 @@
 use std::{
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     process::ExitCode,
 };
 
 use clap::{Args, Parser, Subcommand};
 use moff_outlook_owa::{
-    DraftInput, EventInput, OutlookWebError, OutlookWebSession, ProductWrite, ReplyInput,
-    WorkInput, WorkPlan, calendar_folders_request, calendar_view_request, product_segment,
-    validate_contact_input, validate_read_action,
+    DEFAULT_MAX_FILE_BYTES, DraftInput, EventInput, LoopWorkspaceRequest, OutlookWebError,
+    OutlookWebSession, ProductWrite, ReplyInput, WorkInput, WorkPlan, calendar_folders_request,
+    calendar_view_request, product_segment, validate_contact_input, validate_file_size,
+    validate_read_action,
 };
 use serde_json::{Value, json};
 
@@ -26,6 +27,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Native Loop and drive-backed Loop file operations in the signed-in Outlook tab.
+    Loop {
+        #[command(flatten)]
+        session: SessionArgs,
+        #[command(subcommand)]
+        command: LoopRootCommand,
+    },
     Auth {
         #[command(flatten)]
         session: SessionArgs,
@@ -356,9 +364,11 @@ enum OneDriveCommand {
     Get {
         #[arg(long)]
         id: String,
-        /// Download a small file to a new local path; never overwrite an existing file.
+        /// Stream a file to a new local path; never overwrite an existing file.
         #[arg(long)]
         output: Option<PathBuf>,
+        #[arg(long, default_value_t = DEFAULT_MAX_FILE_BYTES, value_parser = clap::value_parser!(u64).range(1..=250_000_000))]
+        max_bytes: u64,
     },
 }
 
@@ -400,6 +410,11 @@ enum GroupsCommand {
 
 #[derive(Debug, Subcommand)]
 enum LoopCommand {
+    /// Manage native Loop workspaces; deletion is permanent.
+    Workspace {
+        #[command(subcommand)]
+        command: LoopWorkspaceCommand,
+    },
     /// Search drive-backed Loop file metadata, not full workspaces.
     Search {
         #[arg(long)]
@@ -434,6 +449,48 @@ enum LoopCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum LoopRootCommand {
+    Workspace {
+        #[command(subcommand)]
+        command: LoopWorkspaceCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum LoopWorkspaceCommand {
+    /// List recent workspaces, not a complete tenant inventory.
+    List {
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    Get {
+        /// Base64 `PodId`, not an SPO_ recent-item ID or Graph drive ID.
+        #[arg(long)]
+        id: String,
+    },
+    /// Create an unnamed tenant-owned container; naming/pages are not supported.
+    Create {
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Permanently delete a workspace owned by the current user; no recycle bin.
+    Delete {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        mru_id: Option<String>,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Filter recent workspace titles with a case-insensitive literal query.
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ManagementCommand {
     /// Create a personal contact, drive folder or Microsoft 365 group.
     Create {
@@ -441,6 +498,8 @@ enum ManagementCommand {
         body_file: Option<PathBuf>,
         #[arg(long)]
         file: Option<PathBuf>,
+        #[arg(long, requires = "file", default_value_t = DEFAULT_MAX_FILE_BYTES, value_parser = clap::value_parser!(u64).range(1..=250_000_000))]
+        max_bytes: u64,
         #[arg(long, requires = "file")]
         name: Option<String>,
         #[arg(long)]
@@ -456,6 +515,8 @@ enum ManagementCommand {
         body_file: Option<PathBuf>,
         #[arg(long)]
         file: Option<PathBuf>,
+        #[arg(long, requires = "file", default_value_t = DEFAULT_MAX_FILE_BYTES, value_parser = clap::value_parser!(u64).range(1..=250_000_000))]
+        max_bytes: u64,
         #[arg(long, required = true)]
         confirm: bool,
     },
@@ -523,23 +584,25 @@ fn schema() -> Value {
             "org":{"list":true,"get":true,"search":true,"manager":true,"reports":true,"create":false,"update":false,"delete":false},
             "onedrive":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true,"upload":true,"download":true},
             "groups":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true,"members":true,"add-member":true,"remove-member":true},
-            "loop":{"create":false,"get":true,"update":true,"delete":true,"list":true,"search":true,"content_editing":false},
+            "loop":{"create":false,"get":true,"update":true,"delete":true,"list":true,"search":true,"content_editing":false,
+                "workspace":{"list":true,"get":true,"create":true,"delete":true,"search":true,"update":false,"title":false,"id":"base64 ODSP PodId","delete_policy":"permanent; verified current-user Owner required","list_scope":"recent workspaces only"}},
             "service":{"read":true}},
         "unimplemented_products":[],
         "full_product_management":false,
         "product_reads":{"methods":["GET"],"max_page_size":100,"follow_next_links":"metadata search only, maximum 100 pages",
-            "loop_scope":"drive-backed .loop file metadata, rename and recycle","interactive_consent":false},
-        "product_writes":{"methods":["POST","PATCH","DELETE"],"requires":"--allow-mutation and --confirm plus browser delegated permissions",
+            "loop_scope":"native workspace metadata through Substrate; legacy drive-backed .loop file metadata, rename and recycle","interactive_consent":false},
+        "product_writes":{"methods":["POST","PATCH","DELETE","PUT"],"requires":"--allow-mutation and --confirm plus browser delegated permissions",
             "contacts_scope":"personal default contacts folder through OWA; supplied fields are read-back verified",
             "onedrive_scope":"folder/file creation, bounded binary transfers, rename/description/move and recycle of existing items",
-            "max_file_bytes":128_000,
+            "max_file_bytes":250_000_000,"default_max_file_bytes":DEFAULT_MAX_FILE_BYTES,
+            "transfer_chunk_bytes":128_000,"upload_service_chunk_bytes":3_276_800,"transfer_limit_flag":"--max-bytes",
             "groups_scope":"Microsoft 365 groups; update/delete require verified ownership",
-            "verification":"API acknowledgement; Graph writes are not read-back verified",
+            "verification":"Graph metadata writes use API acknowledgement; uploads check acknowledged size; native Loop deletion verifies GET 404",
             "max_json_bytes":200_000},
-        "remaining_management_gaps":["Loop workspace/page/content creation and editing","large file transfers","meeting/recurrence management"],
-        "mutations":true,"mutation_confirmation":"--confirm","delete_policy":"mail/calendar move to Deleted Items; OneDrive recycle; contacts/groups API deletion",
+        "remaining_management_gaps":["Loop workspace naming and page/content creation/editing","files above 250 MB","meeting/recurrence management"],
+        "mutations":true,"mutation_confirmation":"--confirm","delete_policy":"mail/calendar move to Deleted Items; OneDrive recycle; contacts/groups API deletion; native Loop workspaces permanent",
         "calendar_mutation_scope":"single appointments without attendees","scheduling_policy":"empty gaps first; explicit exact-title overlap fallback","batch_limit":20,
-        "search_semantics":"mail/calendar literal subject/body; contacts/groups literal metadata; OneDrive drive search then metadata filtering"
+        "search_semantics":"mail/calendar literal subject/body; contacts/groups literal metadata; OneDrive drive search then metadata filtering; native Loop workspaces literal recent titles"
     })
 }
 
@@ -772,6 +835,7 @@ fn management_result(
             name,
             parent_id,
             confirm,
+            max_bytes,
             ..
         } => {
             if product != "onedrive" {
@@ -782,13 +846,21 @@ fn management_result(
             }
             return Ok((
                 "create",
-                file_mutation(args, None, parent_id.as_deref(), name.as_deref(), file)?,
+                file_mutation(
+                    args,
+                    None,
+                    parent_id.as_deref(),
+                    name.as_deref(),
+                    file,
+                    *max_bytes,
+                )?,
             ));
         }
         ManagementCommand::Update {
             id,
             file: Some(file),
             confirm,
+            max_bytes,
             ..
         } => {
             if product != "onedrive" {
@@ -797,7 +869,10 @@ fn management_result(
             if !confirm {
                 return Err("mutations require --confirm".to_owned());
             }
-            return Ok(("update", file_mutation(args, Some(id), None, None, file)?));
+            return Ok((
+                "update",
+                file_mutation(args, Some(id), None, None, file, *max_bytes)?,
+            ));
         }
         _ => (),
     }
@@ -949,16 +1024,8 @@ fn file_mutation(
     parent: Option<&str>,
     name: Option<&str>,
     file: &Path,
+    max_bytes: u64,
 ) -> Result<Value, String> {
-    let mut bytes = Vec::new();
-    fs::File::open(file)
-        .map_err(|e| format!("cannot open upload file: {e}"))?
-        .take(128_001)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read upload file: {e}"))?;
-    if bytes.len() > 128_000 {
-        return Err("browser file transfers are limited to 128000 bytes".to_owned());
-    }
     let name = if id.is_none() {
         Some(
             name.or_else(|| file.file_name()?.to_str())
@@ -967,9 +1034,20 @@ fn file_mutation(
     } else {
         None
     };
-    let request =
-        ProductWrite::drive_upload(parent, id, name, bytes.clone(), id.map(|_| "preflight"))
-            .map_err(|e| e.to_string())?;
+    if let Some(name) = name {
+        product_segment(name).map_err(|e| e.to_string())?;
+    }
+    let mut input = fs::File::open(file).map_err(|e| format!("cannot open upload file: {e}"))?;
+    let metadata = input
+        .metadata()
+        .map_err(|e| format!("cannot inspect upload file: {e}"))?;
+    if !metadata.is_file() {
+        return Err("upload requires a regular file".to_owned());
+    }
+    let size = metadata.len();
+    validate_file_size(size, max_bytes).map_err(|e| e.to_string())?;
+    let request = ProductWrite::drive_upload(parent, id, name, size, id.map(|_| "preflight"))
+        .map_err(|e| e.to_string())?;
     let session = session(args)?;
     let request = if let Some(id) = id {
         let before = session
@@ -985,12 +1063,14 @@ fn file_mutation(
             .as_str()
             .filter(|s| !s.is_empty())
             .ok_or("file returned no entity tag")?;
-        ProductWrite::drive_upload(None, Some(id), None, bytes, Some(etag))
+        ProductWrite::drive_upload(None, Some(id), None, size, Some(etag))
             .map_err(|e| e.to_string())?
     } else {
         request
     };
-    let value = session.product_write(&request).map_err(|e| e.to_string())?;
+    let value = session
+        .drive_upload(&request, &mut input, max_bytes)
+        .map_err(|e| e.to_string())?;
     if value["id"].as_str().is_none_or(str::is_empty) {
         return Err(
             "upload was acknowledged without a file ID; inspect OneDrive before retrying"
@@ -1000,12 +1080,10 @@ fn file_mutation(
     Ok(value)
 }
 
-fn download_file(args: SessionArgs, id: &str, path: &Path) -> ExitCode {
+fn download_file(args: SessionArgs, id: &str, path: &Path, max_bytes: u64) -> ExitCode {
     let result = (|| -> Result<Value, String> {
         product_segment(id).map_err(|e| e.to_string())?;
-        let bytes = session(args)?
-            .drive_download(id)
-            .map_err(|e| e.to_string())?;
+        let session = session(args)?;
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1015,13 +1093,15 @@ fn download_file(args: SessionArgs, id: &str, path: &Path) -> ExitCode {
                     "cannot create download destination (existing files are not overwritten): {e}"
                 )
             })?;
-        file.write_all(&bytes).map_err(|e| {
-            format!(
-                "download write failed; a partial file may remain at {}: {e}",
-                path.display()
-            )
-        })?;
-        Ok(json!({"path":path.display().to_string(),"bytes":bytes.len()}))
+        let count = session
+            .drive_download(id, &mut file, max_bytes)
+            .map_err(|e| {
+                format!(
+                    "download write failed; a partial file may remain at {}: {e}",
+                    path.display()
+                )
+            })?;
+        Ok(json!({"path":path.display().to_string(),"bytes":count}))
     })();
     match result {
         Ok(value) => {
@@ -1041,6 +1121,59 @@ fn run_management(args: SessionArgs, product: &str, command: ManagementCommand) 
                 product
             };
             output(&format!("outlook.{product}.{action}"), &value);
+            ExitCode::SUCCESS
+        }
+        Err(e) => error(e),
+    }
+}
+
+fn run_workspace(args: SessionArgs, command: &LoopWorkspaceCommand) -> ExitCode {
+    let result = (|| -> Result<(&str, Value), String> {
+        let (action, request) = match command {
+            LoopWorkspaceCommand::List { limit } => (
+                "list",
+                LoopWorkspaceRequest::List {
+                    query: None,
+                    limit: *limit,
+                },
+            ),
+            LoopWorkspaceCommand::Search { query, limit } => (
+                "search",
+                LoopWorkspaceRequest::List {
+                    query: Some(query),
+                    limit: *limit,
+                },
+            ),
+            LoopWorkspaceCommand::Get { id } => ("get", LoopWorkspaceRequest::Get { id }),
+            LoopWorkspaceCommand::Create { confirm } => {
+                safari_write_guard(&args, *confirm)?;
+                ("create", LoopWorkspaceRequest::Create)
+            }
+            LoopWorkspaceCommand::Delete {
+                id,
+                mru_id,
+                confirm,
+            } => {
+                safari_write_guard(&args, *confirm)?;
+                (
+                    "delete",
+                    LoopWorkspaceRequest::Delete {
+                        id,
+                        mru_id: mru_id.as_deref(),
+                    },
+                )
+            }
+        };
+        Ok((
+            action,
+            session(args)?
+                .loop_workspace(&request)
+                .map_err(|e| e.to_string())?,
+        ))
+    })();
+    match result {
+        Ok((action, value)) => {
+            output(&format!("outlook.loop.workspace.{action}"), &value);
             ExitCode::SUCCESS
         }
         Err(e) => error(e),
@@ -1378,6 +1511,19 @@ fn calendar_result(
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Some(
+            Command::Loop {
+                session: args,
+                command: LoopRootCommand::Workspace { command },
+            }
+            | Command::Outlook {
+                session: args,
+                command:
+                    OutlookCommand::Loop {
+                        command: LoopCommand::Workspace { command },
+                    },
+            },
+        ) => run_workspace(args, &command),
         Some(Command::Schema) => {
             print_json(&schema());
             ExitCode::SUCCESS
@@ -1559,6 +1705,7 @@ fn main() -> ExitCode {
                 id,
                 body_file: Some(body_file),
                 file: None,
+                max_bytes: DEFAULT_MAX_FILE_BYTES,
                 confirm,
             },
         ),
@@ -1788,14 +1935,18 @@ fn main() -> ExitCode {
                         OneDriveCommand::Get {
                             id,
                             output: Some(path),
+                            max_bytes,
                         },
                 },
-        }) => download_file(args, &id, &path),
+        }) => download_file(args, &id, &path, max_bytes),
         Some(Command::Outlook {
             session: args,
             command:
                 OutlookCommand::Onedrive {
-                    command: OneDriveCommand::Get { id, output: None },
+                    command:
+                        OneDriveCommand::Get {
+                            id, output: None, ..
+                        },
                 },
         }) => match graph_result(
             args,
