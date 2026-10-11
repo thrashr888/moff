@@ -4,6 +4,11 @@ async function(config) {
     }
     const allowed = ["FindItem", "FindConversation", "GetItem", "GetConversationItems",
         "GetCalendarFolders", "GetCalendarFoldersV2", "GetCalendarView"];
+    const authOnly = config.action === "__MoffAuthStatus" && config.mutation !== true;
+    if (authOnly && config.recovery_marker !== undefined
+        && (!config.recovery_marker || sessionStorage.getItem("__moff_auth_recovery") !== config.recovery_marker)) {
+        return {status: 409};
+    }
     const writes = ["CreateItem", "UpdateItem", "UpdateCalendarEvent"];
     if (config.mutation === true) {
         if (config.allow_mutation !== true || !writes.includes(config.action)) throw new Error("Unsupported write action");
@@ -18,29 +23,39 @@ async function(config) {
                     || ["RequiredAttendees", "OptionalAttendees", "Resources"].some(k => item[k]?.length)) {
                     throw new Error("Invitations are prohibited");
                 }
-            } else if (!["Message:#Exchange", "ReplyToItem:#Exchange"].includes(item.__type)
+            } else if (!["Message:#Exchange", "ReplyToItem:#Exchange", "ReplyAllToItem:#Exchange"].includes(item.__type)
                 || body.MessageDisposition !== "SaveOnly") throw new Error("Sending is prohibited");
         }
         if (config.action === "UpdateItem" && body.MessageDisposition !== "SaveOnly") throw new Error("Sending is prohibited");
         if (config.action === "UpdateCalendarEvent" && body.ShouldSendUpdateToAttendees !== false) throw new Error("Invitations are prohibited");
-    } else if (!allowed.includes(config.action)) throw new Error("Unsupported read action");
-    if (!window.webpackChunkOwa) throw new Error("Outlook is not loaded; sign in and wait for Mail");
+    } else if (!authOnly && !allowed.includes(config.action)) throw new Error("Unsupported read action");
+    if (!window.webpackChunkOwa) {
+        if (authOnly) return {status: 425};
+        throw new Error("Outlook is not loaded; sign in and wait for Mail");
+    }
     let runtime;
     const chunks = window.webpackChunkOwa;
     const marker = "__moff_read_" + crypto.randomUUID();
     chunks.push([[marker], {}, value => { runtime = value; }]);
     chunks.pop();
     if (!runtime || !runtime.m[121455] || !runtime.m[429896]) {
+        if (authOnly) return {status: 422};
         throw new Error("Outlook authentication contract changed; Moff needs an adapter update");
     }
     const auth = runtime(121455);
     const mailbox = runtime(429896);
     if (typeof auth.ij !== "function" || typeof mailbox.A !== "function") {
+        if (authOnly) return {status: 422};
         throw new Error("Outlook authentication contract changed; Moff needs an adapter update");
     }
     let token = await auth.ij("MoffRead", mailbox.A(), {resource: location.origin});
     if (!token || !token.AccessToken || token.TokenResultCode !== 0) {
         return {status: 401};
+    }
+    if (authOnly) {
+        token = null;
+        if (config.recovery_marker !== undefined) sessionStorage.removeItem("__moff_auth_recovery");
+        return {status: 200};
     }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 25000);

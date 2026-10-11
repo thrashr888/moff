@@ -29,6 +29,8 @@ pub struct EventInput {
 #[serde(deny_unknown_fields)]
 pub struct ReplyInput {
     pub body: String,
+    #[serde(default)]
+    pub reply_all: bool,
 }
 
 pub fn batch_item_request(ids: &[String], calendar: bool) -> Result<Value, OutlookWebError> {
@@ -62,9 +64,25 @@ pub fn reply_draft_request(
         json!({
             "__type":"CreateItemRequest:#Exchange","MessageDisposition":"SaveOnly",
             "ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly"},
-            "Items":[{"__type":"ReplyToItem:#Exchange",
+            "Items":[{"__type":if input.reply_all { "ReplyAllToItem:#Exchange" } else { "ReplyToItem:#Exchange" },
                 "ReferenceItemId":{"__type":"ItemId:#Exchange","Id":id,"ChangeKey":key},
                 "NewBodyContent":text_body(&input.body)}]
+        }),
+    ))
+}
+
+pub fn mark_read_request(id: &str, key: &str, read: bool) -> Result<Value, OutlookWebError> {
+    nonempty(id)?;
+    nonempty(key)?;
+    Ok(envelope(
+        "UpdateItem",
+        json!({
+            "__type":"UpdateItemRequest:#Exchange","MessageDisposition":"SaveOnly",
+            "ConflictResolution":"NeverOverwrite","SuppressReadReceipts":true,
+            "ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly"},
+            "ItemChanges":[{"__type":"ItemChange:#Exchange",
+                "ItemId":{"__type":"ItemId:#Exchange","Id":id,"ChangeKey":key},
+                "Updates":[change("IsRead",json!(read),"Message:#Exchange")]}]
         }),
     ))
 }
@@ -545,27 +563,55 @@ impl OutlookWebSession {
         .map_err(|_| OutlookWebError::OutcomeUnknown {
             action: "CreateItem",
         })?;
-        let verified = self
-            .mail_get(draft_id)
-            .map_err(|_| OutlookWebError::VerificationFailed)?;
-        if single_item(&verified)?
+        let verification_error = || OutlookWebError::DraftVerificationFailed {
+            draft_id: draft_id.to_owned(),
+            source_id: id.to_owned(),
+        };
+        let original_after = self.mail_get(id).map_err(|_| verification_error())?;
+        let after = single_item(&original_after).map_err(|_| verification_error())?;
+        let after_read = after.get("IsRead").and_then(Value::as_bool);
+        let restored = !read && after_read == Some(true);
+        if restored {
+            // Outlook's native reply creation marks the source read, even with SaveOnly.
+            self.mail_mark(id, false)
+                .map_err(|_| verification_error())?;
+        } else if after_read != Some(read) {
+            return Err(verification_error());
+        }
+        let verified = self.mail_get(draft_id).map_err(|_| verification_error())?;
+        if single_item(&verified)
+            .map_err(|_| verification_error())?
             .get("IsDraft")
             .and_then(Value::as_bool)
             != Some(true)
         {
-            return Err(OutlookWebError::VerificationFailed);
+            return Err(verification_error());
         }
-        let original_after = self
-            .mail_get(id)
-            .map_err(|_| OutlookWebError::VerificationFailed)?;
-        if single_item(&original_after)?
+        Ok(
+            json!({"source_id":id,"draft_id":draft_id,"sent":false,"verified":true,
+            "reply_all":input.reply_all,"source_read_restored":restored}),
+        )
+    }
+    pub fn mail_mark(&self, id: &str, read: bool) -> Result<Value, OutlookWebError> {
+        let response = self.mail_get(id)?;
+        let original = single_item(&response)?;
+        type_is(original, "Message:#Exchange")?;
+        let current = original
             .get("IsRead")
             .and_then(Value::as_bool)
-            != Some(read)
-        {
+            .ok_or(OutlookWebError::InvalidResponse)?;
+        if current != read {
+            self.execute(
+                "UpdateItem",
+                &mark_read_request(id, field(original, "/ItemId/ChangeKey")?, read)?,
+                true,
+            )?;
+        }
+        let after = self.mail_get(id)?;
+        if single_item(&after)?.get("IsRead").and_then(Value::as_bool) != Some(read) {
             return Err(OutlookWebError::VerificationFailed);
         }
-        Ok(json!({"source_id":id,"draft_id":draft_id,"sent":false,"verified":true}))
+        Ok(json!({"id":id,"is_read":read,"verified":true,"changed":current != read}))
     }
     pub fn mail_list(
         &self,
@@ -849,18 +895,19 @@ mod tests {
         let (session, requests, worker) = mock(vec![
             ("GetItem", message(original.clone())),
             ("CreateItem", message(json!({"ItemId":{"Id":"draft"}}))),
+            ("GetItem", message(original)),
             (
                 "GetItem",
                 message(json!({"ItemId":{"Id":"draft"},"IsDraft":true})),
             ),
-            ("GetItem", message(original)),
         ]);
         assert_eq!(
             session
                 .reply_draft(
                     "source",
                     &ReplyInput {
-                        body: "Hello".into()
+                        body: "Hello".into(),
+                        reply_all: false,
                     }
                 )
                 .unwrap()["sent"],
@@ -871,6 +918,82 @@ mod tests {
             requests.lock().unwrap()[1]["Body"]["Items"][0]["ReferenceItemId"]["Id"],
             "source"
         );
+    }
+
+    #[test]
+    fn reply_creation_restores_unread_without_recreating_the_draft() {
+        let unread = json!({"__type":"Message:#Exchange","ItemId":{"Id":"source","ChangeKey":"key"},
+            "IsRead":false,"IsDraft":false});
+        let mut read = unread.clone();
+        read["IsRead"] = json!(true);
+        let (session, requests, worker) = mock(vec![
+            ("GetItem", message(unread.clone())),
+            ("CreateItem", message(json!({"ItemId":{"Id":"draft"}}))),
+            ("GetItem", message(read.clone())),
+            ("GetItem", message(read)),
+            ("UpdateItem", message(json!({"ItemId":{"Id":"source"}}))),
+            ("GetItem", message(unread)),
+            (
+                "GetItem",
+                message(json!({"ItemId":{"Id":"draft"},"IsDraft":true})),
+            ),
+        ]);
+        let result = session
+            .reply_draft(
+                "source",
+                &ReplyInput {
+                    body: "Hello".into(),
+                    reply_all: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(result["source_read_restored"], true);
+        assert_eq!(result["draft_id"], "draft");
+        worker.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[1]["Body"]["Items"][0]["__type"],
+            "ReplyAllToItem:#Exchange"
+        );
+        assert_eq!(requests[4]["Body"]["SuppressReadReceipts"], true);
+        assert_eq!(
+            requests[4]["Body"]["ItemChanges"][0]["Updates"][0]["Path"]["FieldURI"],
+            "IsRead"
+        );
+        assert_eq!(
+            requests[4]["Body"]["ItemChanges"][0]["Updates"][0]["Item"]["IsRead"],
+            false
+        );
+    }
+
+    #[test]
+    fn failed_draft_verification_preserves_created_id() {
+        let original = json!({"__type":"Message:#Exchange","ItemId":{"Id":"source","ChangeKey":"key"},
+            "IsRead":true,"IsDraft":false});
+        let (session, _, worker) = mock(vec![
+            ("GetItem", message(original.clone())),
+            ("CreateItem", message(json!({"ItemId":{"Id":"draft"}}))),
+            ("GetItem", message(original)),
+            (
+                "GetItem",
+                message(json!({"ItemId":{"Id":"draft"},"IsDraft":false})),
+            ),
+        ]);
+        let error = session
+            .reply_draft(
+                "source",
+                &ReplyInput {
+                    body: "Hello".into(),
+                    reply_all: false,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OutlookWebError::DraftVerificationFailed { .. }
+        ));
+        assert!(error.to_string().contains("draft"));
+        worker.join().unwrap();
     }
 
     #[test]

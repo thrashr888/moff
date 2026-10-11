@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    fs,
     io::Read,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -7,8 +7,8 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use moff_outlook_owa::{
-    DraftInput, EventInput, GraphWebSession, OutlookWebError, OutlookWebSession, ReplyInput,
-    WorkInput, WorkPlan, calendar_folders_request, calendar_view_request, validate_read_action,
+    DraftInput, EventInput, OutlookWebError, OutlookWebSession, ReplyInput, WorkInput, WorkPlan,
+    calendar_folders_request, calendar_view_request, validate_read_action,
 };
 use serde_json::{Value, json};
 
@@ -25,6 +25,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Auth {
+        #[command(flatten)]
+        session: SessionArgs,
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     Outlook {
         #[command(flatten)]
         session: SessionArgs,
@@ -34,34 +40,27 @@ enum Command {
     Schema,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Clone, Copy)]
 struct SessionArgs {
+    #[arg(long = "safari", hide = true)]
+    _safari: bool,
     #[arg(
         long,
-        conflicts_with = "session_curl",
-        help = "Use Mail/Calendar through a loaded Outlook Safari tab (experimental)"
-    )]
-    safari: bool,
-    #[arg(
-        long,
-        requires = "safari",
         help = "Permit typed non-sending Safari writes; each write also requires --confirm"
     )]
     allow_mutation: bool,
-    #[arg(long, requires = "safari", requires = "safari_tab", value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, requires = "safari_tab", value_parser = clap::value_parser!(u32).range(1..))]
     safari_window: Option<u32>,
-    #[arg(long, requires = "safari", requires = "safari_window", value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, requires = "safari_window", value_parser = clap::value_parser!(u32).range(1..))]
     safari_tab: Option<u32>,
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Path to a browser-exported Outlook Web or Microsoft Graph cURL request"
-    )]
-    session_curl: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
 enum OutlookCommand {
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     Mail {
         #[command(subcommand)]
         command: MailCommand,
@@ -97,7 +96,31 @@ enum OutlookCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Check silent authentication without a refresh or interactive sign-in.
+    Status,
+    /// Reload the selected Outlook tab for browser SSO; leave account/2FA clicks to you.
+    Refresh {
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=120))]
+        wait_seconds: u32,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum MailCommand {
+    /// Set read state explicitly; reply drafts restore Outlook's automatic read side effect.
+    Mark {
+        #[arg(long)]
+        id: String,
+        #[arg(long, required_unless_present = "unread", conflicts_with = "unread")]
+        read: bool,
+        #[arg(long, required_unless_present = "read", conflicts_with = "read")]
+        unread: bool,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
     /// Read 1-20 messages in one non-marking request.
     GetBatch {
         #[arg(long, required = true, num_args = 1..=20)]
@@ -114,7 +137,7 @@ enum MailCommand {
         #[arg(long, required = true)]
         confirm: bool,
     },
-    /// Save a threaded reply-to-sender draft, never send it.
+    /// Save a threaded reply draft; optional `reply_all` in JSON keeps thread recipients.
     ReplyDraft {
         #[arg(long)]
         id: String,
@@ -160,7 +183,7 @@ enum MailCommand {
         #[arg(long, required = true)]
         confirm: bool,
     },
-    /// Permanently delete a message or draft (`HardDelete`).
+    /// Unavailable through Safari; retained to return an explicit unsupported error.
     Delete {
         #[arg(long)]
         id: String,
@@ -245,7 +268,7 @@ enum CalendarCommand {
         #[arg(long, required = true)]
         confirm: bool,
     },
-    /// Move a single personal appointment without attendees to Deleted Items.
+    /// Unavailable through Safari; retained to return an explicit unsupported error.
     Delete {
         #[arg(long)]
         id: String,
@@ -351,32 +374,9 @@ fn error(message: impl std::fmt::Display) -> ExitCode {
 }
 
 fn session(args: SessionArgs) -> Result<OutlookWebSession, String> {
-    if args.safari {
-        return OutlookWebSession::from_safari_with_mutations(
-            args.safari_window.zip(args.safari_tab),
-            args.allow_mutation,
-        )
-        .map_err(|error| error.to_string());
-    }
-    let path = args.session_curl.or_else(|| {
-        env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(".config/moff/outlook-session.curl"))
-    });
-    OutlookWebSession::from_curl_file(
-        &path.ok_or("--session-curl PATH is required and HOME is unavailable")?,
-    )
-    .map_err(|error| error.to_string())
-}
-
-fn graph_session(args: SessionArgs) -> Result<GraphWebSession, String> {
-    if args.safari {
-        return Err("--safari currently supports Mail/Calendar reads only".to_owned());
-    }
-    let path = args.session_curl.or_else(|| {
-        env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/moff/graph-session.curl"))
-    });
-    GraphWebSession::from_curl_file(
-        &path.ok_or("--session-curl PATH is required and HOME is unavailable")?,
+    OutlookWebSession::from_safari_with_mutations(
+        args.safari_window.zip(args.safari_tab),
+        args.allow_mutation,
     )
     .map_err(|error| error.to_string())
 }
@@ -398,39 +398,16 @@ fn output(command: &str, value: &Value) {
     );
 }
 
-#[allow(clippy::collapsible_if, clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value)]
 fn graph_result(
-    args: SessionArgs,
+    _args: SessionArgs,
     command: &str,
-    path: String,
-    only_loop_files: bool,
+    _path: String,
+    _only_loop_files: bool,
 ) -> Result<(&'static str, Value), String> {
-    let mut value = graph_session(args)
-        .and_then(|session| session.get(&path).map_err(|error| error.to_string()))?;
-    if only_loop_files {
-        if let Some(items) = value.get_mut("value").and_then(Value::as_array_mut) {
-            items.retain(|item| {
-                item["name"].as_str().is_some_and(|name| {
-                    Path::new(name)
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("loop"))
-                })
-            });
-        }
-    }
-    let command = match command {
-        "outlook.people.search" => "outlook.people.search",
-        "outlook.people.get" => "outlook.people.get",
-        "outlook.org.manager" => "outlook.org.manager",
-        "outlook.org.reports" => "outlook.org.reports",
-        "outlook.onedrive.list" => "outlook.onedrive.list",
-        "outlook.onedrive.get" => "outlook.onedrive.get",
-        "outlook.groups.list" => "outlook.groups.list",
-        "outlook.loop.list" => "outlook.loop.list",
-        "outlook.loop.get" => "outlook.loop.get",
-        _ => return Err("unsupported browser-session command".to_owned()),
-    };
-    Ok((command, value))
+    Err(format!(
+        "{command} is not yet available through Safari/Cider; exported-cURL credentials are no longer supported"
+    ))
 }
 
 fn confirmed_json(path: &Path, confirm: bool) -> Result<Value, String> {
@@ -453,7 +430,7 @@ fn read_json(path: &Path) -> Result<Value, String> {
 }
 
 fn safari_write_guard(args: &SessionArgs, mutation: bool, delete: bool) -> Result<(), String> {
-    if args.safari && mutation && (!args.allow_mutation || delete) {
+    if mutation && (!args.allow_mutation || delete) {
         return Err(OutlookWebError::SafariReadOnly.to_string());
     }
     Ok(())
@@ -466,6 +443,7 @@ fn with_owa(
     operation(&session(args)?).map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_lines)]
 fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str, Value), String> {
     safari_write_guard(
         &args,
@@ -476,10 +454,25 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
                 | MailCommand::Delete { .. }
                 | MailCommand::Categories { .. }
                 | MailCommand::ReplyDraft { .. }
+                | MailCommand::Mark { .. }
         ),
         matches!(command, MailCommand::Delete { .. }),
     )?;
     match command {
+        MailCommand::Mark {
+            id,
+            read,
+            unread: _,
+            confirm,
+        } => {
+            if !confirm {
+                return Err("mutations require --confirm".to_owned());
+            }
+            Ok((
+                "outlook.mail.mark",
+                with_owa(args, |s| s.mail_mark(&id, read))?,
+            ))
+        }
         MailCommand::GetBatch { id } => Ok((
             "outlook.mail.get-batch",
             with_owa(args, |s| s.get_batch(&id, false))?,
@@ -507,7 +500,7 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
             confirm,
         } => {
             let input: ReplyInput = serde_json::from_value(confirmed_json(&body_file, confirm)?)
-                .map_err(|_| "reply input accepts only a nonempty body string")?;
+                .map_err(|_| "reply input accepts a body string and optional reply_all boolean")?;
             if input.body.trim().is_empty() {
                 return Err("reply body must not be empty".into());
             }
@@ -711,9 +704,74 @@ fn main() -> ExitCode {
     match cli.command {
         Some(Command::Schema) => {
             print_json(
-                &json!({"schema":moff_core::SCHEMA_VERSION,"provider":"browser-session","transports":{"curl-export":{"mutations":true},"safari":{"experimental":true,"mutations":true,"mutation_gate":"--allow-mutation and --confirm","delete":false,"products":["mail","calendar"],"requires":"loaded authenticated Outlook tab","credential_export":false}},"commands":{"mail":{"list":true,"search":true,"get":true,"get-batch":true,"categories":true,"reply-draft":true,"create":true,"update":true,"delete":true,"send":false},"calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"get-batch":true,"availability":true,"work-blocks":{"plan":true,"apply":true},"create":true,"update":true,"delete":true},"people":{"search":true,"get":true},"org":{"manager":true,"reports":true},"onedrive":{"list":true,"get":true},"groups":{"list":true},"loop":{"list":true,"get":true},"service":{"read":true}},"unimplemented_products":[],"mutations":true,"mutation_confirmation":"--confirm","mail_delete":"permanent","calendar_delete":"deleted-items","calendar_mutation_scope":"single appointments without attendees","scheduling_policy":"empty gaps first; explicit exact-title overlap fallback","batch_limit":20,"search_semantics":"case-insensitive literal subject/body search within the chosen folder or calendar range"}),
+                &json!({"schema":moff_core::SCHEMA_VERSION,"provider":"browser-session","default_transport":"safari","transports":{"safari":{"experimental":true,"mutations":true,"mutation_gate":"--allow-mutation and --confirm","delete":false,"products":["mail","calendar"],"requires":"loaded authenticated Outlook tab","credential_export":false,"auth_recovery":{"refresh":true,"status":true,"interactive_sign_in":false,"confirmation":"--confirm","wait_seconds_max":120}}},"commands":{"auth":{"refresh":true,"status":true},"mail":{"list":true,"search":true,"get":true,"get-batch":true,"categories":true,"reply-draft":true,"reply_all_draft":true,"mark":true,"create":true,"update":true,"delete":false,"send":false},"calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"get-batch":true,"availability":true,"work-blocks":{"plan":true,"apply":true},"create":true,"update":true,"delete":false},"people":{"search":false,"get":false},"org":{"manager":false,"reports":false},"onedrive":{"list":false,"get":false},"groups":{"list":false},"loop":{"list":false,"get":false},"service":{"read":true}},"unimplemented_products":["people","org","onedrive","groups","loop"],"mutations":true,"mutation_confirmation":"--confirm","calendar_mutation_scope":"single appointments without attendees","scheduling_policy":"empty gaps first; explicit exact-title overlap fallback","batch_limit":20,"search_semantics":"case-insensitive literal subject/body search within the chosen folder or calendar range"}),
             );
             ExitCode::SUCCESS
+        }
+        Some(
+            Command::Auth {
+                session: args,
+                command: AuthCommand::Status,
+            }
+            | Command::Outlook {
+                session: args,
+                command:
+                    OutlookCommand::Auth {
+                        command: AuthCommand::Status,
+                    },
+            },
+        ) => match OutlookWebSession::safari_auth_status(args.safari_window.zip(args.safari_tab)) {
+            Ok(value) => {
+                output("outlook.auth.status", &value);
+                if value["authenticated"] == true {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                }
+            }
+            Err(e) => error(e),
+        },
+        Some(
+            Command::Auth {
+                session: args,
+                command:
+                    AuthCommand::Refresh {
+                        wait_seconds,
+                        confirm,
+                    },
+            }
+            | Command::Outlook {
+                session: args,
+                command:
+                    OutlookCommand::Auth {
+                        command:
+                            AuthCommand::Refresh {
+                                wait_seconds,
+                                confirm,
+                            },
+                    },
+            },
+        ) => {
+            if !confirm {
+                return error("auth refresh requires --confirm; no credentials are stored");
+            }
+            eprintln!(
+                "Refreshing the selected Outlook tab; complete any account-selection or 2FA clicks yourself in Safari."
+            );
+            match OutlookWebSession::refresh_safari_auth(
+                args.safari_window.zip(args.safari_tab),
+                wait_seconds,
+            ) {
+                Ok(value) => {
+                    output("outlook.auth.refresh", &value);
+                    if value["complete"] == false {
+                        ExitCode::from(2)
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(e) => error(e),
+            }
         }
         Some(Command::Outlook {
             session: args,
