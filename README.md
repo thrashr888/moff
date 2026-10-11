@@ -97,8 +97,8 @@ moff outlook --safari --safari-window 1 --safari-tab 1 mail list
 Open and sign into Outlook Mail or Calendar in Safari first. Enable Safari
 Automation for the launching app and **Allow JavaScript from Apple Events**.
 Moff links Cider directly; an installed `cider` executable is not required.
-The dependency is pinned to the feature revision in
-[Cider PR #3](https://github.com/thrashr888/cider/pull/3), not a released API.
+The dependency is pinned to the Cider 0.11.0 source revision containing the Safari
+library APIs; it does not track Cider's default branch.
 
 Safari mode supports the existing Mail/Calendar reads and searches only; mutations
 are rejected before browser access. Graph products still require their cURL export.

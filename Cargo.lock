@@ -199,8 +199,8 @@ dependencies = [
 
 [[package]]
 name = "cider-cli"
-version = "0.10.0"
-source = "git+https://github.com/thrashr888/cider?rev=5f49de686c1965db44ec4398a4589acbe33e35e2#5f49de686c1965db44ec4398a4589acbe33e35e2"
+version = "0.11.0"
+source = "git+https://github.com/thrashr888/cider?rev=1a76c0d791430a551b88bcd979eb2923ce87a6a4#1a76c0d791430a551b88bcd979eb2923ce87a6a4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -336,7 +336,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1232,9 +1232,9 @@ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "once_cell",
  "ring",
@@ -1811,7 +1811,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

@@ -22,4 +22,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
       - run: cargo test --workspace --all-features
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --test crates/moff-outlook-owa/tests/safari_read.test.cjs
       - run: cargo audit
