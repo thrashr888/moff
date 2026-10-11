@@ -2,6 +2,7 @@
 #![allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
 mod graph;
 mod operations;
+mod safari;
 
 pub use graph::GraphWebSession;
 pub use operations::*;
@@ -39,6 +40,9 @@ pub enum OutlookWebError {
     },
     UnsupportedItem,
     TruncatedSearch,
+    SafariUnavailable,
+    SafariOperationFailed,
+    SafariReadOnly,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -70,6 +74,9 @@ impl fmt::Display for OutlookWebError {
             Self::InvalidInput(message) => message,
             Self::UnsupportedItem => "this mutation requires an unsent mail draft, mail message, or single organizer-owned appointment without attendees, as applicable",
             Self::TruncatedSearch => "Outlook returned incomplete search data; narrow the folder or calendar range",
+            Self::SafariUnavailable => "select exactly one loaded Outlook Safari tab, or provide both --safari-window and --safari-tab",
+            Self::SafariOperationFailed => "Safari read failed; check Safari Automation permission, JavaScript from Apple Events, and that Outlook is signed in; the private Outlook adapter may need an update",
+            Self::SafariReadOnly => "the Safari provider supports reads only; use an explicit session export for confirmed mutations",
             Self::OperationRejected { action, code } => {
                 return write!(f, "Outlook Web rejected {action} ({code:?})");
             }
@@ -91,6 +98,7 @@ pub struct OutlookWebSession {
     origin: Url,
     headers: BTreeMap<String, String>,
     client: Client,
+    safari: Option<safari::SafariSession>,
 }
 impl fmt::Debug for RequestParts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -220,6 +228,7 @@ impl OutlookWebSession {
             origin,
             headers,
             client: http_client()?,
+            safari: None,
         })
     }
     pub fn request_parts(
@@ -258,6 +267,14 @@ impl OutlookWebSession {
         body: &Value,
         mutation: bool,
     ) -> Result<Value, OutlookWebError> {
+        if let Some(session) = &self.safari {
+            if mutation {
+                return Err(OutlookWebError::SafariReadOnly);
+            }
+            let value = session.call(action, body)?;
+            check_response(action, &value)?;
+            return Ok(value);
+        }
         let parts = self.parts(action)?;
         let mut headers = HeaderMap::new();
         for (name, value) in parts.headers {
@@ -506,6 +523,7 @@ mod tests {
                 origin: Url::parse(&format!("http://{address}/")).unwrap(),
                 headers: BTreeMap::new(),
                 client: http_client().unwrap(),
+                safari: None,
             };
             let error = session.create_draft(&DraftInput::default()).unwrap_err();
             if status.starts_with("500") {

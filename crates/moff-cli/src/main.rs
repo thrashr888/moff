@@ -37,6 +37,16 @@ enum Command {
 struct SessionArgs {
     #[arg(
         long,
+        conflicts_with = "session_curl",
+        help = "Read Mail/Calendar through a loaded Outlook Safari tab (experimental, read-only)"
+    )]
+    safari: bool,
+    #[arg(long, requires = "safari", requires = "safari_tab", value_parser = clap::value_parser!(u32).range(1..))]
+    safari_window: Option<u32>,
+    #[arg(long, requires = "safari", requires = "safari_window", value_parser = clap::value_parser!(u32).range(1..))]
+    safari_tab: Option<u32>,
+    #[arg(
+        long,
         value_name = "PATH",
         help = "Path to a browser-exported Outlook Web or Microsoft Graph cURL request"
     )]
@@ -271,6 +281,10 @@ fn error(message: impl std::fmt::Display) -> ExitCode {
 }
 
 fn session(args: SessionArgs) -> Result<OutlookWebSession, String> {
+    if args.safari {
+        return OutlookWebSession::from_safari(args.safari_window.zip(args.safari_tab))
+            .map_err(|error| error.to_string());
+    }
     let path = args.session_curl.or_else(|| {
         env::var_os("HOME")
             .map(|home| PathBuf::from(home).join(".config/moff/outlook-session.curl"))
@@ -282,6 +296,9 @@ fn session(args: SessionArgs) -> Result<OutlookWebSession, String> {
 }
 
 fn graph_session(args: SessionArgs) -> Result<GraphWebSession, String> {
+    if args.safari {
+        return Err("--safari currently supports Mail/Calendar reads only".to_owned());
+    }
     let path = args.session_curl.or_else(|| {
         env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/moff/graph-session.curl"))
     });
@@ -362,6 +379,14 @@ fn with_owa(
 }
 
 fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str, Value), String> {
+    if args.safari
+        && matches!(
+            command,
+            MailCommand::Create { .. } | MailCommand::Update { .. } | MailCommand::Delete { .. }
+        )
+    {
+        return Err(OutlookWebError::SafariReadOnly.to_string());
+    }
     match command {
         MailCommand::List {
             folder,
@@ -416,6 +441,16 @@ fn calendar_result(
     args: SessionArgs,
     command: CalendarCommand,
 ) -> Result<(&'static str, Value), String> {
+    if args.safari
+        && matches!(
+            command,
+            CalendarCommand::Create { .. }
+                | CalendarCommand::Update { .. }
+                | CalendarCommand::Delete { .. }
+        )
+    {
+        return Err(OutlookWebError::SafariReadOnly.to_string());
+    }
     match command {
         CalendarCommand::Folders => Ok((
             "outlook.calendar.folders",
@@ -506,7 +541,7 @@ fn main() -> ExitCode {
     match cli.command {
         Some(Command::Schema) => {
             print_json(
-                &json!({"schema":moff_core::SCHEMA_VERSION,"provider":"browser-session","commands":{"mail":{"list":true,"search":true,"get":true,"create":true,"update":true,"delete":true,"send":false},"calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"create":true,"update":true,"delete":true},"people":{"search":true,"get":true},"org":{"manager":true,"reports":true},"onedrive":{"list":true,"get":true},"groups":{"list":true},"loop":{"list":true,"get":true},"service":{"read":true}},"unimplemented_products":[],"mutations":true,"mutation_confirmation":"--confirm","mail_delete":"permanent","calendar_delete":"deleted-items","calendar_mutation_scope":"single appointments without attendees","search_semantics":"case-insensitive literal subject/body search within the chosen folder or calendar range"}),
+                &json!({"schema":moff_core::SCHEMA_VERSION,"provider":"browser-session","transports":{"curl-export":{"mutations":true},"safari":{"experimental":true,"mutations":false,"products":["mail","calendar"],"requires":"loaded authenticated Outlook tab","credential_export":false}},"commands":{"mail":{"list":true,"search":true,"get":true,"create":true,"update":true,"delete":true,"send":false},"calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"create":true,"update":true,"delete":true},"people":{"search":true,"get":true},"org":{"manager":true,"reports":true},"onedrive":{"list":true,"get":true},"groups":{"list":true},"loop":{"list":true,"get":true},"service":{"read":true}},"unimplemented_products":[],"mutations":true,"mutation_confirmation":"--confirm","mail_delete":"permanent","calendar_delete":"deleted-items","calendar_mutation_scope":"single appointments without attendees","search_semantics":"case-insensitive literal subject/body search within the chosen folder or calendar range"}),
             );
             ExitCode::SUCCESS
         }

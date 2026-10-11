@@ -1,6 +1,6 @@
 # Moff
 
-Moff is a personal **Outlook Web mail and calendar CLI**. It uses one provider only: existing authenticated browser sessions exported as cURL requests. Moff does not register an Entra application, run its own OAuth flow, use Azure CLI, access Keychain, automate desktop Outlook, use OCR, or persist a separate token cache.
+Moff is a personal **Outlook Web mail and calendar CLI**. It uses existing authenticated browser sessions: exported cURL requests, or an experimental read-only Safari adapter backed by the Cider library. Moff does not register an Entra application, run its own OAuth flow, use Azure CLI, access Keychain, automate desktop Outlook, use OCR, or persist a separate token cache.
 
 The export is read only while Moff runs. It is never copied, logged, cached, or added to source control.
 
@@ -82,6 +82,40 @@ Mail folders are `inbox`, `drafts`, `sentitems`, `deleteditems`, `archive`, `jun
 
 ## Session export
 
+### Experimental Safari reads
+
+```sh
+moff outlook --safari mail list --limit 5
+moff outlook --safari mail get --id '<item-id>'
+moff outlook --safari calendar folders
+moff outlook --safari calendar list --folder-id '<calendar-id>' \
+  --start 2026-10-10T00:00:00Z --end 2026-10-17T00:00:00Z
+# Select explicitly when multiple Outlook tabs are open.
+moff outlook --safari --safari-window 1 --safari-tab 1 mail list
+```
+
+Open and sign into Outlook Mail or Calendar in Safari first. Enable Safari
+Automation for the launching app and **Allow JavaScript from Apple Events**.
+Moff links Cider directly; an installed `cider` executable is not required.
+The dependency is pinned to the feature revision in
+[Cider PR #3](https://github.com/thrashr888/cider/pull/3), not a released API.
+
+Safari mode supports the existing Mail/Calendar reads and searches only; mutations
+are rejected before browser access. Graph products still require their cURL export.
+Credentials stay in the tab: Moff calls Outlook's silent authentication helper and
+performs the OWA request there, returning only response data. It never exports or
+stores a token. Session expiry requires signing in again in Safari; cached visible
+messages alone do not establish a valid session.
+
+This adapter depends on private Outlook webpack module contracts observed in the
+current web app, not a supported Microsoft API. An Outlook update can break it;
+failures are reported rather than silently falling back to scraped UI or another
+account. Responses are limited to 900 KB; oversized data is rejected, not truncated
+into a successful result. Use a smaller page or calendar range. Automatic sign-in
+and MFA handling are not implemented.
+
+### cURL exports
+
 Keep both files local and owner-readable only. They contain browser credentials and must never be committed, logged, or pasted into chat.
 
 | Session file | Browser capture source | Used for |
@@ -118,6 +152,8 @@ cargo fmt --check
 cargo clippy --workspace -- -D warnings
 cargo test --workspace
 cargo build --release
+# Browser-adapter contract tests (Node.js 18+; no Safari or account needed).
+node --test crates/moff-outlook-owa/tests/safari_read.test.cjs
 ```
 
 The release binary is `target/release/moff`.

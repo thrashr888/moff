@@ -8,6 +8,60 @@ fn moff() -> Command {
 }
 
 #[test]
+fn safari_mutations_and_graph_are_rejected_without_browser_access() {
+    for product in ["mail", "calendar"] {
+        moff()
+            .args([
+                "outlook",
+                "--safari",
+                product,
+                "delete",
+                "--id",
+                "fake",
+                "--confirm",
+            ])
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(contains("supports reads only"));
+    }
+    moff()
+        .args(["outlook", "--safari", "people", "search"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("Mail/Calendar reads only"));
+}
+
+#[test]
+fn safari_requires_complete_targets_and_excludes_exports() {
+    moff()
+        .args([
+            "outlook",
+            "--safari",
+            "--safari-window",
+            "1",
+            "mail",
+            "list",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("--safari-tab"));
+    moff()
+        .args([
+            "outlook",
+            "--safari",
+            "--session-curl",
+            "fake",
+            "mail",
+            "list",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("cannot be used"));
+}
+
+#[test]
 fn help_exposes_all_browser_session_read_products() {
     moff()
         .arg("--help")
