@@ -400,14 +400,43 @@ fn output(command: &str, value: &Value) {
 
 #[allow(clippy::needless_pass_by_value)]
 fn graph_result(
-    _args: SessionArgs,
+    args: SessionArgs,
     command: &str,
-    _path: String,
-    _only_loop_files: bool,
+    path: String,
+    only_loop_files: bool,
 ) -> Result<(&'static str, Value), String> {
-    Err(format!(
-        "{command} is not yet available through Safari/Cider; exported-cURL credentials are no longer supported"
-    ))
+    let mut value = session(args)?
+        .product_read(&path)
+        .map_err(|error| error.to_string())?;
+    let is_loop = |item: &Value| {
+        item["name"].as_str().is_some_and(|name| {
+            Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("loop"))
+        })
+    };
+    if only_loop_files {
+        let items = value
+            .get_mut("value")
+            .and_then(Value::as_array_mut)
+            .ok_or("Loop search returned invalid product metadata")?;
+        items.retain(is_loop);
+    } else if command == "outlook.loop.get" && !is_loop(&value) {
+        return Err("the requested drive item is not a .loop file".to_owned());
+    }
+    let command = match command {
+        "outlook.people.search" => "outlook.people.search",
+        "outlook.people.get" => "outlook.people.get",
+        "outlook.org.manager" => "outlook.org.manager",
+        "outlook.org.reports" => "outlook.org.reports",
+        "outlook.onedrive.list" => "outlook.onedrive.list",
+        "outlook.onedrive.get" => "outlook.onedrive.get",
+        "outlook.groups.list" => "outlook.groups.list",
+        "outlook.loop.list" => "outlook.loop.list",
+        "outlook.loop.get" => "outlook.loop.get",
+        _ => return Err("unsupported browser product command".to_owned()),
+    };
+    Ok((command, value))
 }
 
 fn confirmed_json(path: &Path, confirm: bool) -> Result<Value, String> {
@@ -704,7 +733,7 @@ fn main() -> ExitCode {
     match cli.command {
         Some(Command::Schema) => {
             print_json(
-                &json!({"schema":moff_core::SCHEMA_VERSION,"provider":"browser-session","default_transport":"safari","transports":{"safari":{"experimental":true,"mutations":true,"mutation_gate":"--allow-mutation and --confirm","delete":false,"products":["mail","calendar"],"requires":"loaded authenticated Outlook tab","credential_export":false,"auth_recovery":{"refresh":true,"status":true,"interactive_sign_in":false,"confirmation":"--confirm","wait_seconds_max":120}}},"commands":{"auth":{"refresh":true,"status":true},"mail":{"list":true,"search":true,"get":true,"get-batch":true,"categories":true,"reply-draft":true,"reply_all_draft":true,"mark":true,"create":true,"update":true,"delete":false,"send":false},"calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"get-batch":true,"availability":true,"work-blocks":{"plan":true,"apply":true},"create":true,"update":true,"delete":false},"people":{"search":false,"get":false},"org":{"manager":false,"reports":false},"onedrive":{"list":false,"get":false},"groups":{"list":false},"loop":{"list":false,"get":false},"service":{"read":true}},"unimplemented_products":["people","org","onedrive","groups","loop"],"mutations":true,"mutation_confirmation":"--confirm","calendar_mutation_scope":"single appointments without attendees","scheduling_policy":"empty gaps first; explicit exact-title overlap fallback","batch_limit":20,"search_semantics":"case-insensitive literal subject/body search within the chosen folder or calendar range"}),
+                &json!({"schema":moff_core::SCHEMA_VERSION,"provider":"browser-session","default_transport":"safari","transports":{"safari":{"experimental":true,"mutations":true,"mutation_gate":"--allow-mutation and --confirm","delete":false,"products":["mail","calendar","people","org","onedrive","groups","loop"],"requires":"loaded authenticated Outlook tab; product reads require silent Graph access","credential_export":false,"auth_recovery":{"refresh":true,"status":true,"interactive_sign_in":false,"confirmation":"--confirm","wait_seconds_max":120}}},"commands":{"auth":{"refresh":true,"status":true},"mail":{"list":true,"search":true,"get":true,"get-batch":true,"categories":true,"reply-draft":true,"reply_all_draft":true,"mark":true,"create":true,"update":true,"delete":false,"send":false},"calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"get-batch":true,"availability":true,"work-blocks":{"plan":true,"apply":true},"create":true,"update":true,"delete":false},"people":{"search":true,"get":true},"org":{"manager":true,"reports":true},"onedrive":{"list":true,"get":true},"groups":{"list":true},"loop":{"list":true,"get":true},"service":{"read":true}},"unimplemented_products":[],"product_reads":{"methods":["GET"],"max_page_size":100,"follow_next_links":false,"loop_scope":"drive-backed .loop file metadata","interactive_consent":false},"mutations":true,"mutation_confirmation":"--confirm","calendar_mutation_scope":"single appointments without attendees","scheduling_policy":"empty gaps first; explicit exact-title overlap fallback","batch_limit":20,"search_semantics":"case-insensitive literal subject/body search within the chosen folder or calendar range"}),
             );
             ExitCode::SUCCESS
         }

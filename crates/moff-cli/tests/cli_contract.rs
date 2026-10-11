@@ -29,7 +29,7 @@ fn safari_is_the_only_transport_and_exports_are_not_accepted() {
 }
 
 #[test]
-fn unsupported_products_fail_before_any_browser_access() {
+fn product_commands_remain_discoverable_without_browser_access() {
     for args in [
         vec!["people", "search"],
         vec!["people", "get", "--user", "fake"],
@@ -44,10 +44,9 @@ fn unsupported_products_fail_before_any_browser_access() {
         moff()
             .arg("outlook")
             .args(args)
+            .arg("--help")
             .assert()
-            .failure()
-            .code(2)
-            .stderr(contains("not yet available through Safari/Cider"));
+            .success();
     }
 }
 
@@ -170,11 +169,13 @@ fn schema_is_honest_about_unavailable_products_and_safe_writes() {
         assert_eq!(schema["commands"][product]["delete"], false);
         assert_eq!(schema["commands"][product]["get-batch"], true);
     }
-    assert_eq!(
-        schema["unimplemented_products"].as_array().unwrap().len(),
-        5
+    assert!(
+        schema["unimplemented_products"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
-    assert_eq!(schema["commands"]["people"]["search"], false);
+    assert_eq!(schema["commands"]["people"]["search"], true);
 }
 
 #[test]

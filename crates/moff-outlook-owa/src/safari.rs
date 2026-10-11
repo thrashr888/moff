@@ -41,8 +41,11 @@ impl OutlookWebSession {
             return Err(OutlookWebError::SafariUnavailable);
         };
         let script = format!(
-            "(async function(){{const result=await ({})({{\"action\":\"__MoffAuthStatus\"}});return {{status:result.status,recovery_marker_present:sessionStorage.getItem('__moff_auth_recovery')!==null}};}})()",
-            include_str!("safari_read.js")
+            "(async function(){{const result=await {};return {{status:result.status,recovery_marker_present:sessionStorage.getItem('__moff_auth_recovery')!==null}};}})()",
+            page_script(
+                include_str!("safari_read.js"),
+                &json!({"action":"__MoffAuthStatus"})
+            )
         );
         let result = safari
             .runtime
@@ -115,8 +118,8 @@ impl OutlookWebSession {
                     }
                     if candidates.len() > 1 { return Err(OutlookWebError::SafariUnavailable); }
                     let Some((document, tab)) = candidates.pop() else { continue; };
-                    let script = format!("({})({})", include_str!("safari_read.js"),
-                        json!({"action":"__MoffAuthStatus","recovery_marker":marker}));
+                    let script = page_script(include_str!("safari_read.js"),
+                        &json!({"action":"__MoffAuthStatus","recovery_marker":marker}));
                     let result = match safari::eval_document(&script, &document, &eval_options(15)).await {
                         Ok(result) => result,
                         Err(error) if error.downcast_ref::<PageOperationError>().is_some_and(|error|
@@ -183,6 +186,14 @@ fn eval_options(timeout: u32) -> EvalOptions {
     }
 }
 
+fn page_script(source: &str, config: &Value) -> String {
+    format!(
+        "({source})({config}, ({}), ({}))",
+        include_str!("safari_auth.js"),
+        include_str!("safari_response.js")
+    )
+}
+
 impl OutlookWebSession {
     /// Explicitly opt into typed, non-sending writes; the raw read surface stays read-only.
     pub fn from_safari_with_mutations(
@@ -210,6 +221,44 @@ impl OutlookWebSession {
 }
 
 impl SafariSession {
+    pub(super) fn product_read(&self, url: &str) -> Result<Value, OutlookWebError> {
+        let script = page_script(include_str!("safari_products.js"), &json!({"url":url}));
+        let result = self
+            .runtime
+            .block_on(safari::eval_document(
+                &script,
+                &self.target,
+                &EvalOptions {
+                    allow_eval: true,
+                    max_chars: 1_000_000,
+                    timeout: 60,
+                },
+            ))
+            .map_err(|_| OutlookWebError::SafariOperationFailed)?;
+        if result.truncated {
+            return Err(OutlookWebError::TruncatedSearch);
+        }
+        let status = result.value["status"]
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .ok_or(OutlookWebError::InvalidResponse)?;
+        if status == 401 {
+            return Err(OutlookWebError::ProductAuthenticationUnavailable);
+        }
+        if !(200..300).contains(&status) {
+            return Err(OutlookWebError::ProductRequestRejected(status));
+        }
+        let value = decode_response(
+            result.value["body"]
+                .as_str()
+                .ok_or(OutlookWebError::InvalidResponse)?,
+        )?;
+        if !value.is_object() || value.get("error").is_some() {
+            return Err(OutlookWebError::InvalidResponse);
+        }
+        Ok(value)
+    }
+
     pub(super) fn call(
         &self,
         action: &'static str,
@@ -225,10 +274,9 @@ impl SafariSession {
         } else {
             validate_read_action(action)?;
         }
-        let script = format!(
-            "({})({})",
+        let script = page_script(
             include_str!("safari_read.js"),
-            json!({ "action": action, "body": body, "mutation": mutation, "allow_mutation": self.allow_mutation })
+            &json!({ "action": action, "body": body, "mutation": mutation, "allow_mutation": self.allow_mutation }),
         );
         let result = self
             .runtime

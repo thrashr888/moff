@@ -1,6 +1,7 @@
 //! Outlook Mail and Calendar operations through Safari and the Cider library.
 #![allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
 mod operations;
+mod products;
 mod safari;
 mod scheduling;
 #[cfg(test)]
@@ -34,6 +35,8 @@ pub enum OutlookWebError {
     SafariOperationFailed,
     SafariRefreshUnknown,
     SafariAuthRecoveryFailed(&'static str),
+    ProductAuthenticationUnavailable,
+    ProductRequestRejected(u16),
     SafariReadOnly,
     VerificationFailed,
     DraftVerificationFailed {
@@ -73,6 +76,10 @@ impl fmt::Display for OutlookWebError {
             Self::SafariRefreshUnknown => "Safari did not confirm the scheduled refresh; it may still happen. Inspect the selected tab before retrying; no mailbox write was attempted",
             Self::SafariAuthRecoveryFailed(stage) => {
                 return write!(f, "Safari authentication recovery failed during {stage}; no mailbox write was attempted; inspect Safari or update the private Outlook adapter");
+            }
+            Self::ProductAuthenticationUnavailable => "browser product authentication is unavailable; sign into Outlook and check the product's permitted browser access; Moff will not request consent or export credentials",
+            Self::ProductRequestRejected(status) => {
+                return write!(f, "the product API rejected the browser read (HTTP {status}); access may require permissions not held by this session");
             }
             Self::SafariReadOnly => "Safari writes require --allow-mutation and --confirm; deletion is not supported through Safari",
             Self::VerificationFailed => "the write completed but verification failed; inspect the affected item before retrying",

@@ -3,6 +3,8 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 const source = fs.readFileSync(require("node:path").join(__dirname, "../src/safari_read.js"), "utf8");
+const authSource = fs.readFileSync(require("node:path").join(__dirname, "../src/safari_auth.js"), "utf8");
+const responseSource = fs.readFileSync(require("node:path").join(__dirname, "../src/safari_response.js"), "utf8");
 
 function fixture(options = {}) {
     const requests = [];
@@ -28,7 +30,10 @@ function fixture(options = {}) {
                 {status: options.status || 200});
         },
     };
-    return {call: vm.runInNewContext(`(${source})`, context), requests, chunks};
+    const read = vm.runInNewContext(`(${source})`, context);
+    const auth = vm.runInNewContext(`(${authSource})`, context);
+    const response = vm.runInNewContext(`(${responseSource})`, context);
+    return {call: config => read(config, auth, response), requests, chunks};
 }
 
 test("read authenticates inside page and returns no credential", async () => {

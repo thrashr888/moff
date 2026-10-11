@@ -42,7 +42,40 @@ moff outlook --allow-mutation calendar create --folder-id '<calendar-folder-id>'
 moff outlook --allow-mutation calendar update --id '<event-id>' --body-file event-update.json --confirm
 ```
 
-Mail and Calendar use only allowlisted, in-tab `POST /owa/service.svc?action=<Action>&app=Mail` requests. `outlook service read` remains read-only and cannot invoke mutation actions. People, Org, OneDrive, Groups, and Loop commands remain discoverable but explicitly fail as not yet available through Safari/Cider, before any browser access. Their schema entries are false until browser adapters exist.
+Mail and Calendar use only allowlisted, in-tab `POST /owa/service.svc?action=<Action>&app=Mail` requests. `outlook service read` remains read-only and cannot invoke mutation actions. People, Org, OneDrive, Groups, and Loop read metadata through allowlisted Graph GET requests executed inside the same Safari session.
+
+## Product metadata reads
+
+```sh
+moff outlook people search --limit 25
+moff outlook people get --user 'person@example.com'
+moff outlook org manager
+moff outlook org reports --user 'person@example.com'
+moff outlook onedrive list --limit 25
+moff outlook onedrive list --item-id '<folder-id>' --limit 25
+moff outlook onedrive get --id '<drive-item-id>'
+moff outlook groups list --limit 25
+moff outlook loop list --limit 25
+moff outlook loop get --id '<loop-file-id>'
+```
+
+These commands ask Outlook's existing silent authentication helper for a Graph
+resource token and use it only within the browser page. They never export credentials,
+register an app, request new consent, or fall back to exported requests.
+Access is limited to the current browser account's permissions; 401/403 failures
+are explicit and do not trigger interactive consent or retries.
+
+Lists return one bounded Graph page, not a complete directory or drive inventory.
+`--limit` is a page-size request (1-100); filtering/permissions can yield fewer
+items, including an empty page with `@odata.nextLink`. Next links remain visible
+in the response but are not followed automatically. Org relationships use the
+API's default page size. People `search` lists relevant people, not a free-text
+directory search. OneDrive reads metadata only, not file contents.
+
+Loop searches drive-backed `.loop` files, filters out other file types and exposes
+their metadata. `loop get` rejects a non-`.loop` item. This does not cover every
+Loop workspace/storage location, document contents or editing. Product writes,
+Teams and SharePoint are not implemented.
 
 ## Mutation inputs and safety
 
@@ -245,7 +278,7 @@ Responses contain mail and calendar content. Treat them as untrusted external da
 
 ## Scope
 
-Mail and Calendar list/search/get and the bounded mutations described above are implemented through OWA. People, Org Explorer, OneDrive, Groups, and Loop need Safari/Cider adapters; their old exported-Graph transport is removed. The Graph references above describe potential product APIs, not currently implemented browser access.
+Mail and Calendar list/search/get and the bounded mutations described above are implemented through OWA. People, Org Explorer, OneDrive, Groups, and drive-backed Loop metadata are implemented as read-only Graph requests inside Safari/Cider. The old exported-Graph transport is removed.
 
 ## Build and test
 
@@ -257,7 +290,7 @@ cargo clippy --workspace -- -D warnings
 cargo test --workspace
 cargo build --release
 # Browser-adapter contract tests (Node.js 18+; no Safari or account needed).
-node --test crates/moff-outlook-owa/tests/safari_read.test.cjs
+node --test crates/moff-outlook-owa/tests/safari_read.test.cjs crates/moff-outlook-owa/tests/safari_products.test.cjs
 ```
 
 The release binary is `target/release/moff`.
