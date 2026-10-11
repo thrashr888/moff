@@ -200,7 +200,7 @@ dependencies = [
 [[package]]
 name = "cider-cli"
 version = "0.11.0"
-source = "git+https://github.com/thrashr888/cider?rev=1a76c0d791430a551b88bcd979eb2923ce87a6a4#1a76c0d791430a551b88bcd979eb2923ce87a6a4"
+source = "git+https://github.com/thrashr888/cider?rev=0b6c27de438aa2baf80394b1542b8850786801f8#0b6c27de438aa2baf80394b1542b8850786801f8"
 dependencies = [
  "anyhow",
  "chrono",

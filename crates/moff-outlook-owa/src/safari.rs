@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use cider::sources::safari::{self, EvalOptions, TabTarget};
+use cider::sources::safari::{
+    self, DocumentTarget, EvalOptions, OperationPhase, PageOperationError, TabTarget,
+};
 use serde_json::{Value, json};
 use url::Url;
 
@@ -9,7 +11,7 @@ use crate::{
 };
 
 pub(super) struct SafariSession {
-    target: TabTarget,
+    target: DocumentTarget,
     runtime: tokio::runtime::Runtime,
     allow_mutation: bool,
 }
@@ -60,6 +62,9 @@ impl OutlookWebSession {
             window: u32::try_from(tab.window).map_err(|_| OutlookWebError::SafariUnavailable)?,
             tab: u32::try_from(tab.tab).map_err(|_| OutlookWebError::SafariUnavailable)?,
         };
+        let target = runtime
+            .block_on(safari::document_target(target))
+            .map_err(|_| OutlookWebError::SafariBeforeDispatch)?;
         Ok(Self {
             origin: Url::parse(&tab.url).map_err(|_| OutlookWebError::SafariUnavailable)?,
             headers: BTreeMap::new(),
@@ -96,16 +101,28 @@ impl SafariSession {
         );
         let result = self
             .runtime
-            .block_on(safari::eval(
+            .block_on(safari::eval_document(
                 &script,
-                self.target,
+                &self.target,
                 &EvalOptions {
                     allow_eval: true,
                     max_chars: 1_000_000,
                     timeout: 60,
                 },
             ))
-            .map_err(|_| {
+            .map_err(|error| {
+                if let Some(operation) = error.downcast_ref::<PageOperationError>() {
+                    if matches!(operation.phase, OperationPhase::BeforeDispatch) {
+                        return OutlookWebError::SafariBeforeDispatch;
+                    }
+                    if mutation {
+                        return OutlookWebError::SafariOutcomeUnknown {
+                            action,
+                            phase: operation.phase,
+                            cancellation: operation.cancellation,
+                        };
+                    }
+                }
                 if mutation {
                     OutlookWebError::OutcomeUnknown { action }
                 } else {

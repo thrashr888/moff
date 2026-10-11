@@ -49,6 +49,12 @@ pub enum OutlookWebError {
     SafariReadOnly,
     VerificationFailed,
     PlanChanged,
+    SafariBeforeDispatch,
+    SafariOutcomeUnknown {
+        action: &'static str,
+        phase: cider::sources::safari::OperationPhase,
+        cancellation: cider::sources::safari::CancellationStatus,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -85,6 +91,10 @@ impl fmt::Display for OutlookWebError {
             Self::SafariReadOnly => "Safari writes require --allow-mutation and --confirm; deletion is not supported through Safari",
             Self::VerificationFailed => "the write completed but verification failed; inspect the affected item before retrying",
             Self::PlanChanged => "the calendar or target appointment changed since preview; generate and review a new plan",
+            Self::SafariBeforeDispatch => "Safari target failed before dispatch; no caller operation was started; sign in and select the intended document again",
+            Self::SafariOutcomeUnknown { action, phase, cancellation } => {
+                return write!(f,"the outcome of {action} is unknown (phase: {phase:?}, cancellation: {cancellation:?}); cancellation does not undo server writes; inspect the affected item before retrying");
+            }
             Self::OperationRejected { action, code } => {
                 return write!(f, "Outlook Web rejected {action} ({code:?})");
             }

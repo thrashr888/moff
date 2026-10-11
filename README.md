@@ -206,13 +206,13 @@ Plan files contain private calendar data and must not be committed or shared.
 
 ### Cider follow-ups
 
-No Cider update is required for these commands: its gated eval library is sufficient.
-Two transport improvements would help future reliability:
-
-- Stable tab identity and same-origin SPA route-change tolerance: positional targeting
-  and route changes during evaluation can produce an unknown write outcome.
-- Structured page-operation failure phases and cancellation status, so Moff can
-  distinguish failure before dispatch from a potentially completed request.
+Cider's document-target and typed failure APIs are now wired into Moff. A session
+captures the original window/document once; tab/window reordering and same-origin
+SPA changes are tolerated without changing the target. Reloads, replacement tabs,
+moving the tab to another window or cross-origin navigation expire the handle.
+Pre-dispatch failures are distinguished from unknown write outcomes; cancellation
+metadata never claims that a server write was rolled back. A full native durable
+tab ID is still not exposed by Safari Apple Events.
 
 Full regular-tab HTTP history and automated sign-in remain separate, unresolved
 capabilities. Moff never silently retries writes or bypasses authentication prompts.
