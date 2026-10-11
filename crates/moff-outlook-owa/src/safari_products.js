@@ -8,28 +8,124 @@ async function(config, acquireToken, readResponse) {
         throw new Error("Unsupported product read URL");
     }
     const url = new URL(config.url);
+    const method = config.method || "GET";
+    const uploadNew = /^\/v1\.0\/me\/drive\/(root|items\/[^/]+):\/[^/]+:\/content$/.test(url.pathname);
+    const uploadExisting = /^\/v1\.0\/me\/drive\/items\/[^/]+\/content$/.test(url.pathname);
     const paths = [
         /^\/v1\.0\/me\/(people|manager|directReports)$/,
-        /^\/v1\.0\/users\/[^/]+(\/(manager|directReports))?$/,
-        /^\/v1\.0\/groups$/,
+        /^\/v1\.0\/me$/,
+        /^\/v1\.0\/me\/contacts(\/[^/]+)?$/,
+        /^\/v1\.0\/users(\/[^/]+(\/(manager|directReports))?)?$/,
+        /^\/v1\.0\/groups(\/[^/]+(\/(owners|members))?)?$/,
+        /^\/v1\.0\/groups\/[^/]+\/members\/(\$ref|[^/]+\/\$ref)$/,
         /^\/v1\.0\/me\/drive\/(root|items\/[^/]+)\/children$/,
         /^\/v1\.0\/me\/drive\/items\/[^/]+$/,
-        /^\/v1\.0\/me\/drive\/root\/search\(q='\.loop'\)$/,
+        /^\/v1\.0\/me\/drive\/root\/search\(q='[^/]*'\)$/,
+        /^\/v1\.0\/me\/drive\/(root|items\/[^/]+):\/[^/]+:\/content$/,
+        /^\/v1\.0\/me\/drive\/items\/[^/]+\/content$/,
     ];
     if (url.origin !== "https://graph.microsoft.com" || url.username || url.password || url.hash
         || !paths.some(pattern => pattern.test(url.pathname))
         || /%2f|%5c|%25/i.test(url.pathname)) throw new Error("Unsupported product read URL");
-    const paged = url.pathname === "/v1.0/me/people" || url.pathname === "/v1.0/groups"
-        || url.pathname.endsWith("/children") || url.pathname.endsWith("/search(q='.loop')");
+    const paged = url.pathname === "/v1.0/me/people" || url.pathname === "/v1.0/me/contacts" || url.pathname === "/v1.0/groups" || url.pathname === "/v1.0/users"
+        || /^\/v1\.0\/groups\/[^/]+\/(owners|members)$/.test(url.pathname)
+        || url.pathname.endsWith("/children") || /^\/v1\.0\/me\/drive\/root\/search\(q='[^/]*'\)$/.test(url.pathname);
     const user = /^\/v1\.0\/users\/[^/]+$/.test(url.pathname), keys = new Set();
     for (const [key, value] of url.searchParams) {
         if (keys.has(key)) throw new Error("Duplicate product read query");
         keys.add(key);
         const allowed = key === "$top" && paged && /^\d+$/.test(value) && Number(value) >= 1 && Number(value) <= 100
             || key === "$select" && user && value === "id,displayName,mail,userPrincipalName,userType"
-            || key === "$filter" && url.pathname === "/v1.0/groups" && value === "groupTypes/any(c:c eq 'Unified')";
+            || key === "$filter" && url.pathname === "/v1.0/groups" && value === "groupTypes/any(c:c eq 'Unified')"
+            || key === "$skiptoken" && paged && value.length > 0 && value.length <= 4096
+            || key === "$skip" && paged && /^\d+$/.test(value) && Number(value) <= 4294967295
+            || key === "@microsoft.graph.conflictBehavior" && method === "PUT" && uploadNew && value === "fail";
         if (!allowed) throw new Error("Unsupported product read query");
     }
+    const write = method !== "GET";
+    const objectFields = (value, fields) => {
+        if (!value || Array.isArray(value) || typeof value !== "object" || !Object.keys(value).length
+            || Object.keys(value).some(key => !fields.includes(key))) throw new Error("Invalid product write body");
+    };
+    const strings = (value, fields) => {
+        objectFields(value, fields);
+        if (Object.values(value).some(item => typeof item !== "string")) throw new Error("Invalid string fields");
+    };
+    const segment = value => typeof value === "string" && value.trim()
+        && !/[\\/%\x00-\x1f]/.test(value) && value !== "." && value !== "..";
+    if (write) {
+        if (config.allow_mutation !== true || !["POST", "PATCH", "DELETE", "PUT"].includes(method)
+            || (url.search && !(method === "PUT" && uploadNew))
+            || JSON.stringify(config.body || {}).length > 200000) throw new Error("Product writes require an explicit gate");
+        const contact = /^\/v1\.0\/me\/contacts\/[^/]+$/.test(url.pathname);
+        const drive = /^\/v1\.0\/me\/drive\/items\/[^/]+$/.test(url.pathname);
+        const group = /^\/v1\.0\/groups\/[^/]+$/.test(url.pathname);
+        const folder = /^\/v1\.0\/me\/drive\/(root|items\/[^/]+)\/children$/.test(url.pathname);
+        const memberAdd = /^\/v1\.0\/groups\/[^/]+\/members\/\$ref$/.test(url.pathname);
+        const memberRemove = /^\/v1\.0\/groups\/[^/]+\/members\/[^/]+\/\$ref$/.test(url.pathname);
+        if (method === "PUT") {
+            if (!(uploadNew || uploadExisting) || config.body != null || !Array.isArray(config.bytes)
+                || config.bytes.length > 128000 || config.bytes.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)
+                || (uploadNew && url.searchParams.get("@microsoft.graph.conflictBehavior") !== "fail")
+                || (uploadExisting && !config.etag)) throw new Error("Invalid bounded file upload");
+            if (uploadNew) {
+                const filename = decodeURIComponent(url.pathname.split("/").at(-2).slice(0,-1));
+                if (!segment(filename)) throw new Error("Invalid upload filename");
+            }
+        } else if (method === "DELETE") {
+            if (!(contact || drive || group || memberRemove) || config.body != null) throw new Error("Unsupported product delete");
+        } else if (method === "POST" && memberAdd) {
+            strings(config.body, ["@odata.id"]);
+            const member = new URL(config.body["@odata.id"]);
+            if (member.origin !== "https://graph.microsoft.com" || member.username || member.password || member.search || member.hash
+                || !/^\/v1\.0\/users\/[^/]+$/.test(member.pathname) || /%2f|%5c|%25/i.test(member.pathname)) throw new Error("Only directory users can be group members");
+        } else if ((method === "POST" && url.pathname === "/v1.0/me/contacts") || (method === "PATCH" && contact)) {
+            objectFields(config.body, ["givenName","surname","displayName","companyName","jobTitle","department","officeLocation","mobilePhone","businessPhones","homePhones","emailAddresses","personalNotes"]);
+            for (const [key, value] of Object.entries(config.body)) {
+                if (["businessPhones","homePhones"].includes(key)) {
+                    if (!Array.isArray(value) || value.some(item => typeof item !== "string")) throw new Error("Invalid phones");
+                } else if (key === "emailAddresses") {
+                    if (!Array.isArray(value)) throw new Error("Invalid addresses");
+                    for (const address of value) {
+                        strings(address, ["name","address"]);
+                        if (!address.address?.includes("@") || /[\x00-\x1f]/.test(address.address)) throw new Error("Invalid address");
+                    }
+                } else if (typeof value !== "string") throw new Error("Invalid contact field");
+            }
+        } else if (method === "POST" && folder) {
+            objectFields(config.body, ["name","folder","@microsoft.graph.conflictBehavior"]);
+            if (!segment(config.body.name) || !config.body.folder || Array.isArray(config.body.folder)
+                || typeof config.body.folder !== "object" || Object.keys(config.body.folder).length
+                || config.body["@microsoft.graph.conflictBehavior"] !== "fail") throw new Error("Invalid folder body");
+        } else if (method === "PATCH" && drive) {
+            objectFields(config.body, ["name","description","parentReference"]);
+            for (const [key,value] of Object.entries(config.body)) {
+                if (key === "parentReference") {
+                    strings(value, ["id"]);
+                    if (!segment(value.id)) throw new Error("Invalid parent folder ID");
+                } else if (typeof value !== "string") throw new Error("Invalid drive field");
+            }
+            if (config.body.name !== undefined && !segment(config.body.name)) throw new Error("Invalid drive name");
+        } else if ((method === "POST" && url.pathname === "/v1.0/groups") || (method === "PATCH" && group)) {
+            objectFields(config.body, method === "POST"
+                ? ["displayName","description","mailNickname","visibility","groupTypes","mailEnabled","securityEnabled"]
+                : ["displayName","description","visibility"]);
+            for (const key of ["displayName","description","mailNickname","visibility"]) {
+                if (config.body[key] !== undefined && typeof config.body[key] !== "string") throw new Error("Invalid group field");
+            }
+            if (config.body.displayName !== undefined && (!config.body.displayName.trim() || config.body.displayName.length > 256))
+                throw new Error("Invalid group name");
+            if (config.body.visibility !== undefined && !["Private","Public"].includes(config.body.visibility)) throw new Error("Invalid visibility");
+            if (method === "POST" && (!config.body.displayName || !/^[a-z0-9_-]{1,64}$/i.test(config.body.mailNickname)
+                || JSON.stringify(config.body.groupTypes) !== '["Unified"]'
+                || config.body.mailEnabled !== true || config.body.securityEnabled !== false)) throw new Error("Only Microsoft 365 groups can be created");
+        } else throw new Error("Unsupported product write route");
+        if (drive && !config.etag) throw new Error("Drive writes require the current entity tag");
+    } else if (config.body != null || config.etag != null || config.bytes != null || uploadNew || uploadExisting
+        || url.pathname.endsWith("/$ref")) throw new Error("Read cannot carry write fields");
+    if (method !== "PUT" && config.bytes != null) throw new Error("Only uploads accept bytes");
+    if (config.download === true && (write || !/^\/v1\.0\/me\/drive\/items\/[^/]+$/.test(url.pathname))) throw new Error("Only drive files can be downloaded");
+    if (config.etag != null && (typeof config.etag !== "string" || !config.etag || /[\r\n]/.test(config.etag))) throw new Error("Invalid entity tag");
     let token = await acquireToken("https://graph.microsoft.com");
     if (token.status !== 200) {
         if (token.status === 422 || token.status === 425) throw new Error("Outlook authentication contract is unavailable");
@@ -39,12 +135,50 @@ async function(config, acquireToken, readResponse) {
     const timer = setTimeout(() => controller.abort(), 25000);
     try {
         const response = await fetch(url.href, {
-            method: "GET", mode: "cors", credentials: "omit", redirect: "error",
-            headers: {accept: "application/json", authorization: "Bearer " + token.accessToken},
+            method, mode: "cors", credentials: "omit", redirect: "error",
+            headers: {accept: "application/json", authorization: "Bearer " + token.accessToken,
+                ...(config.body != null ? {"content-type":"application/json"} : {}),
+                ...(method === "PUT" ? {"content-type":"application/octet-stream"} : {}),
+                ...(config.etag ? {"if-match":config.etag} : {})},
+            ...(config.body != null ? {body:JSON.stringify(config.body)} : {}),
+            ...(method === "PUT" ? {body:new Uint8Array(config.bytes)} : {}),
             signal: controller.signal
         });
         token = null;
-        return await readResponse(response);
+        if (response.status === 204) return {status:204, body:""};
+        const result = await readResponse(response);
+        if (result.body !== undefined) {
+            const value = JSON.parse(result.body);
+            if (config.download === true) {
+                if (!value.file || !Number.isSafeInteger(value.size) || value.size < 0 || value.size > 128000)
+                    throw new Error("Downloads require a file no larger than 128000 bytes");
+                const download = new URL(value["@microsoft.graph.downloadUrl"]);
+                if (download.protocol !== "https:" || download.username || download.password
+                    || !(download.hostname.endsWith(".sharepoint.com") || download.hostname.endsWith(".1drv.com")
+                        || download.hostname.endsWith(".onedrive.com") || download.hostname === "onedrive.live.com"))
+                    throw new Error("Unsupported Microsoft file download location");
+                const content = await fetch(download.href, {method:"GET",mode:"cors",credentials:"omit",redirect:"error",signal:controller.signal});
+                if (!content.ok) return {status:content.status};
+                const reader = content.body.getReader(), bytes = [];
+                try {
+                    while (true) {
+                        const chunk = await reader.read();
+                        if (chunk.done) break;
+                        if (bytes.length + chunk.value.length > 128000) throw new Error("File exceeds browser transfer limit");
+                        for (const byte of chunk.value) bytes.push(byte);
+                    }
+                } finally { await reader.cancel(); }
+                return {status:200,body:JSON.stringify({bytes})};
+            }
+            const scrub = item => {
+                if (!item || typeof item !== "object") return;
+                delete item["@microsoft.graph.downloadUrl"];
+                for (const child of Object.values(item)) scrub(child);
+            };
+            scrub(value);
+            result.body = JSON.stringify(value);
+        }
+        return result;
     } finally {
         token = null;
         clearTimeout(timer);

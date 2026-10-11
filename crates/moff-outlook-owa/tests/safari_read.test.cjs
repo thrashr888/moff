@@ -126,4 +126,25 @@ test("typed writes require gate, save-only disposition and supported actions", a
             Items:[{__type:"ReplyToItem:#Exchange"}]}}});
     assert.equal(result.status,200);
     assert.ok(!JSON.stringify(result).includes("test-secret"));
+    const contact = fixture();
+    assert.equal((await contact.call({action:"CreateItem",mutation:true,allow_mutation:true,
+        body:{Body:{__type:"CreateItemRequest:#Exchange",MessageDisposition:"SaveOnly",
+            SavedItemFolderId:{BaseFolderId:{Id:"contacts"}},Items:[{__type:"Contact:#Exchange",GivenName:"Synthetic"}]}}})).status,200);
+    await assert.rejects(fixture().call({action:"CreateItem",mutation:true,allow_mutation:true,
+        body:{Body:{__type:"CreateItemRequest:#Exchange",MessageDisposition:"SaveOnly",
+            SavedItemFolderId:{BaseFolderId:{Id:"inbox"}},Items:[{__type:"Contact:#Exchange"}]}}}));
+});
+
+test("recycle operations require one versioned item and prohibit permanent deletion or notifications", async () => {
+    const body = {Body:{__type:"DeleteItemRequest:#Exchange",DeleteType:"MoveToDeletedItems",
+        SendMeetingCancellations:"SendToNone",SuppressReadReceipts:true,
+        ItemIds:[{Id:"synthetic",ChangeKey:"key"}]}};
+    const f = fixture();
+    assert.equal((await f.call({action:"DeleteItem",mutation:true,allow_mutation:true,body})).status,200);
+    for (const change of [{DeleteType:"HardDelete"},{SendMeetingCancellations:"SendToAll"},
+        {SuppressReadReceipts:false},{ItemIds:[{Id:"synthetic"}]}]) {
+        const f = fixture();
+        await assert.rejects(f.call({action:"DeleteItem",mutation:true,allow_mutation:true,body:{Body:{...body.Body,...change}}}));
+        assert.equal(f.requests.length,0);
+    }
 });

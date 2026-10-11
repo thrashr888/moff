@@ -222,7 +222,71 @@ impl OutlookWebSession {
 
 impl SafariSession {
     pub(super) fn product_read(&self, url: &str) -> Result<Value, OutlookWebError> {
-        let script = page_script(include_str!("safari_products.js"), &json!({"url":url}));
+        self.product_request(&json!({"url":url}), false)
+    }
+
+    pub(super) fn product_download(&self, url: &str) -> Result<Value, OutlookWebError> {
+        self.product_request(&json!({"url":url,"download":true}), false)
+    }
+
+    pub(super) fn product_write(
+        &self,
+        request: &crate::ProductWrite,
+    ) -> Result<Value, OutlookWebError> {
+        if !self.allow_mutation {
+            return Err(OutlookWebError::SafariReadOnly);
+        }
+        if let Some(path) = request
+            .url
+            .strip_prefix("https://graph.microsoft.com/v1.0/groups/")
+        {
+            let id = path
+                .split('/')
+                .next()
+                .ok_or(OutlookWebError::InvalidResponse)?;
+            let group =
+                self.product_read(&format!("https://graph.microsoft.com/v1.0/groups/{id}"))?;
+            if group["groupTypes"]
+                .as_array()
+                .is_none_or(|types| types.len() != 1 || types[0] != "Unified")
+                || group["isAssignableToRole"] == true
+            {
+                return Err(OutlookWebError::InvalidInput(
+                    "only Microsoft 365 groups can be managed",
+                ));
+            }
+            let me = self.product_read("https://graph.microsoft.com/v1.0/me")?;
+            let user_id = me["id"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or(OutlookWebError::InvalidResponse)?;
+            let owners = self.product_read(&format!(
+                "https://graph.microsoft.com/v1.0/groups/{id}/owners?$top=100"
+            ))?;
+            let owners = owners["value"]
+                .as_array()
+                .ok_or(OutlookWebError::InvalidResponse)?;
+            if !owners
+                .iter()
+                .any(|owner| owner["id"].as_str() == Some(user_id))
+            {
+                return Err(OutlookWebError::InvalidInput(
+                    "group mutations require verified ownership; the bounded owner page did not establish it",
+                ));
+            }
+        }
+        self.product_request(
+            &json!({"url":request.url,"method":request.method,"body":request.body,
+            "etag":request.etag,"bytes":request.bytes,"allow_mutation":true}),
+            true,
+        )
+    }
+
+    fn product_request(&self, config: &Value, mutation: bool) -> Result<Value, OutlookWebError> {
+        let unknown = || OutlookWebError::OutcomeUnknown {
+            action: "product write",
+        };
+        let script = page_script(include_str!("safari_products.js"), config);
         let result = self
             .runtime
             .block_on(safari::eval_document(
@@ -234,27 +298,67 @@ impl SafariSession {
                     timeout: 60,
                 },
             ))
-            .map_err(|_| OutlookWebError::SafariOperationFailed)?;
+            .map_err(|error| {
+                if error
+                    .downcast_ref::<PageOperationError>()
+                    .is_some_and(|e| matches!(e.phase, OperationPhase::BeforeDispatch))
+                {
+                    OutlookWebError::SafariBeforeDispatch
+                } else if mutation {
+                    unknown()
+                } else {
+                    OutlookWebError::SafariOperationFailed
+                }
+            })?;
         if result.truncated {
-            return Err(OutlookWebError::TruncatedSearch);
+            return Err(if mutation {
+                unknown()
+            } else {
+                OutlookWebError::TruncatedSearch
+            });
         }
         let status = result.value["status"]
             .as_u64()
             .and_then(|n| u16::try_from(n).ok())
-            .ok_or(OutlookWebError::InvalidResponse)?;
+            .ok_or_else(|| {
+                if mutation {
+                    unknown()
+                } else {
+                    OutlookWebError::InvalidResponse
+                }
+            })?;
         if status == 401 {
             return Err(OutlookWebError::ProductAuthenticationUnavailable);
         }
         if !(200..300).contains(&status) {
+            if mutation && status >= 500 {
+                return Err(unknown());
+            }
             return Err(OutlookWebError::ProductRequestRejected(status));
         }
-        let value = decode_response(
-            result.value["body"]
-                .as_str()
-                .ok_or(OutlookWebError::InvalidResponse)?,
-        )?;
+        if mutation && status == 204 {
+            return Ok(json!({"status":204,"acknowledged":true,"verified":false}));
+        }
+        let value = decode_response(result.value["body"].as_str().ok_or_else(|| {
+            if mutation {
+                unknown()
+            } else {
+                OutlookWebError::InvalidResponse
+            }
+        })?)
+        .map_err(|_| {
+            if mutation {
+                unknown()
+            } else {
+                OutlookWebError::InvalidResponse
+            }
+        })?;
         if !value.is_object() || value.get("error").is_some() {
-            return Err(OutlookWebError::InvalidResponse);
+            return Err(if mutation {
+                unknown()
+            } else {
+                OutlookWebError::InvalidResponse
+            });
         }
         Ok(value)
     }
@@ -267,7 +371,13 @@ impl SafariSession {
     ) -> Result<Value, OutlookWebError> {
         if mutation {
             if !self.allow_mutation
-                || !["CreateItem", "UpdateItem", "UpdateCalendarEvent"].contains(&action)
+                || ![
+                    "CreateItem",
+                    "UpdateItem",
+                    "UpdateCalendarEvent",
+                    "DeleteItem",
+                ]
+                .contains(&action)
             {
                 return Err(OutlookWebError::SafariReadOnly);
             }

@@ -26,7 +26,8 @@ fn draft_writes_use_observed_exchange_envelopes_and_never_send() {
     );
     assert_eq!(update["Body"]["MessageDisposition"], "SaveOnly");
     let delete = delete_message_request("synthetic-id", "synthetic-key").unwrap();
-    assert_eq!(delete["Body"]["DeleteType"], "HardDelete");
+    assert_eq!(delete["Body"]["DeleteType"], "MoveToDeletedItems");
+    assert_eq!(delete["Body"]["SendMeetingCancellations"], "SendToNone");
     assert_eq!(delete["Body"]["SuppressReadReceipts"], true);
 }
 
@@ -74,12 +75,10 @@ fn calendar_writes_use_distinct_observed_actions_and_single_event_scope() {
     assert_eq!(update["__type"], "UpdateCalendarEventJsonRequest:#Exchange");
     assert_eq!(update["Body"]["EventScope"], 0);
     assert_eq!(update["Body"]["ShouldSendUpdateToAttendees"], false);
-    let delete = delete_event_request("synthetic-id").unwrap();
-    assert_eq!(
-        delete["Body"]["__type"],
-        "DeleteCalendarEventRequest:#Exchange"
-    );
-    assert_eq!(delete["Body"]["EventScope"], 0);
+    let delete = delete_event_request("synthetic-id", "synthetic-key").unwrap();
+    assert_eq!(delete["Body"]["__type"], "DeleteItemRequest:#Exchange");
+    assert_eq!(delete["Body"]["DeleteType"], "MoveToDeletedItems");
+    assert_eq!(delete["Body"]["ItemIds"][0]["ChangeKey"], "synthetic-key");
 }
 
 #[test]

@@ -1,14 +1,15 @@
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
 
 use clap::{Args, Parser, Subcommand};
 use moff_outlook_owa::{
-    DraftInput, EventInput, OutlookWebError, OutlookWebSession, ReplyInput, WorkInput, WorkPlan,
-    calendar_folders_request, calendar_view_request, validate_read_action,
+    DraftInput, EventInput, OutlookWebError, OutlookWebSession, ProductWrite, ReplyInput,
+    WorkInput, WorkPlan, calendar_folders_request, calendar_view_request, product_segment,
+    validate_contact_input, validate_read_action,
 };
 use serde_json::{Value, json};
 
@@ -183,7 +184,7 @@ enum MailCommand {
         #[arg(long, required = true)]
         confirm: bool,
     },
-    /// Unavailable through Safari; retained to return an explicit unsupported error.
+    /// Move one message to Deleted Items without sending a receipt.
     Delete {
         #[arg(long)]
         id: String,
@@ -268,7 +269,7 @@ enum CalendarCommand {
         #[arg(long, required = true)]
         confirm: bool,
     },
-    /// Unavailable through Safari; retained to return an explicit unsupported error.
+    /// Recycle one personal appointment without sending cancellations.
     Delete {
         #[arg(long)]
         id: String,
@@ -295,7 +296,18 @@ enum WorkBlockCommand {
 
 #[derive(Debug, Subcommand)]
 enum PeopleCommand {
+    /// Manage writable personal contacts; directory recommendations remain separate.
+    Contacts {
+        #[command(subcommand)]
+        command: ContactCommand,
+    },
+    List {
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
     Search {
+        #[arg(long)]
+        query: Option<String>,
         #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
     },
@@ -307,6 +319,20 @@ enum PeopleCommand {
 
 #[derive(Debug, Subcommand)]
 enum OrgCommand {
+    List {
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    Get {
+        #[arg(long)]
+        user: String,
+    },
+    Search {
+        #[arg(long)]
+        query: String,
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
     Manager {
         #[arg(long)]
         user: Option<String>,
@@ -319,9 +345,85 @@ enum OrgCommand {
 
 #[derive(Debug, Subcommand)]
 enum OneDriveCommand {
+    #[command(flatten)]
+    Manage(ManagementCommand),
     List {
         #[arg(long)]
         item_id: Option<String>,
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    Get {
+        #[arg(long)]
+        id: String,
+        /// Download a small file to a new local path; never overwrite an existing file.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GroupsCommand {
+    AddMember {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        user: String,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    RemoveMember {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        user: String,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    #[command(flatten)]
+    Manage(ManagementCommand),
+    Get {
+        #[arg(long)]
+        id: String,
+    },
+    Members {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    List {
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum LoopCommand {
+    /// Search drive-backed Loop file metadata, not full workspaces.
+    Search {
+        #[arg(long)]
+        query: String,
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    /// Rename a drive-backed Loop file; content editing requires a Loop-specific adapter.
+    Update {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        body_file: PathBuf,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Recycle a drive-backed Loop file.
+    Delete {
+        #[arg(long)]
+        id: String,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    List {
         #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
     },
@@ -332,15 +434,51 @@ enum OneDriveCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum GroupsCommand {
-    List {
+enum ManagementCommand {
+    /// Create a personal contact, drive folder or Microsoft 365 group.
+    Create {
+        #[arg(long, required_unless_present = "file", conflicts_with = "file")]
+        body_file: Option<PathBuf>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long, requires = "file")]
+        name: Option<String>,
+        #[arg(long)]
+        parent_id: Option<String>,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Update only the supplied writable fields.
+    Update {
+        #[arg(long)]
+        id: String,
+        #[arg(long, required_unless_present = "file", conflicts_with = "file")]
+        body_file: Option<PathBuf>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Delete the selected object; drive items go to the recycle bin.
+    Delete {
+        #[arg(long)]
+        id: String,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Literal metadata search, following at most 100 pages; reports incomplete results.
+    Search {
+        #[arg(long)]
+        query: String,
         #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
     },
 }
 
 #[derive(Debug, Subcommand)]
-enum LoopCommand {
+enum ContactCommand {
+    #[command(flatten)]
+    Manage(ManagementCommand),
     List {
         #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
@@ -368,6 +506,43 @@ fn print_json(value: &Value) {
     );
 }
 
+fn schema() -> Value {
+    json!({
+        "schema":moff_core::SCHEMA_VERSION,"provider":"browser-session","default_transport":"safari",
+        "transports":{"safari":{"experimental":true,"mutations":true,"delete":true,
+            "mutation_gate":"--allow-mutation and --confirm",
+            "products":["mail","calendar","people","org","onedrive","groups","loop"],
+            "requires":"loaded authenticated Outlook tab; Graph operations require corresponding delegated permissions",
+            "credential_export":false,
+            "auth_recovery":{"refresh":true,"status":true,"interactive_sign_in":false,"confirmation":"--confirm","wait_seconds_max":120}}},
+        "commands":{
+            "auth":{"refresh":true,"status":true},
+            "mail":{"list":true,"search":true,"get":true,"get-batch":true,"categories":true,"reply-draft":true,"reply_all_draft":true,"mark":true,"create":true,"update":true,"delete":true,"send":false},
+            "calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"get-batch":true,"availability":true,"work-blocks":{"plan":true,"apply":true},"create":true,"update":true,"delete":true},
+            "people":{"list":true,"search":true,"get":true,"contacts":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true}},
+            "org":{"list":true,"get":true,"search":true,"manager":true,"reports":true,"create":false,"update":false,"delete":false},
+            "onedrive":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true,"upload":true,"download":true},
+            "groups":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true,"members":true,"add-member":true,"remove-member":true},
+            "loop":{"create":false,"get":true,"update":true,"delete":true,"list":true,"search":true,"content_editing":false},
+            "service":{"read":true}},
+        "unimplemented_products":[],
+        "full_product_management":false,
+        "product_reads":{"methods":["GET"],"max_page_size":100,"follow_next_links":"metadata search only, maximum 100 pages",
+            "loop_scope":"drive-backed .loop file metadata, rename and recycle","interactive_consent":false},
+        "product_writes":{"methods":["POST","PATCH","DELETE"],"requires":"--allow-mutation and --confirm plus browser delegated permissions",
+            "contacts_scope":"personal default contacts folder through OWA; supplied fields are read-back verified",
+            "onedrive_scope":"folder/file creation, bounded binary transfers, rename/description/move and recycle of existing items",
+            "max_file_bytes":128_000,
+            "groups_scope":"Microsoft 365 groups; update/delete require verified ownership",
+            "verification":"API acknowledgement; Graph writes are not read-back verified",
+            "max_json_bytes":200_000},
+        "remaining_management_gaps":["Loop workspace/page/content creation and editing","large file transfers","meeting/recurrence management"],
+        "mutations":true,"mutation_confirmation":"--confirm","delete_policy":"mail/calendar move to Deleted Items; OneDrive recycle; contacts/groups API deletion",
+        "calendar_mutation_scope":"single appointments without attendees","scheduling_policy":"empty gaps first; explicit exact-title overlap fallback","batch_limit":20,
+        "search_semantics":"mail/calendar literal subject/body; contacts/groups literal metadata; OneDrive drive search then metadata filtering"
+    })
+}
+
 fn error(message: impl std::fmt::Display) -> ExitCode {
     eprintln!("[browser_session] {message}");
     ExitCode::from(2)
@@ -382,7 +557,9 @@ fn session(args: SessionArgs) -> Result<OutlookWebSession, String> {
 }
 
 fn encode_segment(segment: &str) -> String {
-    url::form_urlencoded::byte_serialize(segment.as_bytes()).collect()
+    url::form_urlencoded::byte_serialize(segment.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20")
 }
 
 fn user_path(user: Option<&str>, relationship: &str) -> String {
@@ -439,6 +616,478 @@ fn graph_result(
     Ok((command, value))
 }
 
+fn metadata_search(value: &mut Value, query: &str) -> Result<(), String> {
+    if query.trim().is_empty() {
+        return Err("search query must not be empty".to_owned());
+    }
+    let query = query.to_lowercase();
+    let has_more = value.get("@odata.nextLink").is_some();
+    let items = value["value"]
+        .as_array_mut()
+        .ok_or("product list returned invalid data")?;
+    let scanned = items.len();
+    items.retain(|item| item.to_string().to_lowercase().contains(&query));
+    let count = items.len();
+    value["search"] = json!({"count":count,"scanned":scanned,"complete":!has_more,
+        "scope":"one metadata page","has_more":has_more});
+    Ok(())
+}
+
+fn search_pages(
+    session: &OutlookWebSession,
+    path: &str,
+    query: &str,
+    limit: u16,
+    loop_files: bool,
+) -> Result<Value, String> {
+    search_pages_with(path, query, limit, loop_files, |path| {
+        session.product_read(path).map_err(|e| e.to_string())
+    })
+}
+
+fn search_pages_with(
+    path: &str,
+    query: &str,
+    limit: u16,
+    loop_files: bool,
+    mut read: impl FnMut(&str) -> Result<Value, String>,
+) -> Result<Value, String> {
+    if query.trim().is_empty() || !(1..=100).contains(&limit) {
+        return Err("search requires a nonempty query and a limit from 1 to 100".to_owned());
+    }
+    let original = url::Url::parse(&format!("https://graph.microsoft.com{path}"))
+        .map_err(|e| e.to_string())?;
+    let mut path = path.to_owned();
+    let mut results = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut scanned = 0;
+    for _ in 0..100 {
+        if !visited.insert(path.clone()) {
+            return Err("product returned a repeated continuation link".to_owned());
+        }
+        let mut page = read(&path)?;
+        let items = page["value"]
+            .as_array()
+            .ok_or("product search returned invalid data")?;
+        if items.iter().any(|item| {
+            item["id"].as_str().is_none_or(str::is_empty)
+                || (loop_files && !item["name"].is_string())
+        }) {
+            return Err("product search returned incomplete item metadata".to_owned());
+        }
+        scanned += items.len();
+        if loop_files {
+            page["value"]
+                .as_array_mut()
+                .ok_or("Loop search returned invalid data")?
+                .retain(|item| {
+                    item["name"]
+                        .as_str()
+                        .is_some_and(|s| s.to_ascii_lowercase().ends_with(".loop"))
+                });
+        }
+        if !original.path().contains("/search(q=") || loop_files {
+            metadata_search(&mut page, query)?;
+        }
+        results.extend(
+            page["value"]
+                .as_array()
+                .ok_or("product search returned invalid data")?
+                .iter()
+                .cloned(),
+        );
+        let next = page
+            .get("@odata.nextLink")
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or("invalid product continuation")
+            })
+            .transpose()?;
+        if results.len() >= usize::from(limit) || next.is_none() {
+            let has_more = results.len() > usize::from(limit) || next.is_some();
+            results.truncate(usize::from(limit));
+            return Ok(
+                json!({"value":results,"search":{"count":results.len(),"scanned":scanned,
+                "complete":!has_more,"has_more":has_more,"scope":"metadata across bounded pages"}}),
+            );
+        }
+        let next = url::Url::parse(next.ok_or("missing continuation")?)
+            .map_err(|_| "invalid product continuation")?;
+        if next.origin() != original.origin()
+            || next.path() != original.path()
+            || next.username() != ""
+            || next.password().is_some()
+            || next.fragment().is_some()
+        {
+            return Err("unsafe product continuation; no request followed".to_owned());
+        }
+        path = format!(
+            "{}{}",
+            next.path(),
+            next.query().map_or(String::new(), |q| format!("?{q}"))
+        );
+    }
+    Err("product search exceeded 100 pages; narrow the query instead of treating incomplete data as empty".to_owned())
+}
+
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+fn management_result(
+    args: SessionArgs,
+    product: &str,
+    command: ManagementCommand,
+) -> Result<(&'static str, Value), String> {
+    let fail = |e: OutlookWebError| e.to_string();
+    if let ManagementCommand::Search { query, limit } = command {
+        if query.trim().is_empty() {
+            return Err("search query must not be empty".to_owned());
+        }
+        if product == "contacts" {
+            return Ok((
+                "search",
+                with_owa(args, |session| session.contacts_search(&query, limit))?,
+            ));
+        }
+        let path = match product {
+            "people" => format!("/v1.0/me/people?$top={limit}"),
+            "org" => format!("/v1.0/users?$top={limit}"),
+            "onedrive" => format!(
+                "/v1.0/me/drive/root/search(q='{}')?$top={limit}",
+                encode_segment(&query.replace('\'', "''"))
+            ),
+            "groups" => format!(
+                "/v1.0/groups?$filter=groupTypes%2Fany%28c%3Ac%20eq%20%27Unified%27%29&$top={limit}"
+            ),
+            "loop" => format!("/v1.0/me/drive/root/search(q='.loop')?$top={limit}"),
+            _ => return Err("unsupported product".to_owned()),
+        };
+        let value = search_pages(&session(args)?, &path, &query, limit, product == "loop")?;
+        return Ok(("search", value));
+    }
+    safari_write_guard(&args, true)?;
+    match &command {
+        ManagementCommand::Create {
+            file: Some(file),
+            name,
+            parent_id,
+            confirm,
+            ..
+        } => {
+            if product != "onedrive" {
+                return Err("--file is only supported for OneDrive".to_owned());
+            }
+            if !confirm {
+                return Err("mutations require --confirm".to_owned());
+            }
+            return Ok((
+                "create",
+                file_mutation(args, None, parent_id.as_deref(), name.as_deref(), file)?,
+            ));
+        }
+        ManagementCommand::Update {
+            id,
+            file: Some(file),
+            confirm,
+            ..
+        } => {
+            if product != "onedrive" {
+                return Err("--file is only supported for OneDrive".to_owned());
+            }
+            if !confirm {
+                return Err("mutations require --confirm".to_owned());
+            }
+            return Ok(("update", file_mutation(args, Some(id), None, None, file)?));
+        }
+        _ => (),
+    }
+    let (action, id, body, parent) = match command {
+        ManagementCommand::Create {
+            body_file,
+            parent_id,
+            confirm,
+            ..
+        } => (
+            "create",
+            None,
+            Some(confirmed_json(
+                body_file.as_deref().ok_or("--body-file required")?,
+                confirm,
+            )?),
+            parent_id,
+        ),
+        ManagementCommand::Update {
+            id,
+            body_file,
+            confirm,
+            ..
+        } => (
+            "update",
+            Some(id),
+            Some(confirmed_json(
+                body_file.as_deref().ok_or("--body-file required")?,
+                confirm,
+            )?),
+            None,
+        ),
+        ManagementCommand::Delete { id, confirm } => {
+            if !confirm {
+                return Err("mutations require --confirm".to_owned());
+            }
+            ("delete", Some(id), None, None)
+        }
+        ManagementCommand::Search { .. } => unreachable!(),
+    };
+    let method = match action {
+        "create" => "POST",
+        "update" => "PATCH",
+        _ => "DELETE",
+    };
+    if product == "contacts" {
+        if parent.is_some() {
+            return Err("--parent-id is only valid for OneDrive folders".to_owned());
+        }
+        if let Some(body) = body.as_ref() {
+            validate_contact_input(body).map_err(fail)?;
+        }
+        let value = with_owa(args, |session| match action {
+            "create" => session.contact_create(
+                body.as_ref()
+                    .ok_or(OutlookWebError::InvalidInput("contact body required"))?,
+            ),
+            "update" => session.contact_update(
+                id.as_deref()
+                    .ok_or(OutlookWebError::InvalidInput("contact ID required"))?,
+                body.as_ref()
+                    .ok_or(OutlookWebError::InvalidInput("contact body required"))?,
+            ),
+            _ => session.contact_delete(
+                id.as_deref()
+                    .ok_or(OutlookWebError::InvalidInput("contact ID required"))?,
+            ),
+        })?;
+        return Ok((action, value));
+    }
+    let request = match product {
+        "groups" => {
+            if parent.is_some() {
+                return Err("--parent-id is only valid for OneDrive folders".to_owned());
+            }
+            ProductWrite::group(id.as_deref(), method, body.clone()).map_err(fail)?
+        }
+        "onedrive" if action == "create" => {
+            let value = body.as_ref().ok_or("folder input required")?;
+            let object = value.as_object().ok_or("folder input must be an object")?;
+            if object.len() != 1 || !object.contains_key("name") {
+                return Err("folder creation accepts only a name string".to_owned());
+            }
+            ProductWrite::drive_folder(
+                parent.as_deref(),
+                value["name"]
+                    .as_str()
+                    .ok_or("folder name must be a string")?,
+            )
+            .map_err(fail)?
+        }
+        "onedrive" | "loop" => ProductWrite::drive_item(
+            id.as_deref().ok_or("item ID required")?,
+            method,
+            body.clone(),
+            "preflight",
+        )
+        .map_err(fail)?,
+        _ => return Err("unsupported product mutation".to_owned()),
+    };
+    let session = session(args)?;
+    let request = if let Some(id) = id.as_deref() {
+        match product {
+            "onedrive" | "loop" => {
+                let before = session
+                    .product_read(&format!(
+                        "/v1.0/me/drive/items/{}",
+                        product_segment(id).map_err(fail)?
+                    ))
+                    .map_err(fail)?;
+                if product == "loop"
+                    && (!before["name"]
+                        .as_str()
+                        .is_some_and(|s| s.to_ascii_lowercase().ends_with(".loop"))
+                        || body.as_ref().and_then(|v| v.get("name")).is_some_and(|v| {
+                            !v.as_str()
+                                .is_some_and(|s| s.to_ascii_lowercase().ends_with(".loop"))
+                        }))
+                {
+                    return Err(
+                        "Loop mutations require a .loop file and must preserve its extension"
+                            .to_owned(),
+                    );
+                }
+                let etag = before["eTag"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or("drive item returned no entity tag; no write attempted")?;
+                ProductWrite::drive_item(id, method, body, etag).map_err(fail)?
+            }
+            _ => request,
+        }
+    } else {
+        request
+    };
+    let result = session.product_write(&request).map_err(fail)?;
+    if method == "POST" && result["id"].as_str().is_none_or(str::is_empty) {
+        return Err(
+            "creation was acknowledged but returned no ID; inspect the product before retrying"
+                .to_owned(),
+        );
+    }
+    Ok((action, result))
+}
+
+fn file_mutation(
+    args: SessionArgs,
+    id: Option<&str>,
+    parent: Option<&str>,
+    name: Option<&str>,
+    file: &Path,
+) -> Result<Value, String> {
+    let mut bytes = Vec::new();
+    fs::File::open(file)
+        .map_err(|e| format!("cannot open upload file: {e}"))?
+        .take(128_001)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read upload file: {e}"))?;
+    if bytes.len() > 128_000 {
+        return Err("browser file transfers are limited to 128000 bytes".to_owned());
+    }
+    let name = if id.is_none() {
+        Some(
+            name.or_else(|| file.file_name()?.to_str())
+                .ok_or("provide a UTF-8 --name")?,
+        )
+    } else {
+        None
+    };
+    let request =
+        ProductWrite::drive_upload(parent, id, name, bytes.clone(), id.map(|_| "preflight"))
+            .map_err(|e| e.to_string())?;
+    let session = session(args)?;
+    let request = if let Some(id) = id {
+        let before = session
+            .product_read(&format!(
+                "/v1.0/me/drive/items/{}",
+                product_segment(id).map_err(|e| e.to_string())?
+            ))
+            .map_err(|e| e.to_string())?;
+        if !before["file"].is_object() {
+            return Err("content replacement requires an existing file, not a folder".to_owned());
+        }
+        let etag = before["eTag"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("file returned no entity tag")?;
+        ProductWrite::drive_upload(None, Some(id), None, bytes, Some(etag))
+            .map_err(|e| e.to_string())?
+    } else {
+        request
+    };
+    let value = session.product_write(&request).map_err(|e| e.to_string())?;
+    if value["id"].as_str().is_none_or(str::is_empty) {
+        return Err(
+            "upload was acknowledged without a file ID; inspect OneDrive before retrying"
+                .to_owned(),
+        );
+    }
+    Ok(value)
+}
+
+fn download_file(args: SessionArgs, id: &str, path: &Path) -> ExitCode {
+    let result = (|| -> Result<Value, String> {
+        product_segment(id).map_err(|e| e.to_string())?;
+        let bytes = session(args)?
+            .drive_download(id)
+            .map_err(|e| e.to_string())?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| {
+                format!(
+                    "cannot create download destination (existing files are not overwritten): {e}"
+                )
+            })?;
+        file.write_all(&bytes).map_err(|e| {
+            format!(
+                "download write failed; a partial file may remain at {}: {e}",
+                path.display()
+            )
+        })?;
+        Ok(json!({"path":path.display().to_string(),"bytes":bytes.len()}))
+    })();
+    match result {
+        Ok(value) => {
+            output("outlook.onedrive.get", &value);
+            ExitCode::SUCCESS
+        }
+        Err(e) => error(e),
+    }
+}
+
+fn run_management(args: SessionArgs, product: &str, command: ManagementCommand) -> ExitCode {
+    match management_result(args, product, command) {
+        Ok((action, value)) => {
+            let product = if product == "contacts" {
+                "people.contacts"
+            } else {
+                product
+            };
+            output(&format!("outlook.{product}.{action}"), &value);
+            ExitCode::SUCCESS
+        }
+        Err(e) => error(e),
+    }
+}
+
+fn run_product_read(args: SessionArgs, command: &str, path: impl AsRef<str>) -> ExitCode {
+    match with_owa(args, |session| session.product_read(path.as_ref())) {
+        Ok(value) => {
+            output(command, &value);
+            ExitCode::SUCCESS
+        }
+        Err(e) => error(e),
+    }
+}
+
+fn group_member_result(
+    args: SessionArgs,
+    id: &str,
+    user: &str,
+    add: bool,
+    confirm: bool,
+) -> ExitCode {
+    let result = (|| -> Result<Value, String> {
+        safari_write_guard(&args, true)?;
+        if !confirm {
+            return Err("mutations require --confirm".to_owned());
+        }
+        let request = ProductWrite::group_member(id, user, add).map_err(|e| e.to_string())?;
+        with_owa(args, |session| session.product_write(&request))
+    })();
+    match result {
+        Ok(value) => {
+            output(
+                if add {
+                    "outlook.groups.add-member"
+                } else {
+                    "outlook.groups.remove-member"
+                },
+                &value,
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => error(e),
+    }
+}
+
 fn confirmed_json(path: &Path, confirm: bool) -> Result<Value, String> {
     if !confirm {
         return Err("mutations require --confirm".to_owned());
@@ -458,8 +1107,8 @@ fn read_json(path: &Path) -> Result<Value, String> {
     serde_json::from_str(&body).map_err(|_| "--body-file must contain JSON".to_owned())
 }
 
-fn safari_write_guard(args: &SessionArgs, mutation: bool, delete: bool) -> Result<(), String> {
-    if mutation && (!args.allow_mutation || delete) {
+fn safari_write_guard(args: &SessionArgs, mutation: bool) -> Result<(), String> {
+    if mutation && !args.allow_mutation {
         return Err(OutlookWebError::SafariReadOnly.to_string());
     }
     Ok(())
@@ -485,7 +1134,6 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
                 | MailCommand::ReplyDraft { .. }
                 | MailCommand::Mark { .. }
         ),
-        matches!(command, MailCommand::Delete { .. }),
     )?;
     match command {
         MailCommand::Mark {
@@ -603,7 +1251,6 @@ fn calendar_result(
                     command: WorkBlockCommand::Apply { .. }
                 }
         ),
-        matches!(command, CalendarCommand::Delete { .. }),
     )?;
     match command {
         CalendarCommand::GetBatch { id } => Ok((
@@ -732,11 +1379,24 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Schema) => {
-            print_json(
-                &json!({"schema":moff_core::SCHEMA_VERSION,"provider":"browser-session","default_transport":"safari","transports":{"safari":{"experimental":true,"mutations":true,"mutation_gate":"--allow-mutation and --confirm","delete":false,"products":["mail","calendar","people","org","onedrive","groups","loop"],"requires":"loaded authenticated Outlook tab; product reads require silent Graph access","credential_export":false,"auth_recovery":{"refresh":true,"status":true,"interactive_sign_in":false,"confirmation":"--confirm","wait_seconds_max":120}}},"commands":{"auth":{"refresh":true,"status":true},"mail":{"list":true,"search":true,"get":true,"get-batch":true,"categories":true,"reply-draft":true,"reply_all_draft":true,"mark":true,"create":true,"update":true,"delete":false,"send":false},"calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"get-batch":true,"availability":true,"work-blocks":{"plan":true,"apply":true},"create":true,"update":true,"delete":false},"people":{"search":true,"get":true},"org":{"manager":true,"reports":true},"onedrive":{"list":true,"get":true},"groups":{"list":true},"loop":{"list":true,"get":true},"service":{"read":true}},"unimplemented_products":[],"product_reads":{"methods":["GET"],"max_page_size":100,"follow_next_links":false,"loop_scope":"drive-backed .loop file metadata","interactive_consent":false},"mutations":true,"mutation_confirmation":"--confirm","calendar_mutation_scope":"single appointments without attendees","scheduling_policy":"empty gaps first; explicit exact-title overlap fallback","batch_limit":20,"search_semantics":"case-insensitive literal subject/body search within the chosen folder or calendar range"}),
-            );
+            print_json(&schema());
             ExitCode::SUCCESS
         }
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::Groups {
+                    command: GroupsCommand::AddMember { id, user, confirm },
+                },
+        }) => group_member_result(args, &id, &user, true, confirm),
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::Groups {
+                    command: GroupsCommand::RemoveMember { id, user, confirm },
+                },
+        }) => group_member_result(args, &id, &user, false, confirm),
+
         Some(
             Command::Auth {
                 session: args,
@@ -854,7 +1514,144 @@ fn main() -> ExitCode {
             session: args,
             command:
                 OutlookCommand::People {
-                    command: PeopleCommand::Search { limit },
+                    command:
+                        PeopleCommand::Contacts {
+                            command: ContactCommand::Manage(command),
+                        },
+                },
+        }) => run_management(args, "contacts", command),
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::Onedrive {
+                    command: OneDriveCommand::Manage(command),
+                },
+        }) => run_management(args, "onedrive", command),
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::Groups {
+                    command: GroupsCommand::Manage(command),
+                },
+        }) => run_management(args, "groups", command),
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::Loop {
+                    command: LoopCommand::Search { query, limit },
+                },
+        }) => run_management(args, "loop", ManagementCommand::Search { query, limit }),
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::Loop {
+                    command:
+                        LoopCommand::Update {
+                            id,
+                            body_file,
+                            confirm,
+                        },
+                },
+        }) => run_management(
+            args,
+            "loop",
+            ManagementCommand::Update {
+                id,
+                body_file: Some(body_file),
+                file: None,
+                confirm,
+            },
+        ),
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::Loop {
+                    command: LoopCommand::Delete { id, confirm },
+                },
+        }) => run_management(args, "loop", ManagementCommand::Delete { id, confirm }),
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::People {
+                    command:
+                        PeopleCommand::Contacts {
+                            command: ContactCommand::List { limit },
+                        },
+                },
+        }) => match with_owa(args, |session| session.contacts_list(limit, 0)) {
+            Ok(value) => {
+                output("outlook.people.contacts.list", &value);
+                ExitCode::SUCCESS
+            }
+            Err(e) => error(e),
+        },
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::People {
+                    command:
+                        PeopleCommand::Contacts {
+                            command: ContactCommand::Get { id },
+                        },
+                },
+        }) => match with_owa(args, |session| session.contact_get(&id)) {
+            Ok(value) => {
+                output("outlook.people.contacts.get", &value);
+                ExitCode::SUCCESS
+            }
+            Err(e) => error(e),
+        },
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::Groups {
+                    command: GroupsCommand::Get { id },
+                },
+        }) => match product_segment(&id) {
+            Ok(id) => run_product_read(args, "outlook.groups.get", format!("/v1.0/groups/{id}")),
+            Err(e) => error(e.to_string()),
+        },
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::Groups {
+                    command: GroupsCommand::Members { id, limit },
+                },
+        }) => match product_segment(&id) {
+            Ok(id) => run_product_read(
+                args,
+                "outlook.groups.members",
+                format!("/v1.0/groups/{id}/members?$top={limit}"),
+            ),
+            Err(e) => error(e.to_string()),
+        },
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::People {
+                    command: PeopleCommand::List { limit },
+                },
+        }) => run_product_read(
+            args,
+            "outlook.people.list",
+            format!("/v1.0/me/people?$top={limit}"),
+        ),
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::People {
+                    command:
+                        PeopleCommand::Search {
+                            limit,
+                            query: Some(query),
+                        },
+                },
+        }) => run_management(args, "people", ManagementCommand::Search { query, limit }),
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::People {
+                    command: PeopleCommand::Search { limit, query: None },
                 },
         }) => match graph_result(
             args,
@@ -889,6 +1686,40 @@ fn main() -> ExitCode {
             }
             Err(e) => error(e),
         },
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::Org {
+                    command: OrgCommand::List { limit },
+                },
+        }) => run_product_read(
+            args,
+            "outlook.org.list",
+            format!("/v1.0/users?$top={limit}"),
+        ),
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::Org {
+                    command: OrgCommand::Get { user },
+                },
+        }) => match product_segment(&user) {
+            Ok(user) => run_product_read(
+                args,
+                "outlook.org.get",
+                format!(
+                    "/v1.0/users/{user}?$select=id,displayName,mail,userPrincipalName,userType"
+                ),
+            ),
+            Err(e) => error(e.to_string()),
+        },
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::Org {
+                    command: OrgCommand::Search { query, limit },
+                },
+        }) => run_management(args, "org", ManagementCommand::Search { query, limit }),
         Some(Command::Outlook {
             session: args,
             command:
@@ -953,7 +1784,18 @@ fn main() -> ExitCode {
             session: args,
             command:
                 OutlookCommand::Onedrive {
-                    command: OneDriveCommand::Get { id },
+                    command:
+                        OneDriveCommand::Get {
+                            id,
+                            output: Some(path),
+                        },
+                },
+        }) => download_file(args, &id, &path),
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::Onedrive {
+                    command: OneDriveCommand::Get { id, output: None },
                 },
         }) => match graph_result(
             args,
@@ -1027,5 +1869,66 @@ fn main() -> ExitCode {
             print_json(&json!({"command":"moff","provider":"browser-session","status":"ready"}));
             ExitCode::SUCCESS
         }
+    }
+}
+
+#[cfg(test)]
+mod management_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_search_follows_sparse_pages_and_reports_truncation() {
+        let mut paths = Vec::new();
+        let result = search_pages_with("/v1.0/me/contacts?$top=1", "project", 1, false, |path| {
+            paths.push(path.to_owned());
+            Ok(if paths.len() == 1 {
+                json!({"value":[],"@odata.nextLink":"https://graph.microsoft.com/v1.0/me/contacts?$top=1&$skip=1"})
+            } else {
+                json!({"value":[{"id":"a","displayName":"Project Alpha"},{"id":"b","displayName":"Project Beta"}]})
+            })
+        }).unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(result["value"].as_array().unwrap().len(), 1);
+        assert_eq!(result["search"]["has_more"], true);
+        assert_eq!(result["search"]["complete"], false);
+        assert_eq!(result["search"]["scanned"], 2);
+    }
+
+    #[test]
+    fn metadata_search_rejects_unsafe_continuations_and_invalid_shapes() {
+        for next in [
+            "https://evil.example/v1.0/me/contacts?$skip=1",
+            "https://graph.microsoft.com/v1.0/groups?$skip=1",
+            "https://graph.microsoft.com/v1.0/me/contacts#fragment",
+        ] {
+            let mut calls = 0;
+            let result = search_pages_with("/v1.0/me/contacts?$top=1", "project", 1, false, |_| {
+                calls += 1;
+                Ok(json!({"value":[],"@odata.nextLink":next}))
+            });
+            assert!(result.is_err());
+            assert_eq!(calls, 1);
+        }
+        for value in [
+            json!({}),
+            json!({"value":[{}]}),
+            json!({"value":[],"@odata.nextLink":42}),
+        ] {
+            assert!(
+                search_pages_with("/v1.0/me/contacts?$top=1", "x", 1, false, |_| Ok(
+                    value.clone()
+                ))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn loop_search_is_explicitly_limited_to_loop_files() {
+        let result = search_pages_with("/v1.0/me/drive/root/search(q='.loop')?$top=5","project",5,true, |_| {
+            Ok(json!({"value":[{"id":"a","name":"Project.LOOP"},{"id":"b","name":"Project.txt"}]}))
+        }).unwrap();
+        assert_eq!(result["value"], json!([{"id":"a","name":"Project.LOOP"}]));
+        assert_eq!(result["search"]["complete"], true);
     }
 }

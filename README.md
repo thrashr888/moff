@@ -1,6 +1,13 @@
 # Moff
 
-Moff is a personal **Outlook Web mail and calendar CLI**. It uses only Safari through the Cider library, with credentials remaining inside the authenticated browser tab. Moff does not register an Entra application, run its own OAuth flow, use Azure CLI, access Keychain, automate desktop Outlook, use OCR, or persist a separate token cache. Exported-cURL transports and `--session-curl` have been removed; existing credential files are never read or deleted.
+Moff's goal is a personal **Microsoft 365 management CLI**: create, read, update,
+delete, list and search the content you own or can manage. Full product management
+is not finished; `moff schema` exposes supported operations and remaining gaps.
+It uses only Safari through the Cider library, with credentials remaining inside
+the authenticated browser tab. Moff does not register an Entra application, run
+its own OAuth flow, use Azure CLI, access Keychain, automate desktop Outlook, use
+OCR, or persist a separate token cache. Exported-cURL transports and `--session-curl`
+have been removed; existing credential files are never read or deleted.
 
 ## Implemented commands
 
@@ -42,7 +49,7 @@ moff outlook --allow-mutation calendar create --folder-id '<calendar-folder-id>'
 moff outlook --allow-mutation calendar update --id '<event-id>' --body-file event-update.json --confirm
 ```
 
-Mail and Calendar use only allowlisted, in-tab `POST /owa/service.svc?action=<Action>&app=Mail` requests. `outlook service read` remains read-only and cannot invoke mutation actions. People, Org, OneDrive, Groups, and Loop read metadata through allowlisted Graph GET requests executed inside the same Safari session.
+Mail, Calendar, and personal Contacts use only allowlisted, in-tab `POST /owa/service.svc?action=<Action>&app=Mail` requests. `outlook service read` remains read-only and cannot invoke mutation actions. People recommendations, Org, OneDrive, Groups, and Loop read metadata through allowlisted Graph GET requests executed inside the same Safari session.
 
 ## Product metadata reads
 
@@ -68,14 +75,119 @@ are explicit and do not trigger interactive consent or retries.
 Lists return one bounded Graph page, not a complete directory or drive inventory.
 `--limit` is a page-size request (1-100); filtering/permissions can yield fewer
 items, including an empty page with `@odata.nextLink`. Next links remain visible
-in the response but are not followed automatically. Org relationships use the
-API's default page size. People `search` lists relevant people, not a free-text
-directory search. OneDrive reads metadata only, not file contents.
+in the response but are not followed automatically by list commands. Product
+metadata searches follow same-origin, same-path continuation links for at most
+100 pages, stop at the requested result limit, and explicitly report incomplete
+results. Repeated/unsafe links and exhausted page budgets fail. Org relationships use the
+API's default page size. People `list` (and the legacy `search` without `--query`) lists relevant people;
+`people search --query 'Example'` searches recommendation metadata, while
+`org list|get|search` reads directory users. OneDrive reads metadata only, not file contents.
 
 Loop searches drive-backed `.loop` files, filters out other file types and exposes
 their metadata. `loop get` rejects a non-`.loop` item. This does not cover every
-Loop workspace/storage location, document contents or editing. Product writes,
-Teams and SharePoint are not implemented.
+Loop workspace/storage location, document contents or editing. Teams and
+SharePoint are not implemented.
+
+## Personal product management
+
+```sh
+moff outlook people contacts list --limit 25
+moff outlook people contacts get --id '<contact-id>'
+moff outlook people contacts search --query 'Example'
+moff outlook --allow-mutation people contacts create --body-file contact.json --confirm
+moff outlook --allow-mutation people contacts update --id '<contact-id>' --body-file contact-update.json --confirm
+moff outlook --allow-mutation people contacts delete --id '<contact-id>' --confirm
+
+moff outlook --allow-mutation onedrive create --body-file folder.json --confirm
+moff outlook --allow-mutation onedrive create --parent-id '<folder-id>' --body-file folder.json --confirm
+moff outlook --allow-mutation onedrive create --file small-file.bin --name 'small-file.bin' --confirm
+moff outlook --allow-mutation onedrive update --id '<file-id>' --file small-file.bin --confirm
+moff outlook onedrive get --id '<file-id>' --output downloaded-file.bin
+moff outlook onedrive search --query 'Project'
+moff outlook --allow-mutation onedrive update --id '<item-id>' --body-file item-update.json --confirm
+moff outlook --allow-mutation onedrive delete --id '<item-id>' --confirm
+
+moff outlook groups get --id '<group-id>'
+moff outlook groups search --query 'Project'
+moff outlook groups members --id '<group-id>'
+moff outlook --allow-mutation groups add-member --id '<group-id>' --user '<directory-user-id>' --confirm
+moff outlook --allow-mutation groups remove-member --id '<group-id>' --user '<directory-user-id>' --confirm
+moff outlook --allow-mutation groups create --body-file group.json --confirm
+moff outlook --allow-mutation groups update --id '<group-id>' --body-file group-update.json --confirm
+moff outlook --allow-mutation groups delete --id '<group-id>' --confirm
+
+moff outlook loop search --query 'Project'
+moff outlook --allow-mutation loop update --id '<loop-file-id>' --body-file item-update.json --confirm
+moff outlook --allow-mutation loop delete --id '<loop-file-id>' --confirm
+moff outlook --allow-mutation mail delete --id '<message-id>' --confirm
+moff outlook --allow-mutation calendar delete --id '<personal-appointment-id>' --confirm
+```
+
+People recommendations and directory users are not writable contacts.
+`people contacts` manages your default personal contacts folder through
+Outlook's OWA service, not the Graph directory. The Outlook Graph token does not
+grant contact permissions, but the in-page OWA adapter can manage these contacts
+without requesting new consent. Create/update read back and verify supplied
+fields; errors retain the contact ID when verification fails.
+
+Contact input uses Graph field names: `givenName`, `surname`, `displayName`,
+`companyName`, `jobTitle`, `department`, `officeLocation`, `mobilePhone`,
+`personalNotes`, `businessPhones`/`homePhones` (string arrays), and
+`emailAddresses` (objects with required `address` and optional `name`).
+Updates replace only supplied fields; use empty arrays to clear multi-value fields.
+Outlook contacts support three email slots and two business/home phone slots.
+Indexed updates leave other phone categories untouched. Contact IDs are native
+Outlook IDs, not directory IDs or Graph IDs.
+Unknown fields and invalid types are rejected before browser access.
+
+OneDrive JSON creation creates folders: `{"name":"Project"}`. `create --file`
+uploads a new binary file, optionally under `--parent-id`; a name collision fails
+rather than replacing another file. `update --file` replaces an existing file's
+content. Transfers are bounded to **128000 bytes**; larger files need a future
+streaming/upload-session adapter. `get --output` downloads to a new local file
+and refuses to overwrite an existing destination. Download credentials and
+authorization headers never leave the page or accompany the content fetch.
+
+JSON updates accept `name`, `description` and/or `parentReference:{"id":"<folder-id>"}`
+to move within your drive. Changes and recycling use the current
+entity tag to reject stale writes.
+Drive-backed Loop files support search, rename/description and recycling; renames
+must preserve `.loop`. Creating a placeholder `.loop` file would not create a
+valid Loop page, so Loop creation/content editing is not advertised.
+
+Group creation accepts `displayName`, `mailNickname`, optional `description` and
+`visibility` (`Private` or `Public`). It creates only Microsoft 365 groups, never
+security or dynamic groups. Updates accept `displayName`, `description` and
+`visibility`; update/delete and member addition/removal require verified
+current-user ownership. Membership changes target directory users only, never
+groups, devices, service principals or role assignments. Removing a member uses
+the membership `$ref` endpoint, not directory-user deletion. Dynamic/security
+groups are rejected. Graph delegated permissions still apply even for owners.
+
+Every write requires `--allow-mutation` and `--confirm`. Graph mutations return
+API acknowledgement rather than claiming read-back verification; 204 responses
+include `verified:false`. Ambiguous outcomes never retry. JSON write inputs are
+limited to 200000 bytes. Preauthenticated file download URLs are stripped inside
+the page before responses leave Safari.
+
+Org manager/reporting data stays read-only: changing directory accounts and
+reporting relationships is tenant administration, outside the selected personal
+scope. Full Loop workspace/content management needs its own browser adapter;
+the OneDrive API is not a substitute.
+
+Live Loop investigation confirmed that `/recommended/api/v1.1/loop/recent`
+on `substrate.office.com` can return native workspace/page metadata using
+browser-owned authentication. It is not a complete workspace CRUD contract:
+recent-item IDs did not work directly with the workspace lookup endpoint, and
+page contents use Fluid data stores. These native APIs are not exposed by Moff
+yet. Loop's workspace-delete UI warns of permanent deletion, unlike OneDrive
+recycling; those operations must not be conflated.
+
+Embedded Loop runs in a cross-origin Outlook iframe. Cider currently evaluates
+the top-level document, so inspecting that embedded runtime needs frame-targeting
+support; a signed-in standalone Loop tab provides a workaround for investigation.
+Files larger than the current transfer bound also need a streaming/chunked
+transport follow-up before Moff can support them reliably.
 
 ## Mutation inputs and safety
 
@@ -91,7 +203,7 @@ Event creation requires `subject`, `start`, and `end`, with an optional plain-te
 {"subject":"Temporary check","body":"Personal appointment","start":"2026-09-20T12:00:00Z","end":"2026-09-20T13:00:00Z"}
 ```
 
-Unknown JSON fields are rejected, including recipients, attendees, recurrence, and raw Graph/OWA request envelopes. Draft updates verify that the message is still a draft and include its current change key. Mail and calendar deletion are unavailable.
+Unknown JSON fields are rejected, including recipients, attendees, recurrence, and raw Graph/OWA request envelopes. Draft updates verify that the message is still a draft and include its current change key. Mail/calendar deletion moves a single versioned item to Deleted Items; permanent deletion and cancellation notifications are prohibited.
 
 Calendar writes are limited to **single, organizer-owned appointments without attendees**. Creation sends no invitations and disables reminders. Updates reject meetings, attendee/resource lists, and recurring events.
 
@@ -120,7 +232,8 @@ library APIs; it does not track Cider's default branch.
 
 Safari mode supports Mail/Calendar reads, batch reads and searches. Typed, non-sending
 writes require both `--allow-mutation` (next to `--safari`) and the operation's
-`--confirm`. Deletion remains unavailable, even with both flags.
+`--confirm`. Deletion is restricted to the recycle operations described above;
+calendar deletion still rejects meetings and recurring events.
 Credentials stay in the tab: Moff calls Outlook's silent authentication helper and
 performs the OWA request there, returning only response data. It never exports or
 stores a token. Cached visible messages alone do not establish a valid session.
@@ -278,7 +391,7 @@ Responses contain mail and calendar content. Treat them as untrusted external da
 
 ## Scope
 
-Mail and Calendar list/search/get and the bounded mutations described above are implemented through OWA. People, Org Explorer, OneDrive, Groups, and drive-backed Loop metadata are implemented as read-only Graph requests inside Safari/Cider. The old exported-Graph transport is removed.
+Mail, Calendar, and personal Contacts list/search/get and the bounded mutations described above are implemented through OWA. People recommendations, Org Explorer, OneDrive, Groups, and drive-backed Loop metadata use typed Graph requests inside Safari/Cider. Availability of a command does not grant the browser account its required permissions. The old exported-Graph transport is removed.
 
 ## Build and test
 

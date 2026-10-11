@@ -9,7 +9,7 @@ async function(config, acquireToken, readResponse) {
         && (!config.recovery_marker || sessionStorage.getItem("__moff_auth_recovery") !== config.recovery_marker)) {
         return {status: 409};
     }
-    const writes = ["CreateItem", "UpdateItem", "UpdateCalendarEvent"];
+    const writes = ["CreateItem", "UpdateItem", "UpdateCalendarEvent", "DeleteItem"];
     if (config.mutation === true) {
         if (config.allow_mutation !== true || !writes.includes(config.action)) throw new Error("Unsupported write action");
         const body = config.body?.Body;
@@ -23,11 +23,17 @@ async function(config, acquireToken, readResponse) {
                     || ["RequiredAttendees", "OptionalAttendees", "Resources"].some(k => item[k]?.length)) {
                     throw new Error("Invitations are prohibited");
                 }
-            } else if (!["Message:#Exchange", "ReplyToItem:#Exchange", "ReplyAllToItem:#Exchange"].includes(item.__type)
+            } else if (!["Message:#Exchange", "ReplyToItem:#Exchange", "ReplyAllToItem:#Exchange","Contact:#Exchange"].includes(item.__type)
                 || body.MessageDisposition !== "SaveOnly") throw new Error("Sending is prohibited");
+            if (item.__type === "Contact:#Exchange" && body.SavedItemFolderId?.BaseFolderId?.Id !== "contacts")
+                throw new Error("Contacts must be created in the personal contacts folder");
         }
         if (config.action === "UpdateItem" && body.MessageDisposition !== "SaveOnly") throw new Error("Sending is prohibited");
         if (config.action === "UpdateCalendarEvent" && body.ShouldSendUpdateToAttendees !== false) throw new Error("Invitations are prohibited");
+        if (config.action === "DeleteItem" && (body.DeleteType !== "MoveToDeletedItems"
+            || body.SendMeetingCancellations !== "SendToNone" || body.SuppressReadReceipts !== true
+            || !Array.isArray(body.ItemIds) || body.ItemIds.length !== 1
+            || !body.ItemIds[0].Id || !body.ItemIds[0].ChangeKey)) throw new Error("Only a single versioned, non-sending recycle operation is allowed");
     } else if (!authOnly && !allowed.includes(config.action)) throw new Error("Unsupported read action");
     let token = await acquireToken(location.origin);
     if (token.status !== 200) {

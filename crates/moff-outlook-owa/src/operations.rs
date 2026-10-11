@@ -244,7 +244,8 @@ pub fn delete_message_request(id: &str, key: &str) -> Result<Value, OutlookWebEr
     nonempty(key)?;
     Ok(envelope(
         "DeleteItem",
-        json!({"__type":"DeleteItemRequest:#Exchange","DeleteType":"HardDelete",
+        json!({"__type":"DeleteItemRequest:#Exchange","DeleteType":"MoveToDeletedItems",
+        "SendMeetingCancellations":"SendToNone",
         "AffectedTaskOccurrences":"AllOccurrences","ReturnMovedItemIds":true,"SuppressReadReceipts":true,
         "ItemIds":[{"__type":"ItemId:#Exchange","Id":id,"ChangeKey":key}]}),
     ))
@@ -315,12 +316,8 @@ pub fn update_event_request(id: &str, input: &EventInput) -> Result<Value, Outlo
         "ItemChange":{"__type":"ItemChange:#Exchange","ItemId":item_id(id),"Updates":updates}}),
     ))
 }
-pub fn delete_event_request(id: &str) -> Result<Value, OutlookWebError> {
-    nonempty(id)?;
-    Ok(envelope(
-        "DeleteCalendarEvent",
-        json!({"__type":"DeleteCalendarEventRequest:#Exchange","EventId":item_id(id),"EventScope":0}),
-    ))
+pub fn delete_event_request(id: &str, key: &str) -> Result<Value, OutlookWebError> {
+    delete_message_request(id, key)
 }
 
 enum Mutation {
@@ -336,9 +333,8 @@ impl Mutation {
         match self {
             Self::CreateDraft | Self::CreateEvent => "CreateItem",
             Self::UpdateDraft => "UpdateItem",
-            Self::DeleteMessage => "DeleteItem",
+            Self::DeleteMessage | Self::DeleteEvent => "DeleteItem",
             Self::UpdateEvent => "UpdateCalendarEvent",
-            Self::DeleteEvent => "DeleteCalendarEvent",
         }
     }
 }
@@ -853,7 +849,7 @@ impl OutlookWebSession {
         appointment(single_item(&response)?)?;
         self.execute(
             Mutation::DeleteEvent.action(),
-            &delete_event_request(id)?,
+            &delete_event_request(id, field(single_item(&response)?, "/ItemId/ChangeKey")?)?,
             true,
         )
     }
@@ -863,6 +859,36 @@ impl OutlookWebSession {
 mod tests {
     use super::*;
     use crate::test_support::{message, mock};
+
+    #[test]
+    fn deletion_recycles_messages_and_rejects_meeting_cancellations() {
+        let (session, requests, completion) = mock(vec![
+            (
+                "GetItem",
+                message(
+                    json!({"__type":"Message:#Exchange","ItemId":{"Id":"id","ChangeKey":"key"},"IsRead":false}),
+                ),
+            ),
+            (
+                "DeleteItem",
+                json!({"Body":{"ResponseMessages":{"Items":[{"ResponseCode":"NoError"}]}}}),
+            ),
+        ]);
+        session.delete_message("id").unwrap();
+        completion.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[1]["Body"]["DeleteType"], "MoveToDeletedItems");
+        assert_eq!(requests[1]["Body"]["ItemIds"][0]["ChangeKey"], "key");
+        assert_eq!(requests[1]["Body"]["SuppressReadReceipts"], true);
+        let (session, _, completion) = mock(vec![(
+            "GetItem",
+            message(
+                json!({"__type":"CalendarItem:#Exchange","ItemId":{"Id":"id","ChangeKey":"key"},"IsMeeting":true}),
+            ),
+        )]);
+        assert!(session.delete_event("id").is_err());
+        completion.join().unwrap();
+    }
 
     #[test]
     fn category_update_preserves_existing_categories_and_unread_state() {

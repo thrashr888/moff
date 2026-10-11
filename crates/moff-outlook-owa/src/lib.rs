@@ -1,7 +1,10 @@
 //! Outlook Mail and Calendar operations through Safari and the Cider library.
 #![allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
+mod contacts;
 mod operations;
+pub use contacts::validate_contact_input;
 mod products;
+pub use products::{ProductWrite, product_segment};
 mod safari;
 mod scheduling;
 #[cfg(test)]
@@ -39,6 +42,9 @@ pub enum OutlookWebError {
     ProductRequestRejected(u16),
     SafariReadOnly,
     VerificationFailed,
+    ItemVerificationFailed {
+        id: String,
+    },
     DraftVerificationFailed {
         draft_id: String,
         source_id: String,
@@ -79,10 +85,13 @@ impl fmt::Display for OutlookWebError {
             }
             Self::ProductAuthenticationUnavailable => "browser product authentication is unavailable; sign into Outlook and check the product's permitted browser access; Moff will not request consent or export credentials",
             Self::ProductRequestRejected(status) => {
-                return write!(f, "the product API rejected the browser read (HTTP {status}); access may require permissions not held by this session");
+                return write!(f, "the product API rejected the browser request (HTTP {status}); access may require permissions not held by this session");
             }
-            Self::SafariReadOnly => "Safari writes require --allow-mutation and --confirm; deletion is not supported through Safari",
+            Self::SafariReadOnly => "Safari writes require --allow-mutation and --confirm",
             Self::VerificationFailed => "the write completed but verification failed; inspect the affected item before retrying",
+            Self::ItemVerificationFailed { id } => {
+                return write!(f,"item {id} was written but read-back verification failed; inspect it before retrying");
+            }
             Self::DraftVerificationFailed { draft_id, source_id } => {
                 return write!(f, "draft {draft_id} was created but verification or read-state restoration failed for source {source_id}; inspect both items; do not recreate the draft automatically");
             }

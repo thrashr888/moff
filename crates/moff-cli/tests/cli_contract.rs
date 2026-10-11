@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use serde_json::Value;
 
@@ -90,18 +91,10 @@ fn mutations_require_confirmation_and_opt_in_before_browser_access() {
     }
     for product in ["mail", "calendar"] {
         moff()
-            .args([
-                "outlook",
-                "--allow-mutation",
-                product,
-                "delete",
-                "--id",
-                "fake",
-                "--confirm",
-            ])
+            .args(["outlook", product, "delete", "--id", "fake", "--confirm"])
             .assert()
             .failure()
-            .stderr(contains("deletion is not supported"));
+            .stderr(contains("--allow-mutation"));
         moff()
             .args([
                 "outlook",
@@ -166,7 +159,7 @@ fn schema_is_honest_about_unavailable_products_and_safe_writes() {
     assert_eq!(schema["commands"]["mail"]["reply_all_draft"], true);
     assert_eq!(schema["commands"]["mail"]["send"], false);
     for product in ["mail", "calendar"] {
-        assert_eq!(schema["commands"][product]["delete"], false);
+        assert_eq!(schema["commands"][product]["delete"], true);
         assert_eq!(schema["commands"][product]["get-batch"], true);
     }
     assert!(
@@ -176,6 +169,110 @@ fn schema_is_honest_about_unavailable_products_and_safe_writes() {
             .is_empty()
     );
     assert_eq!(schema["commands"]["people"]["search"], true);
+    assert_eq!(schema["commands"]["people"]["contacts"]["create"], true);
+    assert_eq!(schema["commands"]["groups"]["update"], true);
+    assert_eq!(schema["commands"]["onedrive"]["delete"], true);
+    assert_eq!(schema["commands"]["loop"]["create"], false);
+    assert_eq!(schema["commands"]["org"]["delete"], false);
+    assert_eq!(schema["full_product_management"], false);
+}
+
+#[test]
+fn product_management_commands_have_gates_and_validate_input_before_browser_access() {
+    for product in [vec!["people", "contacts"], vec!["onedrive"], vec!["groups"]] {
+        for verb in ["create", "update", "delete", "search"] {
+            moff()
+                .arg("outlook")
+                .args(&product)
+                .args([verb, "--help"])
+                .assert()
+                .success();
+        }
+        for args in [
+            vec!["create", "--body-file", "/not/read", "--confirm"],
+            vec![
+                "update",
+                "--id",
+                "fake",
+                "--body-file",
+                "/not/read",
+                "--confirm",
+            ],
+            vec!["delete", "--id", "fake", "--confirm"],
+        ] {
+            moff()
+                .arg("outlook")
+                .args(&product)
+                .args(args)
+                .assert()
+                .failure()
+                .stderr(contains("--allow-mutation"));
+        }
+        moff()
+            .args(["outlook", "--allow-mutation"])
+            .args(&product)
+            .args(["create", "--body-file", "/dev/stdin", "--confirm"])
+            .write_stdin(r#"{"owners@odata.bind":["bad"]}"#)
+            .assert()
+            .failure()
+            .stderr(contains("unsupported field").or(contains("accepts only")));
+    }
+    for verb in ["update", "delete"] {
+        moff()
+            .args(["outlook", "loop", verb, "--id", "fake", "--confirm"])
+            .args(if verb == "update" {
+                vec!["--body-file", "/not/read"]
+            } else {
+                vec![]
+            })
+            .assert()
+            .failure()
+            .stderr(contains("--allow-mutation"));
+    }
+    for verb in ["add-member", "remove-member"] {
+        moff()
+            .args([
+                "outlook",
+                "groups",
+                verb,
+                "--id",
+                "fake",
+                "--user",
+                "fake",
+                "--confirm",
+            ])
+            .assert()
+            .failure()
+            .stderr(contains("--allow-mutation"));
+    }
+    moff()
+        .args([
+            "outlook",
+            "--allow-mutation",
+            "onedrive",
+            "create",
+            "--file",
+            "/dev/null",
+            "--name",
+            "bad/name",
+            "--confirm",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("single path segments"));
+    moff()
+        .args([
+            "outlook",
+            "--allow-mutation",
+            "groups",
+            "create",
+            "--file",
+            "/not/read",
+            "--confirm",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("--file is only supported"));
 }
 
 #[test]
