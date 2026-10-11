@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::time::Duration;
 
 use cider::sources::safari::{
     self, DocumentTarget, EvalOptions, OperationPhase, PageOperationError, TabTarget,
@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::{
-    OutlookWebError, OutlookWebSession, decode_response, http_client, validate_read_action,
+    OutlookWebError, OutlookWebSession, SessionTransport, decode_response, validate_read_action,
 };
 
 pub(super) struct SafariSession {
@@ -31,11 +31,170 @@ fn outlook_url(value: &str) -> bool {
 }
 
 impl OutlookWebSession {
+    /// Check browser authentication without refreshing or invoking interactive login.
+    pub fn safari_auth_status(target: Option<(u32, u32)>) -> Result<Value, OutlookWebError> {
+        let session = Self::from_safari(target)?;
+        #[cfg(not(test))]
+        let SessionTransport::Safari(safari) = &session.transport;
+        #[cfg(test)]
+        let SessionTransport::Safari(safari) = &session.transport else {
+            return Err(OutlookWebError::SafariUnavailable);
+        };
+        let script = format!(
+            "(async function(){{const result=await {};return {{status:result.status,recovery_marker_present:sessionStorage.getItem('__moff_auth_recovery')!==null}};}})()",
+            page_script(
+                include_str!("safari_read.js"),
+                &json!({"action":"__MoffAuthStatus"})
+            )
+        );
+        let result = safari
+            .runtime
+            .block_on(safari::eval_document(
+                &script,
+                &safari.target,
+                &eval_options(30),
+            ))
+            .map_err(|_| OutlookWebError::SafariAuthRecoveryFailed("silent token acquisition"))?;
+        if result.truncated {
+            return Err(OutlookWebError::InvalidResponse);
+        }
+        match result.value["status"].as_u64() {
+            Some(200 | 401 | 422 | 425) => {
+                Ok(json!({"authenticated":result.value["status"] == 200,
+                "status":result.value["status"],"recovery_marker_present":result.value["recovery_marker_present"],
+                "credential_export":false}))
+            }
+            _ => Err(OutlookWebError::InvalidResponse),
+        }
+    }
+
+    /// Explicitly reload Outlook and let browser SSO recover; never interact with login UI.
+    pub fn refresh_safari_auth(
+        target: Option<(u32, u32)>,
+        wait_seconds: u32,
+    ) -> Result<Value, OutlookWebError> {
+        if !(1..=120).contains(&wait_seconds) {
+            return Err(OutlookWebError::InvalidInput(
+                "wait seconds must be between 1 and 120",
+            ));
+        }
+        let runtime =
+            tokio::runtime::Runtime::new().map_err(|_| OutlookWebError::SafariOperationFailed)?;
+        runtime.block_on(async {
+            let tabs = safari::tabs().await.map_err(|_| OutlookWebError::SafariOperationFailed)?;
+            let tab = selected_tab(&tabs, target)?;
+            let original = safari::document_target(tab_target(tab)?).await
+                .map_err(|_| OutlookWebError::SafariBeforeDispatch)?;
+            let marker = original.document_id.clone();
+            let script = format!("({})({})", include_str!("safari_refresh.js"), json!(marker));
+            let result = safari::eval_document(&script, &original, &eval_options(10)).await
+                .map_err(|_| OutlookWebError::SafariRefreshUnknown)?;
+            if result.truncated || result.value["scheduled"] != true {
+                return Err(OutlookWebError::SafariRefreshUnknown);
+            }
+            let mut last_status = None;
+            let wait = tokio::time::timeout(Duration::from_secs(u64::from(wait_seconds)), async {
+                'poll: loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let tabs = safari::tabs().await
+                        .map_err(|_| OutlookWebError::SafariOperationFailed)?;
+                    let mut candidates = Vec::new();
+                    for tab in tabs.iter().filter(|tab| tab.window_id == original.window_id && outlook_url(&tab.url)) {
+                        let document = safari::document_target(tab_target(tab)?).await
+                            .map_err(|_| OutlookWebError::SafariBeforeDispatch)?;
+                        if document.document_id == original.document_id { continue; }
+                        let probe = format!(
+                            "sessionStorage.getItem('__moff_auth_recovery') === {}", json!(marker));
+                        let result = match safari::eval_document(&probe, &document, &eval_options(10)).await {
+                            Ok(result) => result,
+                            Err(error) if error.downcast_ref::<PageOperationError>().is_some_and(|error|
+                                matches!(error.phase, OperationPhase::BeforeDispatch)) => continue 'poll,
+                            Err(_) => return Err(OutlookWebError::SafariAuthRecoveryFailed("document marker probe")),
+                        };
+                        if result.truncated {
+                            return Err(OutlookWebError::InvalidResponse);
+                        }
+                        if result.value == true { candidates.push((document, tab)); }
+                    }
+                    if candidates.len() > 1 { return Err(OutlookWebError::SafariUnavailable); }
+                    let Some((document, tab)) = candidates.pop() else { continue; };
+                    let script = page_script(include_str!("safari_read.js"),
+                        &json!({"action":"__MoffAuthStatus","recovery_marker":marker}));
+                    let result = match safari::eval_document(&script, &document, &eval_options(15)).await {
+                        Ok(result) => result,
+                        Err(error) if error.downcast_ref::<PageOperationError>().is_some_and(|error|
+                            matches!(error.phase, OperationPhase::BeforeDispatch)) => continue 'poll,
+                        Err(_) => return Err(OutlookWebError::SafariAuthRecoveryFailed("silent token acquisition")),
+                    };
+                    if result.truncated { return Err(OutlookWebError::InvalidResponse); }
+                    last_status = result.value["status"].as_u64();
+                    match result.value["status"].as_u64() {
+                        Some(200) => return Ok(json!({"complete":true,"state":"authenticated",
+                            "window":tab.window,"tab":tab.tab,"credential_export":false})),
+                        Some(401 | 409 | 422 | 425) => {}
+                        _ => return Err(OutlookWebError::InvalidResponse),
+                    }
+                }
+            }).await;
+            match wait {
+                Ok(result) => result,
+                Err(_) if last_status == Some(422) => Err(OutlookWebError::SafariAuthRecoveryFailed("Outlook authentication modules did not become available")),
+                Err(_) => Ok(json!({"complete":false,"state":"needs_user_action",
+                    "message":"Recovery was not verified within the wait period: sign-in may need your clicks, or Outlook may have changed origin/cleared the tab marker. Inspect Safari, finish sign-in if needed, then run moff auth status. Do not refresh while entering credentials.",
+                    "credential_export":false})),
+            }
+        })
+    }
+
     /// Use a loaded Outlook tab without exporting browser credentials.
     pub fn from_safari(target: Option<(u32, u32)>) -> Result<Self, OutlookWebError> {
         Self::from_safari_with_mutations(target, false)
     }
+}
 
+fn selected_tab(
+    tabs: &[safari::OpenTab],
+    target: Option<(u32, u32)>,
+) -> Result<&safari::OpenTab, OutlookWebError> {
+    let matches: Vec<_> = tabs
+        .iter()
+        .filter(|tab| {
+            outlook_url(&tab.url)
+                && target.is_none_or(|(window, position)| {
+                    tab.window == i64::from(window) && tab.tab == i64::from(position)
+                })
+        })
+        .collect();
+    let [tab] = matches.as_slice() else {
+        return Err(OutlookWebError::SafariUnavailable);
+    };
+    Ok(tab)
+}
+
+fn tab_target(tab: &safari::OpenTab) -> Result<TabTarget, OutlookWebError> {
+    Ok(TabTarget {
+        window: u32::try_from(tab.window).map_err(|_| OutlookWebError::SafariUnavailable)?,
+        tab: u32::try_from(tab.tab).map_err(|_| OutlookWebError::SafariUnavailable)?,
+    })
+}
+
+fn eval_options(timeout: u32) -> EvalOptions {
+    EvalOptions {
+        allow_eval: true,
+        max_chars: 1000,
+        timeout,
+    }
+}
+
+fn page_script(source: &str, config: &Value) -> String {
+    format!(
+        "({source})({config}, ({}), ({}))",
+        include_str!("safari_auth.js"),
+        include_str!("safari_response.js")
+    )
+}
+
+impl OutlookWebSession {
     /// Explicitly opt into typed, non-sending writes; the raw read surface stays read-only.
     pub fn from_safari_with_mutations(
         target: Option<(u32, u32)>,
@@ -46,30 +205,13 @@ impl OutlookWebSession {
         let tabs = runtime
             .block_on(safari::tabs())
             .map_err(|_| OutlookWebError::SafariOperationFailed)?;
-        let matches: Vec<_> = tabs
-            .iter()
-            .filter(|tab| {
-                outlook_url(&tab.url)
-                    && target.is_none_or(|(window, position)| {
-                        tab.window == i64::from(window) && tab.tab == i64::from(position)
-                    })
-            })
-            .collect();
-        let [tab] = matches.as_slice() else {
-            return Err(OutlookWebError::SafariUnavailable);
-        };
-        let target = TabTarget {
-            window: u32::try_from(tab.window).map_err(|_| OutlookWebError::SafariUnavailable)?,
-            tab: u32::try_from(tab.tab).map_err(|_| OutlookWebError::SafariUnavailable)?,
-        };
+        let tab = selected_tab(&tabs, target)?;
+        let target = tab_target(tab)?;
         let target = runtime
             .block_on(safari::document_target(target))
             .map_err(|_| OutlookWebError::SafariBeforeDispatch)?;
         Ok(Self {
-            origin: Url::parse(&tab.url).map_err(|_| OutlookWebError::SafariUnavailable)?,
-            headers: BTreeMap::new(),
-            client: http_client()?,
-            safari: Some(SafariSession {
+            transport: SessionTransport::Safari(SafariSession {
                 target,
                 runtime,
                 allow_mutation,
@@ -79,6 +221,148 @@ impl OutlookWebSession {
 }
 
 impl SafariSession {
+    pub(super) fn product_read(&self, url: &str) -> Result<Value, OutlookWebError> {
+        self.product_request(&json!({"url":url}), false)
+    }
+
+    pub(super) fn product_download(&self, url: &str) -> Result<Value, OutlookWebError> {
+        self.product_request(&json!({"url":url,"download":true}), false)
+    }
+
+    pub(super) fn product_write(
+        &self,
+        request: &crate::ProductWrite,
+    ) -> Result<Value, OutlookWebError> {
+        if !self.allow_mutation {
+            return Err(OutlookWebError::SafariReadOnly);
+        }
+        if let Some(path) = request
+            .url
+            .strip_prefix("https://graph.microsoft.com/v1.0/groups/")
+        {
+            let id = path
+                .split('/')
+                .next()
+                .ok_or(OutlookWebError::InvalidResponse)?;
+            let group =
+                self.product_read(&format!("https://graph.microsoft.com/v1.0/groups/{id}"))?;
+            if group["groupTypes"]
+                .as_array()
+                .is_none_or(|types| types.len() != 1 || types[0] != "Unified")
+                || group["isAssignableToRole"] == true
+            {
+                return Err(OutlookWebError::InvalidInput(
+                    "only Microsoft 365 groups can be managed",
+                ));
+            }
+            let me = self.product_read("https://graph.microsoft.com/v1.0/me")?;
+            let user_id = me["id"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or(OutlookWebError::InvalidResponse)?;
+            let owners = self.product_read(&format!(
+                "https://graph.microsoft.com/v1.0/groups/{id}/owners?$top=100"
+            ))?;
+            let owners = owners["value"]
+                .as_array()
+                .ok_or(OutlookWebError::InvalidResponse)?;
+            if !owners
+                .iter()
+                .any(|owner| owner["id"].as_str() == Some(user_id))
+            {
+                return Err(OutlookWebError::InvalidInput(
+                    "group mutations require verified ownership; the bounded owner page did not establish it",
+                ));
+            }
+        }
+        self.product_request(
+            &json!({"url":request.url,"method":request.method,"body":request.body,
+            "etag":request.etag,"bytes":request.bytes,"allow_mutation":true}),
+            true,
+        )
+    }
+
+    fn product_request(&self, config: &Value, mutation: bool) -> Result<Value, OutlookWebError> {
+        let unknown = || OutlookWebError::OutcomeUnknown {
+            action: "product write",
+        };
+        let script = page_script(include_str!("safari_products.js"), config);
+        let result = self
+            .runtime
+            .block_on(safari::eval_document(
+                &script,
+                &self.target,
+                &EvalOptions {
+                    allow_eval: true,
+                    max_chars: 1_000_000,
+                    timeout: 60,
+                },
+            ))
+            .map_err(|error| {
+                if error
+                    .downcast_ref::<PageOperationError>()
+                    .is_some_and(|e| matches!(e.phase, OperationPhase::BeforeDispatch))
+                {
+                    OutlookWebError::SafariBeforeDispatch
+                } else if mutation {
+                    unknown()
+                } else {
+                    OutlookWebError::SafariOperationFailed
+                }
+            })?;
+        if result.truncated {
+            return Err(if mutation {
+                unknown()
+            } else {
+                OutlookWebError::TruncatedSearch
+            });
+        }
+        let status = result.value["status"]
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .ok_or_else(|| {
+                if mutation {
+                    unknown()
+                } else {
+                    OutlookWebError::InvalidResponse
+                }
+            })?;
+        if status == 401 {
+            return Err(OutlookWebError::ProductAuthenticationUnavailable);
+        }
+        if !(200..300).contains(&status) {
+            if mutation && status >= 500 {
+                return Err(unknown());
+            }
+            return Err(OutlookWebError::ProductRequestRejected(status));
+        }
+        if mutation && status == 204 {
+            return Ok(json!({"status":204,"acknowledged":true,"verified":false}));
+        }
+        let value = decode_response(result.value["body"].as_str().ok_or_else(|| {
+            if mutation {
+                unknown()
+            } else {
+                OutlookWebError::InvalidResponse
+            }
+        })?)
+        .map_err(|_| {
+            if mutation {
+                unknown()
+            } else {
+                OutlookWebError::InvalidResponse
+            }
+        })?;
+        if !value.is_object() || value.get("error").is_some() {
+            return Err(if mutation {
+                unknown()
+            } else {
+                OutlookWebError::InvalidResponse
+            });
+        }
+        Ok(value)
+    }
+
     pub(super) fn call(
         &self,
         action: &'static str,
@@ -87,17 +371,22 @@ impl SafariSession {
     ) -> Result<Value, OutlookWebError> {
         if mutation {
             if !self.allow_mutation
-                || !["CreateItem", "UpdateItem", "UpdateCalendarEvent"].contains(&action)
+                || ![
+                    "CreateItem",
+                    "UpdateItem",
+                    "UpdateCalendarEvent",
+                    "DeleteItem",
+                ]
+                .contains(&action)
             {
                 return Err(OutlookWebError::SafariReadOnly);
             }
         } else {
             validate_read_action(action)?;
         }
-        let script = format!(
-            "({})({})",
+        let script = page_script(
             include_str!("safari_read.js"),
-            json!({ "action": action, "body": body, "mutation": mutation, "allow_mutation": self.allow_mutation })
+            &json!({ "action": action, "body": body, "mutation": mutation, "allow_mutation": self.allow_mutation }),
         );
         let result = self
             .runtime
@@ -188,6 +477,35 @@ mod tests {
             "https://user@outlook.office.com/mail/",
         ] {
             assert!(!outlook_url(url));
+        }
+    }
+
+    #[test]
+    fn refresh_requires_an_unambiguous_outlook_document_and_bounded_wait() {
+        let tabs = vec![
+            safari::OpenTab {
+                title: String::new(),
+                url: "https://outlook.office.com/mail/".into(),
+                window: 1,
+                tab: 1,
+                window_id: 42,
+            },
+            safari::OpenTab {
+                title: String::new(),
+                url: "https://outlook.office.com/calendar/".into(),
+                window: 1,
+                tab: 2,
+                window_id: 42,
+            },
+        ];
+        assert!(selected_tab(&tabs, None).is_err());
+        assert_eq!(selected_tab(&tabs, Some((1, 2))).unwrap().tab, 2);
+        assert!(selected_tab(&tabs, Some((2, 1))).is_err());
+        for wait in [0, 121] {
+            assert!(matches!(
+                OutlookWebSession::refresh_safari_auth(None, wait),
+                Err(OutlookWebError::InvalidInput(_))
+            ));
         }
     }
 }

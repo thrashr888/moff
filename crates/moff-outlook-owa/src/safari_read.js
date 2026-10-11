@@ -1,10 +1,15 @@
-async function(config) {
+async function(config, acquireToken, readResponse) {
     if (!["https://outlook.office.com", "https://outlook.cloud.microsoft"].includes(location.origin)) {
         throw new Error("Moff requires an HTTPS Outlook tab");
     }
     const allowed = ["FindItem", "FindConversation", "GetItem", "GetConversationItems",
         "GetCalendarFolders", "GetCalendarFoldersV2", "GetCalendarView"];
-    const writes = ["CreateItem", "UpdateItem", "UpdateCalendarEvent"];
+    const authOnly = config.action === "__MoffAuthStatus" && config.mutation !== true;
+    if (authOnly && config.recovery_marker !== undefined
+        && (!config.recovery_marker || sessionStorage.getItem("__moff_auth_recovery") !== config.recovery_marker)) {
+        return {status: 409};
+    }
+    const writes = ["CreateItem", "UpdateItem", "UpdateCalendarEvent", "DeleteItem"];
     if (config.mutation === true) {
         if (config.allow_mutation !== true || !writes.includes(config.action)) throw new Error("Unsupported write action");
         const body = config.body?.Body;
@@ -18,29 +23,28 @@ async function(config) {
                     || ["RequiredAttendees", "OptionalAttendees", "Resources"].some(k => item[k]?.length)) {
                     throw new Error("Invitations are prohibited");
                 }
-            } else if (!["Message:#Exchange", "ReplyToItem:#Exchange"].includes(item.__type)
+            } else if (!["Message:#Exchange", "ReplyToItem:#Exchange", "ReplyAllToItem:#Exchange","Contact:#Exchange"].includes(item.__type)
                 || body.MessageDisposition !== "SaveOnly") throw new Error("Sending is prohibited");
+            if (item.__type === "Contact:#Exchange" && body.SavedItemFolderId?.BaseFolderId?.Id !== "contacts")
+                throw new Error("Contacts must be created in the personal contacts folder");
         }
         if (config.action === "UpdateItem" && body.MessageDisposition !== "SaveOnly") throw new Error("Sending is prohibited");
         if (config.action === "UpdateCalendarEvent" && body.ShouldSendUpdateToAttendees !== false) throw new Error("Invitations are prohibited");
-    } else if (!allowed.includes(config.action)) throw new Error("Unsupported read action");
-    if (!window.webpackChunkOwa) throw new Error("Outlook is not loaded; sign in and wait for Mail");
-    let runtime;
-    const chunks = window.webpackChunkOwa;
-    const marker = "__moff_read_" + crypto.randomUUID();
-    chunks.push([[marker], {}, value => { runtime = value; }]);
-    chunks.pop();
-    if (!runtime || !runtime.m[121455] || !runtime.m[429896]) {
+        if (config.action === "DeleteItem" && (body.DeleteType !== "MoveToDeletedItems"
+            || body.SendMeetingCancellations !== "SendToNone" || body.SuppressReadReceipts !== true
+            || !Array.isArray(body.ItemIds) || body.ItemIds.length !== 1
+            || !body.ItemIds[0].Id || !body.ItemIds[0].ChangeKey)) throw new Error("Only a single versioned, non-sending recycle operation is allowed");
+    } else if (!authOnly && !allowed.includes(config.action)) throw new Error("Unsupported read action");
+    let token = await acquireToken(location.origin);
+    if (token.status !== 200) {
+        if (authOnly || token.status === 401) return {status: token.status};
+        if (token.status === 425) throw new Error("Outlook is not loaded; sign in and wait for Mail");
         throw new Error("Outlook authentication contract changed; Moff needs an adapter update");
     }
-    const auth = runtime(121455);
-    const mailbox = runtime(429896);
-    if (typeof auth.ij !== "function" || typeof mailbox.A !== "function") {
-        throw new Error("Outlook authentication contract changed; Moff needs an adapter update");
-    }
-    let token = await auth.ij("MoffRead", mailbox.A(), {resource: location.origin});
-    if (!token || !token.AccessToken || token.TokenResultCode !== 0) {
-        return {status: 401};
+    if (authOnly) {
+        token = null;
+        if (config.recovery_marker !== undefined) sessionStorage.removeItem("__moff_auth_recovery");
+        return {status: 200};
     }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 25000);
@@ -48,25 +52,11 @@ async function(config) {
         const response = await fetch("/owa/service.svc?action=" + config.action + "&app=Mail", {
             method: "POST", mode: "same-origin", credentials: "same-origin", redirect: "error",
             headers: {"content-type": "application/json", action: config.action,
-                authorization: "Bearer " + token.AccessToken},
+                authorization: "Bearer " + token.accessToken},
             body: JSON.stringify(config.body), signal: controller.signal
         });
         token = null;
-        if (!response.ok) return {status: response.status};
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let text = "", bytes = 0;
-        try {
-            while (true) {
-                const part = await reader.read();
-                if (part.done) break;
-                bytes += part.value.length;
-                if (bytes > 900000) throw new Error("Outlook response exceeds Moff's browser limit");
-                text += decoder.decode(part.value, {stream: true});
-            }
-            text += decoder.decode();
-        } finally { await reader.cancel(); }
-        return {status: response.status, body: text};
+        return await readResponse(response);
     } finally {
         token = null;
         clearTimeout(timer);

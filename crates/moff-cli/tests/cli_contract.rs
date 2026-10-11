@@ -8,87 +8,72 @@ fn moff() -> Command {
 }
 
 #[test]
-fn safari_mutations_and_graph_are_rejected_without_browser_access() {
-    for product in ["mail", "calendar"] {
-        moff()
-            .args([
-                "outlook",
-                "--safari",
-                product,
-                "delete",
-                "--id",
-                "fake",
-                "--confirm",
-            ])
-            .assert()
-            .failure()
-            .code(2)
-            .stderr(contains("deletion is not supported through Safari"));
-    }
+fn safari_is_the_only_transport_and_exports_are_not_accepted() {
     moff()
-        .args(["outlook", "--safari", "people", "search"])
+        .args(["outlook", "--session-curl", "/not/read", "mail", "list"])
         .assert()
         .failure()
-        .code(2)
-        .stderr(contains("Mail/Calendar reads only"));
-}
-
-#[test]
-fn safari_requires_complete_targets_and_excludes_exports() {
+        .stderr(contains("unexpected argument"));
     moff()
-        .args([
-            "outlook",
-            "--safari",
-            "--safari-window",
-            "1",
-            "mail",
-            "list",
-        ])
+        .args(["outlook", "--safari-window", "1", "mail", "list"])
         .assert()
         .failure()
         .stderr(contains("--safari-tab"));
     moff()
-        .args([
-            "outlook",
-            "--safari",
-            "--session-curl",
-            "fake",
-            "mail",
-            "list",
-        ])
+        .args(["outlook", "--safari", "mail", "list", "--help"])
         .assert()
-        .failure()
-        .stderr(contains("cannot be used"));
+        .success();
+    moff()
+        .args(["outlook", "mail", "list", "--help"])
+        .assert()
+        .success();
 }
 
 #[test]
-fn assistant_commands_expose_safe_gates_and_planning() {
+fn product_commands_remain_discoverable_without_browser_access() {
+    for args in [
+        vec!["people", "search"],
+        vec!["people", "get", "--user", "fake"],
+        vec!["org", "manager"],
+        vec!["org", "reports"],
+        vec!["onedrive", "list"],
+        vec!["onedrive", "get", "--id", "fake"],
+        vec!["groups", "list"],
+        vec!["loop", "list"],
+        vec!["loop", "get", "--id", "fake"],
+    ] {
+        moff()
+            .arg("outlook")
+            .args(args)
+            .arg("--help")
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn mutations_require_confirmation_and_opt_in_before_browser_access() {
     for args in [
         vec![
-            "outlook",
-            "--safari",
             "mail",
             "categories",
             "--id",
-            "id",
+            "fake",
             "--add",
             "Needs Response",
             "--confirm",
         ],
         vec![
-            "outlook",
-            "--safari",
             "mail",
             "reply-draft",
             "--id",
-            "id",
+            "fake",
             "--body-file",
             "/not/read",
             "--confirm",
         ],
+        vec!["mail", "mark", "--id", "fake", "--unread", "--confirm"],
         vec![
-            "outlook",
-            "--safari",
             "calendar",
             "work-blocks",
             "apply",
@@ -98,48 +83,66 @@ fn assistant_commands_expose_safe_gates_and_planning() {
         ],
     ] {
         moff()
+            .arg("outlook")
             .args(args)
             .assert()
             .failure()
             .stderr(contains("--allow-mutation"));
     }
-    moff()
-        .args(["outlook", "--allow-mutation", "mail", "list"])
-        .assert()
-        .failure()
-        .stderr(contains("--safari"));
-    moff()
-        .args([
-            "outlook",
-            "--safari",
-            "--allow-mutation",
-            "calendar",
-            "work-blocks",
-            "apply",
-            "--body-file",
-            "/not/read",
-        ])
-        .assert()
-        .failure()
-        .stderr(contains("--confirm"));
     for product in ["mail", "calendar"] {
+        moff()
+            .args(["outlook", product, "delete", "--id", "fake", "--confirm"])
+            .assert()
+            .failure()
+            .stderr(contains("--allow-mutation"));
         moff()
             .args([
                 "outlook",
+                "--allow-mutation",
                 product,
-                "get-batch",
+                "update",
                 "--id",
-                "one",
-                "two",
-                "--help",
+                "fake",
+                "--body-file",
+                "/not/read",
             ])
             .assert()
-            .success();
+            .failure()
+            .stderr(contains("--confirm"));
     }
-    moff()
-        .args(["outlook", "calendar", "work-blocks", "plan", "--help"])
-        .assert()
-        .success();
+}
+
+#[test]
+fn auth_has_root_and_outlook_aliases_and_an_explicit_refresh_gate() {
+    for prefix in [vec!["auth"], vec!["outlook", "auth"]] {
+        moff()
+            .args(&prefix)
+            .arg("refresh")
+            .assert()
+            .failure()
+            .stderr(contains("--confirm"));
+        moff()
+            .args(&prefix)
+            .args(["refresh", "--help"])
+            .assert()
+            .success()
+            .stdout(contains("--wait-seconds"));
+        moff()
+            .args(&prefix)
+            .args(["status", "--help"])
+            .assert()
+            .success();
+        moff()
+            .args(&prefix)
+            .args(["refresh", "--wait-seconds", "121", "--confirm"])
+            .assert()
+            .failure()
+            .stderr(contains("121"));
+    }
+}
+
+#[test]
+fn schema_is_honest_about_unavailable_products_and_safe_writes() {
     let output = moff()
         .arg("schema")
         .assert()
@@ -148,80 +151,132 @@ fn assistant_commands_expose_safe_gates_and_planning() {
         .stdout
         .clone();
     let schema: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(schema["commands"]["mail"]["categories"], true);
-    assert_eq!(schema["commands"]["mail"]["reply-draft"], true);
-    assert_eq!(schema["commands"]["calendar"]["availability"], true);
-    assert_eq!(schema["commands"]["calendar"]["work-blocks"]["apply"], true);
-    assert_eq!(schema["transports"]["safari"]["delete"], false);
-}
-
-#[test]
-fn help_exposes_all_browser_session_read_products() {
-    moff()
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(contains("outlook"));
-    moff()
-        .args(["outlook", "--help"])
-        .assert()
-        .success()
-        .stdout(contains("mail"))
-        .stdout(contains("calendar"))
-        .stdout(contains("people"))
-        .stdout(contains("org"))
-        .stdout(contains("onedrive"))
-        .stdout(contains("groups"))
-        .stdout(contains("loop"))
-        .stdout(contains("service"))
-        .stdout(contains("Graph"))
-        .stdout(contains("doctor").not());
-}
-
-#[test]
-fn mail_list_uses_the_default_session_export_path() {
-    let home = std::env::temp_dir().join(format!("moff-home-{}", std::process::id()));
-    std::fs::create_dir_all(&home).unwrap();
-    moff()
-        .env("HOME", &home)
-        .args(["outlook", "mail", "list"])
-        .assert()
-        .failure()
-        .code(2)
-        .stderr(contains("session export could not be read"));
-    std::fs::remove_dir_all(home).unwrap();
-}
-
-#[test]
-fn schema_names_the_one_browser_session_provider() {
-    let output = moff()
-        .arg("schema")
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let value: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(value["schema"], "moff.schema/v1");
-    assert_eq!(value["provider"], "browser-session");
-    assert!(value["commands"]["mail"]["list"].as_bool().unwrap());
-    assert!(value["commands"]["calendar"]["view"].as_bool().unwrap());
-    assert!(value["commands"]["people"]["search"].as_bool().unwrap());
-    assert!(value["commands"]["org"]["manager"].as_bool().unwrap());
-    assert!(value["commands"]["onedrive"]["list"].as_bool().unwrap());
-    assert!(value["commands"]["groups"]["list"].as_bool().unwrap());
-    assert!(value["commands"]["loop"]["list"].as_bool().unwrap());
-    assert!(value["commands"]["service"]["read"].as_bool().unwrap());
+    assert_eq!(schema["default_transport"], "safari");
+    assert!(schema["transports"].get("curl-export").is_none());
+    assert_eq!(schema["commands"]["auth"]["refresh"], true);
+    assert_eq!(schema["commands"]["auth"]["status"], true);
+    assert_eq!(schema["commands"]["mail"]["mark"], true);
+    assert_eq!(schema["commands"]["mail"]["reply_all_draft"], true);
+    assert_eq!(schema["commands"]["mail"]["send"], false);
+    for product in ["mail", "calendar"] {
+        assert_eq!(schema["commands"][product]["delete"], true);
+        assert_eq!(schema["commands"][product]["get-batch"], true);
+    }
     assert!(
-        value["unimplemented_products"]
+        schema["unimplemented_products"]
             .as_array()
             .unwrap()
             .is_empty()
     );
+    assert_eq!(schema["commands"]["people"]["search"], true);
+    assert_eq!(schema["commands"]["people"]["contacts"]["create"], true);
+    assert_eq!(schema["commands"]["groups"]["update"], true);
+    assert_eq!(schema["commands"]["onedrive"]["delete"], true);
+    assert_eq!(schema["commands"]["loop"]["create"], false);
+    assert_eq!(schema["commands"]["org"]["delete"], false);
+    assert_eq!(schema["full_product_management"], false);
 }
 
 #[test]
-fn non_readonly_service_action_is_rejected_before_session_access() {
+fn product_management_commands_have_gates_and_validate_input_before_browser_access() {
+    for product in [vec!["people", "contacts"], vec!["onedrive"], vec!["groups"]] {
+        for verb in ["create", "update", "delete", "search"] {
+            moff()
+                .arg("outlook")
+                .args(&product)
+                .args([verb, "--help"])
+                .assert()
+                .success();
+        }
+        for args in [
+            vec!["create", "--body-file", "/not/read", "--confirm"],
+            vec![
+                "update",
+                "--id",
+                "fake",
+                "--body-file",
+                "/not/read",
+                "--confirm",
+            ],
+            vec!["delete", "--id", "fake", "--confirm"],
+        ] {
+            moff()
+                .arg("outlook")
+                .args(&product)
+                .args(args)
+                .assert()
+                .failure()
+                .stderr(contains("--allow-mutation"));
+        }
+        moff()
+            .args(["outlook", "--allow-mutation"])
+            .args(&product)
+            .args(["create", "--body-file", "/dev/stdin", "--confirm"])
+            .write_stdin(r#"{"owners@odata.bind":["bad"]}"#)
+            .assert()
+            .failure()
+            .stderr(contains("unsupported field").or(contains("accepts only")));
+    }
+    for verb in ["update", "delete"] {
+        moff()
+            .args(["outlook", "loop", verb, "--id", "fake", "--confirm"])
+            .args(if verb == "update" {
+                vec!["--body-file", "/not/read"]
+            } else {
+                vec![]
+            })
+            .assert()
+            .failure()
+            .stderr(contains("--allow-mutation"));
+    }
+    for verb in ["add-member", "remove-member"] {
+        moff()
+            .args([
+                "outlook",
+                "groups",
+                verb,
+                "--id",
+                "fake",
+                "--user",
+                "fake",
+                "--confirm",
+            ])
+            .assert()
+            .failure()
+            .stderr(contains("--allow-mutation"));
+    }
+    moff()
+        .args([
+            "outlook",
+            "--allow-mutation",
+            "onedrive",
+            "create",
+            "--file",
+            "/dev/null",
+            "--name",
+            "bad/name",
+            "--confirm",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("single path segments"));
+    moff()
+        .args([
+            "outlook",
+            "--allow-mutation",
+            "groups",
+            "create",
+            "--file",
+            "/not/read",
+            "--confirm",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("--file is only supported"));
+}
+
+#[test]
+fn read_escape_hatch_and_inputs_are_validated_before_browser_access() {
     moff()
         .args([
             "outlook",
@@ -230,186 +285,68 @@ fn non_readonly_service_action_is_rejected_before_session_access() {
             "--action",
             "SendItem",
             "--body-file",
-            "/not/read.json",
+            "/not/read",
         ])
         .assert()
         .failure()
-        .code(2)
         .stderr(contains("not a supported read operation"));
-}
-
-#[test]
-fn every_mutation_requires_confirmation_before_files_or_sessions() {
-    for product in ["mail", "calendar"] {
-        for operation in ["create", "update", "delete"] {
-            let mut args = vec!["outlook", product, operation];
-            if operation != "create" {
-                args.extend(["--id", "synthetic-item"]);
-            }
-            if operation != "delete" {
-                args.extend(["--body-file", "/not/read.json"]);
-            }
-            moff()
-                .env("HOME", "/definitely/missing/moff-contract-home")
-                .args(args)
-                .assert()
-                .failure()
-                .code(2)
-                .stderr(contains("--confirm"))
-                .stderr(contains("session export").not());
-        }
-    }
-}
-
-#[test]
-fn outlook_search_and_calendar_get_do_not_open_the_graph_export() {
-    let home = std::env::temp_dir().join(format!("moff-routing-{}", std::process::id()));
-    let config = home.join(".config/moff");
-    std::fs::create_dir_all(&config).unwrap();
-    std::fs::write(
-        config.join("graph-session.curl"),
-        "invalid synthetic export",
-    )
-    .unwrap();
     for args in [
-        vec!["outlook", "mail", "search", "--query", "synthetic"],
-        vec!["outlook", "calendar", "get", "--id", "synthetic-item"],
+        vec!["mail", "create", "--confirm", "--body-file", "/dev/stdin"],
+        vec![
+            "calendar",
+            "create",
+            "--folder-id",
+            "fake",
+            "--confirm",
+            "--body-file",
+            "/dev/stdin",
+        ],
     ] {
         moff()
-            .env("HOME", &home)
+            .args(["outlook", "--allow-mutation"])
             .args(args)
+            .write_stdin(r#"{"attendees":[]}"#)
             .assert()
             .failure()
-            .code(2)
-            .stderr(contains("session export could not be read"));
+            .stderr(contains("--body-file must contain only"));
     }
-    std::fs::remove_dir_all(home).unwrap();
-}
-
-#[test]
-fn schema_advertises_confirmed_crud_without_send() {
-    let output = moff()
-        .arg("schema")
+    moff()
+        .args([
+            "outlook",
+            "mail",
+            "mark",
+            "--id",
+            "fake",
+            "--read",
+            "--unread",
+            "--confirm",
+        ])
         .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let schema: Value = serde_json::from_slice(&output).unwrap();
-    for product in ["mail", "calendar"] {
-        for operation in ["list", "search", "get", "create", "update", "delete"] {
-            assert_eq!(schema["commands"][product][operation], true);
-        }
-    }
-    assert_eq!(schema["mutations"], true);
-    assert_eq!(schema["mutation_confirmation"], "--confirm");
-    assert_eq!(schema["commands"]["mail"]["send"], false);
-}
-
-#[test]
-fn calendar_listing_requires_an_explicit_folder_and_range() {
+        .failure()
+        .stderr(contains("cannot be used"));
     moff()
         .args(["outlook", "calendar", "list"])
         .assert()
         .failure()
-        .code(2)
         .stderr(contains("--folder-id"))
         .stderr(contains("--start"))
         .stderr(contains("--end"));
-}
-
-#[test]
-fn mail_search_rejects_invalid_limits_before_session_access() {
-    for limit in ["0", "101"] {
-        moff()
-            .args([
-                "outlook",
-                "mail",
-                "search",
-                "--query",
-                "synthetic",
-                "--limit",
-                limit,
-            ])
-            .assert()
-            .failure()
-            .code(2)
-            .stderr(contains("invalid value"))
-            .stderr(contains("session export").not());
-    }
-}
-
-#[test]
-fn arbitrary_graph_or_owa_payloads_are_rejected_before_session_access() {
-    for (args, input) in [
-        (
-            vec![
-                "outlook",
-                "mail",
-                "create",
-                "--confirm",
-                "--body-file",
-                "/dev/stdin",
-            ],
-            r#"{"subject":"synthetic","toRecipients":[]}"#,
-        ),
-        (
-            vec![
-                "outlook",
-                "calendar",
-                "create",
-                "--folder-id",
-                "synthetic-folder",
-                "--confirm",
-                "--body-file",
-                "/dev/stdin",
-            ],
-            r#"{"subject":"synthetic","attendees":[]}"#,
-        ),
-        (
-            vec![
-                "outlook",
-                "mail",
-                "update",
-                "--id",
-                "synthetic-item",
-                "--confirm",
-                "--body-file",
-                "/dev/stdin",
-            ],
-            r#"{"Body":{"MessageDisposition":"SendAndSaveCopy"}}"#,
-        ),
-    ] {
-        moff()
-            .env("HOME", "/definitely/missing/moff-contract-home")
-            .args(args)
-            .write_stdin(input)
-            .assert()
-            .failure()
-            .code(2)
-            .stderr(contains("--body-file must contain only"))
-            .stderr(contains("session export").not());
-    }
-}
-
-#[test]
-fn no_send_or_generic_write_command_is_exposed() {
+    moff()
+        .args([
+            "outlook", "mail", "search", "--query", "fake", "--limit", "101",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid value"));
     for args in [
-        vec!["outlook", "mail", "send", "--confirm"],
-        vec![
-            "outlook",
-            "service",
-            "write",
-            "--action",
-            "SendItem",
-            "--confirm",
-        ],
+        vec!["mail", "send", "--confirm"],
+        vec!["service", "write", "--action", "SendItem", "--confirm"],
     ] {
         moff()
+            .arg("outlook")
             .args(args)
             .assert()
             .failure()
-            .code(2)
             .stderr(contains("unrecognized subcommand"));
     }
 }

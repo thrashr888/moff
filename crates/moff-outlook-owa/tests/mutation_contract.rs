@@ -1,8 +1,8 @@
 use moff_outlook_owa::{
-    DraftInput, EventInput, GraphWebSession, OutlookWebSession, ReplyInput, batch_item_request,
-    categories_request, create_draft_request, create_event_request, delete_event_request,
-    delete_message_request, reply_draft_request, search_item_request, update_draft_request,
-    update_event_request,
+    DraftInput, EventInput, ReplyInput, batch_item_request, categories_request,
+    create_draft_request, create_event_request, delete_event_request, delete_message_request,
+    reply_draft_request, search_item_request, update_draft_request, update_event_request,
+    validate_read_action,
 };
 use serde_json::json;
 
@@ -26,7 +26,8 @@ fn draft_writes_use_observed_exchange_envelopes_and_never_send() {
     );
     assert_eq!(update["Body"]["MessageDisposition"], "SaveOnly");
     let delete = delete_message_request("synthetic-id", "synthetic-key").unwrap();
-    assert_eq!(delete["Body"]["DeleteType"], "HardDelete");
+    assert_eq!(delete["Body"]["DeleteType"], "MoveToDeletedItems");
+    assert_eq!(delete["Body"]["SendMeetingCancellations"], "SendToNone");
     assert_eq!(delete["Body"]["SuppressReadReceipts"], true);
 }
 
@@ -74,12 +75,10 @@ fn calendar_writes_use_distinct_observed_actions_and_single_event_scope() {
     assert_eq!(update["__type"], "UpdateCalendarEventJsonRequest:#Exchange");
     assert_eq!(update["Body"]["EventScope"], 0);
     assert_eq!(update["Body"]["ShouldSendUpdateToAttendees"], false);
-    let delete = delete_event_request("synthetic-id").unwrap();
-    assert_eq!(
-        delete["Body"]["__type"],
-        "DeleteCalendarEventRequest:#Exchange"
-    );
-    assert_eq!(delete["Body"]["EventScope"], 0);
+    let delete = delete_event_request("synthetic-id", "synthetic-key").unwrap();
+    assert_eq!(delete["Body"]["__type"], "DeleteItemRequest:#Exchange");
+    assert_eq!(delete["Body"]["DeleteType"], "MoveToDeletedItems");
+    assert_eq!(delete["Body"]["ItemIds"][0]["ChangeKey"], "synthetic-key");
 }
 
 #[test]
@@ -97,6 +96,7 @@ fn triage_builders_do_not_mark_read_send_or_replace_unrelated_fields() {
         "key",
         &ReplyInput {
             body: "<draft>".into(),
+            reply_all: false,
         },
     )
     .unwrap();
@@ -151,10 +151,7 @@ fn calendar_times_preserve_fractional_seconds_when_normalized() {
 }
 
 #[test]
-fn read_escape_hatch_stays_read_only_and_graph_cannot_access_outlook() {
-    let owa =
-        OutlookWebSession::from_curl_text("curl 'https://outlook.cloud.microsoft/owa/service.svc'")
-            .unwrap();
+fn read_escape_hatch_stays_read_only() {
     for action in [
         "CreateItem",
         "UpdateItem",
@@ -164,17 +161,6 @@ fn read_escape_hatch_stays_read_only_and_graph_cannot_access_outlook() {
         "DeleteCalendarEvent",
         "SendItem",
     ] {
-        assert!(owa.request_parts(action, &json!({})).is_err());
-    }
-    let graph =
-        GraphWebSession::from_curl_text("curl 'https://graph.microsoft.com/v1.0/organization'")
-            .unwrap();
-    for path in [
-        "/v1.0/me/messages",
-        "/v1.0/me/events",
-        "/v1.0/search/query",
-        "/v1.0/users/id/messages",
-    ] {
-        assert!(graph.request_parts(path).is_err());
+        assert!(validate_read_action(action).is_err());
     }
 }

@@ -28,5 +28,5 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: node --test crates/moff-outlook-owa/tests/safari_read.test.cjs
+      -       run: node --test crates/moff-outlook-owa/tests/safari_read.test.cjs crates/moff-outlook-owa/tests/safari_products.test.cjs
       - run: cargo audit

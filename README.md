@@ -1,14 +1,21 @@
 # Moff
 
-Moff is a personal **Outlook Web mail and calendar CLI**. It uses existing authenticated browser sessions: exported cURL requests, or an experimental Safari adapter backed by the Cider library. Moff does not register an Entra application, run its own OAuth flow, use Azure CLI, access Keychain, automate desktop Outlook, use OCR, or persist a separate token cache.
-
-The export is read only while Moff runs. It is never copied, logged, cached, or added to source control.
+Moff's goal is a personal **Microsoft 365 management CLI**: create, read, update,
+delete, list and search the content you own or can manage. Full product management
+is not finished; `moff schema` exposes supported operations and remaining gaps.
+It uses only Safari through the Cider library, with credentials remaining inside
+the authenticated browser tab. Moff does not register an Entra application, run
+its own OAuth flow, use Azure CLI, access Keychain, automate desktop Outlook, use
+OCR, or persist a separate token cache. Exported-cURL transports and `--session-curl`
+have been removed; existing credential files are never read or deleted.
 
 ## Implemented commands
 
 ```sh
 # Inspect the supported machine-readable surface.
 moff schema
+moff auth status
+moff auth refresh --confirm
 
 # List Inbox messages (the result includes opaque item IDs for `mail get`).
 moff outlook mail list --limit 25
@@ -20,11 +27,9 @@ moff outlook mail get --id '<opaque-item-id>'
 moff outlook mail list --folder drafts --limit 25 --offset 0
 moff outlook mail search --folder drafts --query 'temporary check'
 
-# All writes require --confirm. The JSON input shapes are described below.
-moff outlook mail create --body-file draft.json --confirm
-moff outlook mail update --id '<draft-id>' --body-file draft-update.json --confirm
-# WARNING: this permanently deletes the message/draft (HardDelete).
-moff outlook mail delete --id '<message-id>' --confirm
+# All mailbox writes require --allow-mutation and --confirm.
+moff outlook --allow-mutation mail create --body-file draft.json --confirm
+moff outlook --allow-mutation mail update --id '<draft-id>' --body-file draft-update.json --confirm
 
 # Get calendars, then query one calendar's time range.
 moff outlook calendar folders
@@ -39,24 +44,150 @@ moff outlook calendar search --folder-id '<calendar-folder-id>' \
   --start 2026-09-20T00:00:00Z --end 2026-09-21T00:00:00Z \
   --query 'temporary check'
 moff outlook calendar get --id '<event-id>'
-moff outlook calendar create --folder-id '<calendar-folder-id>' \
+moff outlook --allow-mutation calendar create --folder-id '<calendar-folder-id>' \
   --body-file event.json --confirm
-moff outlook calendar update --id '<event-id>' --body-file event-update.json --confirm
-moff outlook calendar delete --id '<event-id>' --confirm
+moff outlook --allow-mutation calendar update --id '<event-id>' --body-file event-update.json --confirm
+```
 
-# Browser-issued Graph session reads (uses ~/.config/moff/graph-session.curl).
+Mail, Calendar, and personal Contacts use only allowlisted, in-tab `POST /owa/service.svc?action=<Action>&app=Mail` requests. `outlook service read` remains read-only and cannot invoke mutation actions. People recommendations, Org, OneDrive, Groups, and Loop read metadata through allowlisted Graph GET requests executed inside the same Safari session.
+
+## Product metadata reads
+
+```sh
 moff outlook people search --limit 25
 moff outlook people get --user 'person@example.com'
 moff outlook org manager
 moff outlook org reports --user 'person@example.com'
 moff outlook onedrive list --limit 25
-moff outlook onedrive get --id '<opaque-drive-item-id>'
+moff outlook onedrive list --item-id '<folder-id>' --limit 25
+moff outlook onedrive get --id '<drive-item-id>'
 moff outlook groups list --limit 25
 moff outlook loop list --limit 25
-moff outlook loop get --id '<opaque-loop-drive-item-id>'
+moff outlook loop get --id '<loop-file-id>'
 ```
 
-Mail and Calendar use only allowlisted `POST /owa/service.svc?action=<Action>&app=Mail` requests. Graph is limited to GET requests for People, Org, OneDrive, Groups, and Loop; there are no Graph Mail/Calendar or Graph mutation command paths. `outlook service read` remains read-only and cannot invoke mutation actions.
+These commands ask Outlook's existing silent authentication helper for a Graph
+resource token and use it only within the browser page. They never export credentials,
+register an app, request new consent, or fall back to exported requests.
+Access is limited to the current browser account's permissions; 401/403 failures
+are explicit and do not trigger interactive consent or retries.
+
+Lists return one bounded Graph page, not a complete directory or drive inventory.
+`--limit` is a page-size request (1-100); filtering/permissions can yield fewer
+items, including an empty page with `@odata.nextLink`. Next links remain visible
+in the response but are not followed automatically by list commands. Product
+metadata searches follow same-origin, same-path continuation links for at most
+100 pages, stop at the requested result limit, and explicitly report incomplete
+results. Repeated/unsafe links and exhausted page budgets fail. Org relationships use the
+API's default page size. People `list` (and the legacy `search` without `--query`) lists relevant people;
+`people search --query 'Example'` searches recommendation metadata, while
+`org list|get|search` reads directory users. OneDrive reads metadata only, not file contents.
+
+Loop searches drive-backed `.loop` files, filters out other file types and exposes
+their metadata. `loop get` rejects a non-`.loop` item. This does not cover every
+Loop workspace/storage location, document contents or editing. Teams and
+SharePoint are not implemented.
+
+## Personal product management
+
+```sh
+moff outlook people contacts list --limit 25
+moff outlook people contacts get --id '<contact-id>'
+moff outlook people contacts search --query 'Example'
+moff outlook --allow-mutation people contacts create --body-file contact.json --confirm
+moff outlook --allow-mutation people contacts update --id '<contact-id>' --body-file contact-update.json --confirm
+moff outlook --allow-mutation people contacts delete --id '<contact-id>' --confirm
+
+moff outlook --allow-mutation onedrive create --body-file folder.json --confirm
+moff outlook --allow-mutation onedrive create --parent-id '<folder-id>' --body-file folder.json --confirm
+moff outlook --allow-mutation onedrive create --file small-file.bin --name 'small-file.bin' --confirm
+moff outlook --allow-mutation onedrive update --id '<file-id>' --file small-file.bin --confirm
+moff outlook onedrive get --id '<file-id>' --output downloaded-file.bin
+moff outlook onedrive search --query 'Project'
+moff outlook --allow-mutation onedrive update --id '<item-id>' --body-file item-update.json --confirm
+moff outlook --allow-mutation onedrive delete --id '<item-id>' --confirm
+
+moff outlook groups get --id '<group-id>'
+moff outlook groups search --query 'Project'
+moff outlook groups members --id '<group-id>'
+moff outlook --allow-mutation groups add-member --id '<group-id>' --user '<directory-user-id>' --confirm
+moff outlook --allow-mutation groups remove-member --id '<group-id>' --user '<directory-user-id>' --confirm
+moff outlook --allow-mutation groups create --body-file group.json --confirm
+moff outlook --allow-mutation groups update --id '<group-id>' --body-file group-update.json --confirm
+moff outlook --allow-mutation groups delete --id '<group-id>' --confirm
+
+moff outlook loop search --query 'Project'
+moff outlook --allow-mutation loop update --id '<loop-file-id>' --body-file item-update.json --confirm
+moff outlook --allow-mutation loop delete --id '<loop-file-id>' --confirm
+moff outlook --allow-mutation mail delete --id '<message-id>' --confirm
+moff outlook --allow-mutation calendar delete --id '<personal-appointment-id>' --confirm
+```
+
+People recommendations and directory users are not writable contacts.
+`people contacts` manages your default personal contacts folder through
+Outlook's OWA service, not the Graph directory. The Outlook Graph token does not
+grant contact permissions, but the in-page OWA adapter can manage these contacts
+without requesting new consent. Create/update read back and verify supplied
+fields; errors retain the contact ID when verification fails.
+
+Contact input uses Graph field names: `givenName`, `surname`, `displayName`,
+`companyName`, `jobTitle`, `department`, `officeLocation`, `mobilePhone`,
+`personalNotes`, `businessPhones`/`homePhones` (string arrays), and
+`emailAddresses` (objects with required `address` and optional `name`).
+Updates replace only supplied fields; use empty arrays to clear multi-value fields.
+Outlook contacts support three email slots and two business/home phone slots.
+Indexed updates leave other phone categories untouched. Contact IDs are native
+Outlook IDs, not directory IDs or Graph IDs.
+Unknown fields and invalid types are rejected before browser access.
+
+OneDrive JSON creation creates folders: `{"name":"Project"}`. `create --file`
+uploads a new binary file, optionally under `--parent-id`; a name collision fails
+rather than replacing another file. `update --file` replaces an existing file's
+content. Transfers are bounded to **128000 bytes**; larger files need a future
+streaming/upload-session adapter. `get --output` downloads to a new local file
+and refuses to overwrite an existing destination. Download credentials and
+authorization headers never leave the page or accompany the content fetch.
+
+JSON updates accept `name`, `description` and/or `parentReference:{"id":"<folder-id>"}`
+to move within your drive. Changes and recycling use the current
+entity tag to reject stale writes.
+Drive-backed Loop files support search, rename/description and recycling; renames
+must preserve `.loop`. Creating a placeholder `.loop` file would not create a
+valid Loop page, so Loop creation/content editing is not advertised.
+
+Group creation accepts `displayName`, `mailNickname`, optional `description` and
+`visibility` (`Private` or `Public`). It creates only Microsoft 365 groups, never
+security or dynamic groups. Updates accept `displayName`, `description` and
+`visibility`; update/delete and member addition/removal require verified
+current-user ownership. Membership changes target directory users only, never
+groups, devices, service principals or role assignments. Removing a member uses
+the membership `$ref` endpoint, not directory-user deletion. Dynamic/security
+groups are rejected. Graph delegated permissions still apply even for owners.
+
+Every write requires `--allow-mutation` and `--confirm`. Graph mutations return
+API acknowledgement rather than claiming read-back verification; 204 responses
+include `verified:false`. Ambiguous outcomes never retry. JSON write inputs are
+limited to 200000 bytes. Preauthenticated file download URLs are stripped inside
+the page before responses leave Safari.
+
+Org manager/reporting data stays read-only: changing directory accounts and
+reporting relationships is tenant administration, outside the selected personal
+scope. Full Loop workspace/content management needs its own browser adapter;
+the OneDrive API is not a substitute.
+
+Live Loop investigation confirmed that `/recommended/api/v1.1/loop/recent`
+on `substrate.office.com` can return native workspace/page metadata using
+browser-owned authentication. It is not a complete workspace CRUD contract:
+recent-item IDs did not work directly with the workspace lookup endpoint, and
+page contents use Fluid data stores. These native APIs are not exposed by Moff
+yet. Loop's workspace-delete UI warns of permanent deletion, unlike OneDrive
+recycling; those operations must not be conflated.
+
+Embedded Loop runs in a cross-origin Outlook iframe. Cider currently evaluates
+the top-level document, so inspecting that embedded runtime needs frame-targeting
+support; a signed-in standalone Loop tab provides a workaround for investigation.
+Files larger than the current transfer bound also need a streaming/chunked
+transport follow-up before Moff can support them reliably.
 
 ## Mutation inputs and safety
 
@@ -72,17 +203,15 @@ Event creation requires `subject`, `start`, and `end`, with an optional plain-te
 {"subject":"Temporary check","body":"Personal appointment","start":"2026-09-20T12:00:00Z","end":"2026-09-20T13:00:00Z"}
 ```
 
-Unknown JSON fields are rejected, including recipients, attendees, recurrence, and raw Graph/OWA request envelopes. Draft updates verify that the message is still a draft and include its current change key. Mail deletion uses the observed **HardDelete** contract and is limited to ordinary messages/drafts, not meeting messages.
+Unknown JSON fields are rejected, including recipients, attendees, recurrence, and raw Graph/OWA request envelopes. Draft updates verify that the message is still a draft and include its current change key. Mail/calendar deletion moves a single versioned item to Deleted Items; permanent deletion and cancellation notifications are prohibited.
 
-Calendar writes are limited to **single, organizer-owned appointments without attendees**. Creation sends no invitations and disables reminders. Updates and deletion reject meetings, attendee/resource lists, and recurring events. Calendar deletion moves an appointment to Deleted Items; an immutable item ID may remain readable there after removal from its original calendar.
+Calendar writes are limited to **single, organizer-owned appointments without attendees**. Creation sends no invitations and disables reminders. Updates reject meetings, attendee/resource lists, and recurring events.
 
 There is **no send command**. Moff never automatically retries requests or follows redirects. An ambiguous mutation result reports that its outcome is unknown: inspect the source folder/calendar before deciding what to do, rather than repeating the mutation.
 
 Mail folders are `inbox`, `drafts`, `sentitems`, `deleteditems`, `archive`, `junkemail`, and `outbox`. Search is case-insensitive literal matching, not AQS or Graph search. Mail search scans successive pages in the chosen folder and reads bodies as needed; its limit bounds matches, not the number of requests. Calendar search is scoped to the supplied calendar range. Search results use `value.items`, `value.count`, and `value.has_more`; other operations retain the OWA response envelope. Truncated bodies are not silently treated as non-matches.
 
-## Session export
-
-### Experimental Safari transport
+## Safari session
 
 ```sh
 moff outlook --safari mail list --limit 5
@@ -97,17 +226,41 @@ moff outlook --safari --safari-window 1 --safari-tab 1 mail list
 Open and sign into Outlook Mail or Calendar in Safari first. Enable Safari
 Automation for the launching app and **Allow JavaScript from Apple Events**.
 Moff links Cider directly; an installed `cider` executable is not required.
-The dependency is pinned to the Cider 0.11.0 source revision containing the Safari
+Safari is the default and only transport; the former `--safari` flag remains a hidden
+compatibility no-op for existing scripts. The dependency is pinned to the Cider 0.11.0 source revision containing the Safari
 library APIs; it does not track Cider's default branch.
 
 Safari mode supports Mail/Calendar reads, batch reads and searches. Typed, non-sending
 writes require both `--allow-mutation` (next to `--safari`) and the operation's
-`--confirm`. Deletion remains unavailable in Safari, even with both flags.
-Graph products still require their cURL export.
+`--confirm`. Deletion is restricted to the recycle operations described above;
+calendar deletion still rejects meetings and recurring events.
 Credentials stay in the tab: Moff calls Outlook's silent authentication helper and
 performs the OWA request there, returning only response data. It never exports or
-stores a token. Session expiry requires signing in again in Safari; cached visible
-messages alone do not establish a valid session.
+stores a token. Cached visible messages alone do not establish a valid session.
+For an expired session, explicitly refresh the selected Outlook tab and let the
+browser reuse Microsoft SSO:
+
+```sh
+moff auth refresh --confirm --wait-seconds 60
+moff auth status
+```
+
+This reloads Outlook once, then checks silent authentication without reading mail.
+Complete any account-selection, password, consent, or 2FA steps yourself in Safari.
+It never clicks sign-in controls, approves MFA, or stores credentials. It returns
+`state: authenticated` only after silent token acquisition succeeds; otherwise
+`complete: false` and exit 2 mean recovery was not verified within the wait period.
+No failed mailbox operation is retried. Finish sign-in before rerunning it.
+Do not invoke refresh while entering credentials or editing an unsaved draft.
+Selection requires a loaded Outlook Mail/Calendar tab; a tab already on Microsoft's
+login page needs your intervention first. A non-secret, tab-scoped sessionStorage
+marker identifies the refreshed document across redirects/reordering in its original
+window; moving/closing the tab or clearing browser storage prevents verification.
+The marker is removed on success and otherwise expires when the tab closes.
+SSO may change Outlook origins or clear sessionStorage; Moff then cannot prove
+which new document belongs to the refresh and reports unverified recovery.
+After your clicks, `moff auth status` independently checks the selected Outlook
+document without another refresh. The `moff outlook auth` spelling is also supported.
 
 Mail reads use `FindItem`/`GetItem` without selecting a message in Outlook's
 reading pane or issuing `IsRead` updates. A live before/after check of 19 reviewed
@@ -119,8 +272,8 @@ This adapter depends on private Outlook webpack module contracts observed in the
 current web app, not a supported Microsoft API. An Outlook update can break it;
 failures are reported rather than silently falling back to scraped UI or another
 account. Responses are limited to 900 KB; oversized data is rejected, not truncated
-into a successful result. Use a smaller page or calendar range. Automatic sign-in
-and MFA handling are not implemented.
+into a successful result. Use a smaller page or calendar range. Browser SSO recovery
+is supported; interactive sign-in and MFA remain user-controlled.
 
 ## Mail triage and reply drafts
 
@@ -135,7 +288,7 @@ moff outlook --safari --allow-mutation mail categories \
 moff outlook --safari --allow-mutation mail categories \
   --id '<message-id>' --remove 'Needs Response' --confirm
 
-# reply.json contains only {"body":"Reply text"}.
+# reply.json contains {"body":"Reply text"}; add "reply_all":true to keep thread recipients.
 moff outlook --safari --allow-mutation mail reply-draft \
   --id '<source-message-id>' --body-file reply.json --confirm
 ```
@@ -143,9 +296,17 @@ moff outlook --safari --allow-mutation mail reply-draft \
 Categories use the current change key with `NeverOverwrite`; adding an existing
 category is a no-op. Replies use Exchange `ReplyToItem` and `SaveOnly`, preserving
 native reply-to-sender threading without manually copying recipients. Moff verifies
-that the saved item is still a draft and the source read flag is unchanged. This
-is not reply-all and does not send mail. The reply-draft contract has deterministic
-coverage but has not yet been validated by saving a draft in a live mailbox.
+that the saved item is still a draft and preserves the source read flag.
+Live Outlook reply creation marks unread source messages read even with `SaveOnly`;
+Moff restores the original unread flag using a narrow, verified `IsRead` update
+with read receipts suppressed. This is compensating, not atomic: a concurrent
+manual read-state change cannot be distinguished from Outlook's reply side effect.
+Replies are sender-only by default; `"reply_all":true` uses native reply-all recipients.
+Both modes save to Outlook Drafts and never send. Live saves and recipient/read-state
+checks have now been verified. If verification fails, the error includes the created
+draft ID and source ID; inspect those items rather than creating another draft.
+An explicit `mail mark --id '<id>' --unread --confirm` (with `--allow-mutation`
+in Safari) can restore a known affected source message.
 Triage decisions and reply text remain caller-supplied, not an embedded AI service.
 
 ## Availability and work blocks
@@ -214,27 +375,13 @@ Pre-dispatch failures are distinguished from unknown write outcomes; cancellatio
 metadata never claims that a server write was rolled back. A full native durable
 tab ID is still not exposed by Safari Apple Events.
 
-Full regular-tab HTTP history and automated sign-in remain separate, unresolved
-capabilities. Moff never silently retries writes or bypasses authentication prompts.
-
-## cURL exports
-
-Keep both files local and owner-readable only. They contain browser credentials and must never be committed, logged, or pasted into chat.
-
-| Session file | Browser capture source | Used for |
-| --- | --- | --- |
-| `~/.config/moff/outlook-session.curl` | An authenticated Outlook Web `https://outlook.office.com/owa/service.svc` or `https://outlook.cloud.microsoft/owa/service.svc` request | Mail and Calendar |
-| `~/.config/moff/graph-session.curl` | An authenticated `https://graph.microsoft.com/v1.0/...` request issued by Outlook, Loop, or Microsoft 365 in the browser | People, Org Explorer, OneDrive, Groups, and Loop |
-
-For either file, use DevTools Network on an authenticated browser page and save **Copy as cURL** directly to the shown path. `--session-curl PATH` remains available as a temporary override.
-
-Moff extracts the required browser request headers in memory. The Outlook session replaces stale action/body framing, including `x-owa-urlpostdata`, with the command-specific OWA JSON request. It accepts inline `-b`/`--cookie` values but does not load cookie files. The Graph session strips stale request-body headers and permits only product-read paths. This is still the same browser-session provider: no Moff OAuth application, Entra registration, Azure CLI, or Moff token cache is involved.
-
-Moff checks that export files are `0600` and their containing directories are `0700` on Unix. HTTP 401 means the export must be refreshed from the authenticated browser, not printed or retried with another authentication provider.
+Full regular-tab HTTP history remains unresolved. SSO refresh recovery does not
+automate interactive sign-in. Moff never silently retries writes or bypasses
+authentication prompts.
 
 ## Request-contract sources
 
-- **Outlook Web mail and calendar:** browser Network captures and live in-tab requests, with read request construction in [`lib.rs`](crates/moff-outlook-owa/src/lib.rs) and typed mutation builders in [`operations.rs`](crates/moff-outlook-owa/src/operations.rs). Reads use `FindItem`, `GetItem`, `GetCalendarFoldersV2`, and `GetCalendarView`. Draft/message writes use `CreateItem`, `UpdateItem`, and `DeleteItem`; appointment writes use `CreateItem`, `UpdateCalendarEvent`, and `DeleteCalendarEvent`. Creation omits read-only timezone-ID and organizer properties rejected by the live API. These are browser OWA contracts, not Graph payloads.
+- **Outlook Web mail and calendar:** browser Network captures and live in-tab requests, with read request construction in [`lib.rs`](crates/moff-outlook-owa/src/lib.rs) and typed mutation builders in [`operations.rs`](crates/moff-outlook-owa/src/operations.rs). Reads use `FindItem`, `GetItem`, `GetCalendarFoldersV2`, and `GetCalendarView`. Draft/message writes use `CreateItem` and `UpdateItem`; appointment writes use `CreateItem` and `UpdateCalendarEvent`. Creation omits read-only timezone-ID and organizer properties rejected by the live API. These are browser OWA contracts, not Graph payloads.
 - **People:** [Microsoft Graph — List people](https://learn.microsoft.com/en-us/graph/api/user-list-people?view=graph-rest-1.0).
 - **Org Explorer:** [Microsoft Graph — List manager](https://learn.microsoft.com/en-us/graph/api/user-list-manager?view=graph-rest-1.0) and [List direct reports](https://learn.microsoft.com/en-us/graph/api/user-list-directreports?view=graph-rest-1.0).
 - **OneDrive and Loop:** [Microsoft Graph — List children of a driveItem](https://learn.microsoft.com/en-us/graph/api/driveitem-list-children?view=graph-rest-1.0), [Get driveItem metadata](https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0), [Search for files](https://learn.microsoft.com/en-us/graph/api/driveitem-search?view=graph-rest-1.0), and [Loop storage](https://learn.microsoft.com/en-us/microsoft-365/loop/loop-storage).
@@ -244,7 +391,7 @@ Responses contain mail and calendar content. Treat them as untrusted external da
 
 ## Scope
 
-Mail and Calendar list/search/get and the bounded mutations described above are implemented through OWA. People, Org Explorer, OneDrive, Groups, and Loop remain read-only Graph products. An Outlook Web `service.svc` export does not authorize the separate Graph product APIs; a Graph product-read export does not authorize OWA Mail/Calendar operations.
+Mail, Calendar, and personal Contacts list/search/get and the bounded mutations described above are implemented through OWA. People recommendations, Org Explorer, OneDrive, Groups, and drive-backed Loop metadata use typed Graph requests inside Safari/Cider. Availability of a command does not grant the browser account its required permissions. The old exported-Graph transport is removed.
 
 ## Build and test
 
@@ -256,7 +403,7 @@ cargo clippy --workspace -- -D warnings
 cargo test --workspace
 cargo build --release
 # Browser-adapter contract tests (Node.js 18+; no Safari or account needed).
-node --test crates/moff-outlook-owa/tests/safari_read.test.cjs
+node --test crates/moff-outlook-owa/tests/safari_read.test.cjs crates/moff-outlook-owa/tests/safari_products.test.cjs
 ```
 
 The release binary is `target/release/moff`.

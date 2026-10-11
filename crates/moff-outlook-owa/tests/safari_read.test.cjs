@@ -3,6 +3,8 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 const source = fs.readFileSync(require("node:path").join(__dirname, "../src/safari_read.js"), "utf8");
+const authSource = fs.readFileSync(require("node:path").join(__dirname, "../src/safari_auth.js"), "utf8");
+const responseSource = fs.readFileSync(require("node:path").join(__dirname, "../src/safari_response.js"), "utf8");
 
 function fixture(options = {}) {
     const requests = [];
@@ -16,14 +18,22 @@ function fixture(options = {}) {
     chunks.push = function (entry) { entry[2](runtime); return Array.prototype.push.call(this, entry); };
     const context = {
         location: {origin: options.origin || "https://outlook.office.com"},
-        window: {webpackChunkOwa: chunks}, crypto: {randomUUID: () => "test"},
+        window: {webpackChunkOwa: options.unloaded ? undefined : chunks}, crypto: {randomUUID: () => "test"},
+        sessionStorage: {
+            getItem: () => options.marker || null,
+            removeItem: () => {},
+        },
         AbortController, setTimeout, clearTimeout, TextDecoder,
         fetch: async (url, init) => {
             requests.push({url, init});
-            return new Response(options.oversized ? "x".repeat(900001) : '{"Body":{"ResponseCode":"NoError"}}');
+            return new Response(options.oversized ? "x".repeat(900001) : '{"Body":{"ResponseCode":"NoError"}}',
+                {status: options.status || 200});
         },
     };
-    return {call: vm.runInNewContext(`(${source})`, context), requests, chunks};
+    const read = vm.runInNewContext(`(${source})`, context);
+    const auth = vm.runInNewContext(`(${authSource})`, context);
+    const response = vm.runInNewContext(`(${responseSource})`, context);
+    return {call: config => read(config, auth, response), requests, chunks};
 }
 
 test("read authenticates inside page and returns no credential", async () => {
@@ -34,6 +44,54 @@ test("read authenticates inside page and returns no credential", async () => {
     assert.equal(f.requests[0].init.redirect, "error");
     assert.equal(f.chunks.length, 0);
     assert.ok(!JSON.stringify(result).includes("test-secret"));
+});
+
+test("SSO probe requires the recovery marker and exports only status, never credentials", async () => {
+    for (const [options, status] of [
+        [{}, 409],
+        [{marker:"different"}, 409],
+        [{marker:"recovery",expired:true}, 401],
+        [{marker:"recovery"}, 200],
+        [{marker:"recovery",unloaded:true}, 425],
+    ]) {
+        const f = fixture(options);
+        const result = await f.call({action:"__MoffAuthStatus",recovery_marker:"recovery"});
+        assert.deepEqual(JSON.parse(JSON.stringify(result)), {status});
+        assert.equal(f.requests.length, 0);
+        assert.ok(!JSON.stringify(result).includes("test-secret"));
+    }
+    const f = fixture({marker:"recovery",changed:true});
+    assert.equal((await f.call({action:"__MoffAuthStatus",recovery_marker:"recovery"})).status, 422);
+});
+
+test("standalone auth status is silent and failed mailbox requests are not retried", async () => {
+    const status = fixture();
+    assert.equal((await status.call({action:"__MoffAuthStatus"})).status, 200);
+    assert.equal(status.requests.length, 0);
+    const failure = fixture({status:500});
+    assert.equal((await failure.call({action:"FindItem",body:{}})).status, 500);
+    assert.equal(failure.requests.length, 1);
+});
+
+test("refresh stores only a non-secret marker and schedules one reload without login UI interaction", () => {
+    const refreshSource = fs.readFileSync(require("node:path").join(__dirname, "../src/safari_refresh.js"), "utf8");
+    const stored = [], timers = [];
+    let reloads = 0;
+    const context = {
+        location: {origin:"https://outlook.office.com", reload: () => { reloads++; }},
+        sessionStorage: {setItem: (...args) => stored.push(args)},
+        setTimeout: (callback, delay) => timers.push({callback, delay}),
+    };
+    const refresh = vm.runInNewContext(`(${refreshSource})`, context);
+    assert.equal(refresh("marker").scheduled, true);
+    assert.deepEqual(stored, [["__moff_auth_recovery", "marker"]]);
+    assert.equal(reloads, 0);
+    assert.equal(timers.length, 1);
+    timers[0].callback();
+    assert.equal(reloads, 1);
+    context.location.origin = "https://login.microsoftonline.com";
+    assert.throws(() => refresh("marker"), /HTTPS Outlook/);
+    assert.equal(timers.length, 1);
 });
 test("rejects writes and foreign origins before fetching", async () => {
     for (const options of [{}, {origin: "https://example.com"}]) {
@@ -68,4 +126,25 @@ test("typed writes require gate, save-only disposition and supported actions", a
             Items:[{__type:"ReplyToItem:#Exchange"}]}}});
     assert.equal(result.status,200);
     assert.ok(!JSON.stringify(result).includes("test-secret"));
+    const contact = fixture();
+    assert.equal((await contact.call({action:"CreateItem",mutation:true,allow_mutation:true,
+        body:{Body:{__type:"CreateItemRequest:#Exchange",MessageDisposition:"SaveOnly",
+            SavedItemFolderId:{BaseFolderId:{Id:"contacts"}},Items:[{__type:"Contact:#Exchange",GivenName:"Synthetic"}]}}})).status,200);
+    await assert.rejects(fixture().call({action:"CreateItem",mutation:true,allow_mutation:true,
+        body:{Body:{__type:"CreateItemRequest:#Exchange",MessageDisposition:"SaveOnly",
+            SavedItemFolderId:{BaseFolderId:{Id:"inbox"}},Items:[{__type:"Contact:#Exchange"}]}}}));
+});
+
+test("recycle operations require one versioned item and prohibit permanent deletion or notifications", async () => {
+    const body = {Body:{__type:"DeleteItemRequest:#Exchange",DeleteType:"MoveToDeletedItems",
+        SendMeetingCancellations:"SendToNone",SuppressReadReceipts:true,
+        ItemIds:[{Id:"synthetic",ChangeKey:"key"}]}};
+    const f = fixture();
+    assert.equal((await f.call({action:"DeleteItem",mutation:true,allow_mutation:true,body})).status,200);
+    for (const change of [{DeleteType:"HardDelete"},{SendMeetingCancellations:"SendToAll"},
+        {SuppressReadReceipts:false},{ItemIds:[{Id:"synthetic"}]}]) {
+        const f = fixture();
+        await assert.rejects(f.call({action:"DeleteItem",mutation:true,allow_mutation:true,body:{Body:{...body.Body,...change}}}));
+        assert.equal(f.requests.length,0);
+    }
 });
