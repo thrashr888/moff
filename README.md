@@ -107,6 +107,12 @@ performs the OWA request there, returning only response data. It never exports o
 stores a token. Session expiry requires signing in again in Safari; cached visible
 messages alone do not establish a valid session.
 
+Mail reads use `FindItem`/`GetItem` without selecting a message in Outlook's
+reading pane or issuing `IsRead` updates. A live before/after check of 19 reviewed
+messages preserved every read/unread flag. Opening messages manually in Outlook
+can still mark them read under your reading-pane settings; Moff does not change
+those settings or restore previously changed flags.
+
 This adapter depends on private Outlook webpack module contracts observed in the
 current web app, not a supported Microsoft API. An Outlook update can break it;
 failures are reported rather than silently falling back to scraped UI or another
