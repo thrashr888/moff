@@ -173,8 +173,75 @@ fn schema_is_honest_about_unavailable_products_and_safe_writes() {
     assert_eq!(schema["commands"]["groups"]["update"], true);
     assert_eq!(schema["commands"]["onedrive"]["delete"], true);
     assert_eq!(schema["commands"]["loop"]["create"], false);
+    assert_eq!(schema["commands"]["loop"]["workspace"]["create"], true);
+    assert_eq!(schema["commands"]["loop"]["workspace"]["update"], false);
+    assert_eq!(schema["commands"]["loop"]["workspace"]["title"], false);
+    assert_eq!(schema["product_writes"]["max_file_bytes"], 250_000_000);
     assert_eq!(schema["commands"]["org"]["delete"], false);
     assert_eq!(schema["full_product_management"], false);
+}
+
+#[test]
+fn native_workspaces_have_aliases_and_permanent_delete_gates() {
+    for prefix in [vec!["loop"], vec!["outlook", "loop"]] {
+        for verb in ["list", "get", "create", "delete", "search"] {
+            moff()
+                .args(&prefix)
+                .args(["workspace", verb, "--help"])
+                .assert()
+                .success();
+        }
+        moff()
+            .args(&prefix)
+            .args(["workspace", "create", "--confirm"])
+            .assert()
+            .failure()
+            .stderr(contains("--allow-mutation"));
+        moff()
+            .args(&prefix)
+            .args(["workspace", "delete", "--id", "fake", "--confirm"])
+            .assert()
+            .failure()
+            .stderr(contains("--allow-mutation"));
+        moff()
+            .args(&prefix)
+            .args(["workspace", "delete", "--id", "fake"])
+            .assert()
+            .failure()
+            .stderr(contains("--confirm"));
+        moff()
+            .args(&prefix)
+            .args(["workspace", "update"])
+            .assert()
+            .failure()
+            .stderr(contains("unrecognized subcommand"));
+        moff()
+            .args(&prefix)
+            .args(["workspace", "create", "--title", "Test", "--confirm"])
+            .assert()
+            .failure()
+            .stderr(contains("unexpected argument"));
+    }
+    for verb in ["create", "update", "get"] {
+        moff()
+            .args(["outlook", "onedrive", verb, "--help"])
+            .assert()
+            .success()
+            .stdout(contains("--max-bytes"));
+    }
+    moff()
+        .args([
+            "outlook",
+            "onedrive",
+            "get",
+            "--id",
+            "fake",
+            "--max-bytes",
+            "250000001",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid value"));
 }
 
 #[test]

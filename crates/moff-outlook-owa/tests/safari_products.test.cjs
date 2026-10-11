@@ -82,33 +82,14 @@ test("invalid and unconfirmed product writes never authenticate or fetch", async
 });
 
 test("preauthenticated download URLs never leave the browser response", async () => {
-    const f = fixture({body:JSON.stringify({value:[{id:"test","@microsoft.graph.downloadUrl":"https://download.example/secret"}]})});
+    const f = fixture({body:JSON.stringify({value:[{id:"test","@microsoft.graph.downloadUrl":"https://download.example/secret","@microsoft.graph.downloadUrlNoAuth":"https://download.example/other"}]})});
     const result = await f.call("https://graph.microsoft.com/v1.0/me/drive/root/children");
     assert.ok(!result.body.includes("downloadUrl"));
     assert.ok(!result.body.includes("secret"));
 });
 
-test("bounded binary transfers preserve bytes and never export or reuse download credentials", async () => {
-    const upload = fixture();
-    await upload.call("https://graph.microsoft.com/v1.0/me/drive/root:/test.bin:/content?@microsoft.graph.conflictBehavior=fail",
-        {method:"PUT",bytes:[0,255,128],allow_mutation:true});
-    assert.deepEqual(Array.from(upload.requests[0].init.body),[0,255,128]);
-    assert.equal(upload.requests[0].init.headers["content-type"],"application/octet-stream");
-    const metadata = {id:"test",file:{},size:3,"@microsoft.graph.downloadUrl":"https://tenant.sharepoint.com/download?secret=test"};
-    const download = fixture({body:JSON.stringify(metadata),downloadBytes:[0,255,128]});
-    const result = await download.call("https://graph.microsoft.com/v1.0/me/drive/items/test",{download:true});
-    assert.deepEqual(JSON.parse(result.body).bytes,[0,255,128]);
-    assert.equal(download.requests[1].init.credentials,"omit");
-    assert.equal(download.requests[1].init.headers,undefined);
-    assert.ok(!JSON.stringify(result).includes("secret"));
-    for (const url of ["http://tenant.sharepoint.com/download","https://evil.example/download"]) {
-        const f = fixture({body:JSON.stringify({...metadata,"@microsoft.graph.downloadUrl":url})});
-        await assert.rejects(f.call("https://graph.microsoft.com/v1.0/me/drive/items/test",{download:true}));
-        assert.equal(f.requests.length,1);
-    }
-    const tooLarge = fixture({body:JSON.stringify({...metadata,size:128001})});
-    await assert.rejects(tooLarge.call("https://graph.microsoft.com/v1.0/me/drive/items/test",{download:true}));
-    assert.equal(tooLarge.requests.length,1);
+test("single-shot transfers are refused in favor of the streamed adapter", async () => {
+    await assert.rejects(fixture().call("https://graph.microsoft.com/v1.0/me/drive/items/test",{download:true}));
     await assert.rejects(fixture().call("https://graph.microsoft.com/v1.0/me/drive/items/test/content",
         {method:"PUT",bytes:[256],etag:"etag",allow_mutation:true}));
     await assert.rejects(fixture().call("https://graph.microsoft.com/v1.0/me/drive/root:/test.bin:/content",

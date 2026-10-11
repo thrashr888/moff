@@ -1,6 +1,6 @@
 async function(resource) {
     if (!["https://outlook.office.com", "https://outlook.cloud.microsoft"].includes(location.origin)
-        || ![location.origin, "https://graph.microsoft.com"].includes(resource)) {
+        || ![location.origin, "https://graph.microsoft.com", "https://substrate.office.com"].includes(resource)) {
         throw new Error("Unsupported browser authentication resource");
     }
     if (!window.webpackChunkOwa) return {status: 425};

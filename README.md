@@ -49,7 +49,7 @@ moff outlook --allow-mutation calendar create --folder-id '<calendar-folder-id>'
 moff outlook --allow-mutation calendar update --id '<event-id>' --body-file event-update.json --confirm
 ```
 
-Mail, Calendar, and personal Contacts use only allowlisted, in-tab `POST /owa/service.svc?action=<Action>&app=Mail` requests. `outlook service read` remains read-only and cannot invoke mutation actions. People recommendations, Org, OneDrive, Groups, and Loop read metadata through allowlisted Graph GET requests executed inside the same Safari session.
+Mail, Calendar, and personal Contacts use only allowlisted, in-tab `POST /owa/service.svc?action=<Action>&app=Mail` requests. `outlook service read` remains read-only and cannot invoke mutation actions. People recommendations, Org, OneDrive, Groups, and drive-backed Loop files read metadata through allowlisted Graph GET requests executed inside the same Safari session. Native Loop workspaces use a separate in-page Substrate adapter.
 
 ## Product metadata reads
 
@@ -64,6 +64,9 @@ moff outlook onedrive get --id '<drive-item-id>'
 moff outlook groups list --limit 25
 moff outlook loop list --limit 25
 moff outlook loop get --id '<loop-file-id>'
+moff loop workspace list --limit 25
+moff loop workspace get --id '<base64-pod-id>'
+moff loop workspace search 'Project'
 ```
 
 These commands ask Outlook's existing silent authentication helper for a Graph
@@ -81,12 +84,18 @@ metadata searches follow same-origin, same-path continuation links for at most
 results. Repeated/unsafe links and exhausted page budgets fail. Org relationships use the
 API's default page size. People `list` (and the legacy `search` without `--query`) lists relevant people;
 `people search --query 'Example'` searches recommendation metadata, while
-`org list|get|search` reads directory users. OneDrive reads metadata only, not file contents.
+`org list|get|search` reads directory users. OneDrive `get` reads metadata unless
+`--output` is supplied to stream file contents to disk.
 
 Loop searches drive-backed `.loop` files, filters out other file types and exposes
 their metadata. `loop get` rejects a non-`.loop` item. This does not cover every
-Loop workspace/storage location, document contents or editing. Teams and
-SharePoint are not implemented.
+Loop workspace/storage location, document contents or editing. Native
+`loop workspace` commands are separate: list/search return **recent workspaces**,
+not a complete inventory, and explicitly report `is_complete`. Workspace `id`
+is the base64 **PodId** from `mfs_info.pod_id`, not a recent `SPO_...` ID or Graph
+`b!...` drive ID. `source_id` preserves the API's original identifier.
+`moff outlook loop workspace ...` is an alias for `moff loop workspace ...`.
+Teams and general SharePoint management are not implemented.
 
 ## Personal product management
 
@@ -100,9 +109,9 @@ moff outlook --allow-mutation people contacts delete --id '<contact-id>' --confi
 
 moff outlook --allow-mutation onedrive create --body-file folder.json --confirm
 moff outlook --allow-mutation onedrive create --parent-id '<folder-id>' --body-file folder.json --confirm
-moff outlook --allow-mutation onedrive create --file small-file.bin --name 'small-file.bin' --confirm
-moff outlook --allow-mutation onedrive update --id '<file-id>' --file small-file.bin --confirm
-moff outlook onedrive get --id '<file-id>' --output downloaded-file.bin
+moff outlook --allow-mutation onedrive create --file file.bin --name 'file.bin' --max-bytes 250000000 --confirm
+moff outlook --allow-mutation onedrive update --id '<file-id>' --file file.bin --confirm
+moff outlook onedrive get --id '<file-id>' --output downloaded-file.bin --max-bytes 250000000
 moff outlook onedrive search --query 'Project'
 moff outlook --allow-mutation onedrive update --id '<item-id>' --body-file item-update.json --confirm
 moff outlook --allow-mutation onedrive delete --id '<item-id>' --confirm
@@ -119,6 +128,9 @@ moff outlook --allow-mutation groups delete --id '<group-id>' --confirm
 moff outlook loop search --query 'Project'
 moff outlook --allow-mutation loop update --id '<loop-file-id>' --body-file item-update.json --confirm
 moff outlook --allow-mutation loop delete --id '<loop-file-id>' --confirm
+moff loop --allow-mutation workspace create --confirm
+# PERMANENT, Owner-only deletion: not the drive-file recycle command above.
+moff loop --allow-mutation workspace delete --id '<base64-pod-id>' --confirm
 moff outlook --allow-mutation mail delete --id '<message-id>' --confirm
 moff outlook --allow-mutation calendar delete --id '<personal-appointment-id>' --confirm
 ```
@@ -143,17 +155,30 @@ Unknown fields and invalid types are rejected before browser access.
 OneDrive JSON creation creates folders: `{"name":"Project"}`. `create --file`
 uploads a new binary file, optionally under `--parent-id`; a name collision fails
 rather than replacing another file. `update --file` replaces an existing file's
-content. Transfers are bounded to **128000 bytes**; larger files need a future
-streaming/upload-session adapter. `get --output` downloads to a new local file
-and refuses to overwrite an existing destination. Download credentials and
-authorization headers never leave the page or accompany the content fetch.
+content. Cider v0.12.0 transports **128000-byte chunks**, not whole files.
+`--max-bytes` defaults to **250000000 bytes (250 MB)** and can be lowered
+to any value from 1 to 250000000. Downloads stream directly to a new local file,
+validate the final length against Graph's item size, and refuse to overwrite an
+existing destination; failures may leave a partial file at the reported path.
+Uploads use Graph upload sessions with separately bounded 320 KiB-aligned
+service ranges. Files are never buffered in full. Download credentials,
+upload-session URLs, and tokens remain inside the pinned Outlook document.
+Ambiguous failures never retry; inspect OneDrive before repeating a write.
 
 JSON updates accept `name`, `description` and/or `parentReference:{"id":"<folder-id>"}`
 to move within your drive. Changes and recycling use the current
 entity tag to reject stale writes.
 Drive-backed Loop files support search, rename/description and recycling; renames
 must preserve `.loop`. Creating a placeholder `.loop` file would not create a
-valid Loop page, so Loop creation/content editing is not advertised.
+valid Loop page. Native workspace creation instead creates a tenant-owned
+container and derives its PodId from the returned SharePoint site, Graph drive
+and root item. The new container's title is a GUID and it may not appear in recent
+results. **Naming/renaming workspaces, creating pages and editing Fluid content
+are not supported**; a `--title` follow-up needs a separate pod/Fluid adapter.
+There is no workspace update command. Workspace deletion is **permanent**,
+requires `--allow-mutation --confirm`, checks the current user's Owner role
+before dispatch, and verifies that workspace GET returns 404 afterward.
+Pass `--mru-id '<guid>'` if a recent-list MRU identifier is known.
 
 Group creation accepts `displayName`, `mailNickname`, optional `description` and
 `visibility` (`Private` or `Public`). It creates only Microsoft 365 groups, never
@@ -172,22 +197,12 @@ the page before responses leave Safari.
 
 Org manager/reporting data stays read-only: changing directory accounts and
 reporting relationships is tenant administration, outside the selected personal
-scope. Full Loop workspace/content management needs its own browser adapter;
-the OneDrive API is not a substitute.
-
-Live Loop investigation confirmed that `/recommended/api/v1.1/loop/recent`
-on `substrate.office.com` can return native workspace/page metadata using
-browser-owned authentication. It is not a complete workspace CRUD contract:
-recent-item IDs did not work directly with the workspace lookup endpoint, and
-page contents use Fluid data stores. These native APIs are not exposed by Moff
-yet. Loop's workspace-delete UI warns of permanent deletion, unlike OneDrive
-recycling; those operations must not be conflated.
-
-Embedded Loop runs in a cross-origin Outlook iframe. Cider currently evaluates
-the top-level document, so inspecting that embedded runtime needs frame-targeting
-support; a signed-in standalone Loop tab provides a workaround for investigation.
-Files larger than the current transfer bound also need a streaming/chunked
-transport follow-up before Moff can support them reliably.
+scope. Full Loop content management still requires a Fluid adapter; the
+OneDrive API is not a substitute. Native workspace requests execute in the
+top-level signed-in Outlook tab (Mail/Calendar or `/host/<guid>/auth` with
+the OWA runtime present); no Loop iframe access is needed.
+See [workspace and transfer contracts](docs/workspaces-and-transfers.md) for
+request shapes, bounds, verification and recovery limitations.
 
 ## Mutation inputs and safety
 
@@ -227,12 +242,12 @@ Open and sign into Outlook Mail or Calendar in Safari first. Enable Safari
 Automation for the launching app and **Allow JavaScript from Apple Events**.
 Moff links Cider directly; an installed `cider` executable is not required.
 Safari is the default and only transport; the former `--safari` flag remains a hidden
-compatibility no-op for existing scripts. The dependency is pinned to the Cider 0.11.0 source revision containing the Safari
+compatibility no-op for existing scripts. The dependency is pinned to the Cider v0.12.0 source revision (`7220e5d6ef2dfbcfa35243f2b054666c4782f8f1`) containing the Safari
 library APIs; it does not track Cider's default branch.
 
 Safari mode supports Mail/Calendar reads, batch reads and searches. Typed, non-sending
 writes require both `--allow-mutation` (next to `--safari`) and the operation's
-`--confirm`. Deletion is restricted to the recycle operations described above;
+`--confirm`. Native Loop workspace deletion is explicitly permanent; other deletion follows the policies described above;
 calendar deletion still rejects meetings and recurring events.
 Credentials stay in the tab: Moff calls Outlook's silent authentication helper and
 performs the OWA request there, returning only response data. It never exports or

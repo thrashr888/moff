@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use cider::sources::safari::{
-    self, DocumentTarget, EvalOptions, OperationPhase, PageOperationError, TabTarget,
+    self, BinaryDirection, BinaryTransferOptions, DocumentTarget, EvalOptions, OperationPhase,
+    PageOperationError, TabTarget,
 };
 use serde_json::{Value, json};
 use url::Url;
@@ -26,8 +27,35 @@ fn outlook_url(value: &str) -> bool {
                 url.host_str(),
                 Some("outlook.office.com" | "outlook.cloud.microsoft")
             )
-            && (url.path().starts_with("/mail/") || url.path().starts_with("/calendar/"))
+            && (url.path().starts_with("/mail/")
+                || url.path().starts_with("/calendar/")
+                || hosted_outlook(&url))
     })
+}
+
+fn hosted_outlook(url: &Url) -> bool {
+    let segments: Vec<_> = url.path().split('/').collect();
+    matches!(segments.as_slice(), ["", "host", id, "auth"]
+        if id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
+}
+
+async fn verify_host_runtime(
+    tab: &safari::OpenTab,
+    target: &DocumentTarget,
+) -> Result<(), OutlookWebError> {
+    if Url::parse(&tab.url).is_ok_and(|url| hosted_outlook(&url)) {
+        let result = safari::eval_document(
+            "typeof window.webpackChunkOwa === 'object' && window.webpackChunkOwa !== null",
+            target,
+            &eval_options(10),
+        )
+        .await
+        .map_err(|_| OutlookWebError::SafariBeforeDispatch)?;
+        if result.truncated || result.value != true {
+            return Err(OutlookWebError::SafariUnavailable);
+        }
+    }
+    Ok(())
 }
 
 impl OutlookWebSession {
@@ -85,6 +113,7 @@ impl OutlookWebSession {
             let tab = selected_tab(&tabs, target)?;
             let original = safari::document_target(tab_target(tab)?).await
                 .map_err(|_| OutlookWebError::SafariBeforeDispatch)?;
+            verify_host_runtime(tab, &original).await?;
             let marker = original.document_id.clone();
             let script = format!("({})({})", include_str!("safari_refresh.js"), json!(marker));
             let result = safari::eval_document(&script, &original, &eval_options(10)).await
@@ -194,6 +223,26 @@ fn page_script(source: &str, config: &Value) -> String {
     )
 }
 
+fn transfer_options(total_bytes: u64) -> BinaryTransferOptions {
+    BinaryTransferOptions {
+        allow_eval: true,
+        chunk_bytes: 128_000,
+        total_bytes,
+        timeout: 60,
+        idle_timeout: 120,
+    }
+}
+
+fn transfer_factory(config: &Value) -> String {
+    format!(
+        "(signal) => ({})({}, ({}), ({}), signal)",
+        include_str!("safari_transfer.js"),
+        config,
+        include_str!("safari_auth.js"),
+        include_str!("safari_response.js")
+    )
+}
+
 impl OutlookWebSession {
     /// Explicitly opt into typed, non-sending writes; the raw read surface stays read-only.
     pub fn from_safari_with_mutations(
@@ -210,6 +259,7 @@ impl OutlookWebSession {
         let target = runtime
             .block_on(safari::document_target(target))
             .map_err(|_| OutlookWebError::SafariBeforeDispatch)?;
+        runtime.block_on(verify_host_runtime(tab, &target))?;
         Ok(Self {
             transport: SessionTransport::Safari(SafariSession {
                 target,
@@ -225,8 +275,159 @@ impl SafariSession {
         self.product_request(&json!({"url":url}), false)
     }
 
-    pub(super) fn product_download(&self, url: &str) -> Result<Value, OutlookWebError> {
-        self.product_request(&json!({"url":url,"download":true}), false)
+    pub(super) fn product_download(
+        &self,
+        url: &str,
+        output: &mut impl std::io::Write,
+        max_bytes: u64,
+    ) -> Result<u64, OutlookWebError> {
+        let item = self.product_read(url)?;
+        let size = item["size"]
+            .as_u64()
+            .filter(|_| item["file"].is_object())
+            .ok_or(OutlookWebError::InvalidInput(
+                "download requires a file with a known size",
+            ))?;
+        crate::validate_file_size(size, max_bytes)?;
+        let factory = transfer_factory(&json!({"url":url,"size":size,"direction":"download"}));
+        self.runtime.block_on(async {
+            let mut transfer = safari::open_binary_transfer(
+                &factory,
+                &self.target,
+                BinaryDirection::Download,
+                &transfer_options(max_bytes),
+            )
+            .await
+            .map_err(|_| OutlookWebError::SafariOperationFailed)?;
+            let result = async {
+                let mut count = 0;
+                loop {
+                    let chunk = safari::read_binary_chunk(&mut transfer)
+                        .await
+                        .map_err(|_| OutlookWebError::SafariOperationFailed)?;
+                    if chunk.offset != count {
+                        return Err(OutlookWebError::InvalidResponse);
+                    }
+                    output
+                        .write_all(&chunk.bytes)
+                        .map_err(OutlookWebError::FileTransferIo)?;
+                    count += u64::try_from(chunk.bytes.len())
+                        .map_err(|_| OutlookWebError::InvalidResponse)?;
+                    if chunk.done {
+                        break;
+                    }
+                }
+                if count != size {
+                    return Err(OutlookWebError::InvalidInput(
+                        "download length differs from item size",
+                    ));
+                }
+                safari::finish_binary_transfer(&mut transfer)
+                    .await
+                    .map_err(|_| OutlookWebError::SafariOperationFailed)?;
+                Ok(count)
+            }
+            .await;
+            if result.is_err() && !transfer.closed {
+                safari::abort_binary_transfer(&mut transfer)
+                    .await
+                    .map_err(|_| OutlookWebError::SafariOperationFailed)?;
+            }
+            result
+        })
+    }
+
+    pub(super) fn product_upload(
+        &self,
+        request: &crate::ProductWrite,
+        input: &mut impl std::io::Read,
+        max_bytes: u64,
+    ) -> Result<Value, OutlookWebError> {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if !self.allow_mutation {
+            return Err(OutlookWebError::SafariReadOnly);
+        }
+        let size = request.upload_size.ok_or(OutlookWebError::InvalidAction)?;
+        crate::validate_file_size(size, max_bytes)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| OutlookWebError::SafariOperationFailed)?
+            .as_nanos();
+        let key = format!(
+            "__moff_upload_{}_{}_{}_{}",
+            self.target.document_id,
+            std::process::id(),
+            now,
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let factory = transfer_factory(&json!({"url":request.url,"size":size,
+            "direction":"upload","etag":request.etag,"allow_mutation":true,"result_key":key}));
+        let unknown = || OutlookWebError::OutcomeUnknown {
+            action: "file upload; inspect OneDrive before retrying",
+        };
+        let result = self.runtime.block_on(async {
+            let mut transfer = safari::open_binary_transfer(
+                &factory, &self.target, BinaryDirection::Upload, &transfer_options(max_bytes),
+            ).await.map_err(|error| {
+                if error.downcast_ref::<PageOperationError>().is_some_and(|e| matches!(e.phase, OperationPhase::BeforeDispatch)) {
+                    OutlookWebError::SafariBeforeDispatch
+                } else { unknown() }
+            })?;
+            let result = async {
+                let mut buffer = vec![0; 128_000];
+                let mut count = 0;
+                loop {
+                    let length = input.read(&mut buffer).map_err(|_| unknown())?;
+                    if length == 0 { break; }
+                    count += u64::try_from(length).map_err(|_| unknown())?;
+                    if count > size { return Err(unknown()); }
+                    safari::write_binary_chunk(&mut transfer, &buffer[..length]).await
+                        .map_err(|_| unknown())?;
+                }
+                if count != size { return Err(unknown()); }
+                safari::finish_binary_transfer(&mut transfer).await.map_err(|_| unknown())?;
+                let script = format!("(()=>{{const key={};const value=window[key];delete window[key];return value;}})()", json!(key));
+                let result = safari::eval_document(&script, &self.target, &EvalOptions {
+                    allow_eval:true, max_chars:10_000, timeout:30,
+                }).await.map_err(|_| unknown())?;
+                if result.truncated || result.value["size"].as_u64() != Some(size)
+                    || result.value["id"].as_str().is_none_or(str::is_empty) { return Err(unknown()); }
+                Ok(result.value)
+            }.await;
+            if result.is_err() && !transfer.closed {
+                safari::abort_binary_transfer(&mut transfer).await.map_err(|_| unknown())?;
+            }
+            result
+        });
+        if result.is_err() {
+            let script = format!(
+                "(()=>{{const key={};const value=window[key];delete window[key];return value ?? null;}})()",
+                json!(format!("{key}_failure"))
+            );
+            if let Ok(diagnostic) = self.runtime.block_on(safari::eval_document(
+                &script,
+                &self.target,
+                &eval_options(10),
+            )) {
+                let stage = match diagnostic.value["stage"].as_str() {
+                    Some("authentication") => Some("authentication"),
+                    Some("empty upload") => Some("empty upload"),
+                    Some("upload session creation") => Some("upload session creation"),
+                    Some("upload range") => Some("upload range"),
+                    Some("upload finalization") => Some("upload finalization"),
+                    _ => None,
+                };
+                if let Some(stage) = stage {
+                    return Err(OutlookWebError::FileUploadOutcomeUnknown {
+                        stage,
+                        status: diagnostic.value["status"]
+                            .as_u64()
+                            .and_then(|n| u16::try_from(n).ok()),
+                    });
+                }
+            }
+        }
+        result
     }
 
     pub(super) fn product_write(
@@ -235,6 +436,11 @@ impl SafariSession {
     ) -> Result<Value, OutlookWebError> {
         if !self.allow_mutation {
             return Err(OutlookWebError::SafariReadOnly);
+        }
+        if request.upload_size.is_some() {
+            return Err(OutlookWebError::InvalidInput(
+                "use the streamed file upload API",
+            ));
         }
         if let Some(path) = request
             .url
@@ -277,16 +483,28 @@ impl SafariSession {
         }
         self.product_request(
             &json!({"url":request.url,"method":request.method,"body":request.body,
-            "etag":request.etag,"bytes":request.bytes,"allow_mutation":true}),
+            "etag":request.etag,"allow_mutation":true}),
             true,
         )
     }
 
     fn product_request(&self, config: &Value, mutation: bool) -> Result<Value, OutlookWebError> {
+        self.page_request(include_str!("safari_products.js"), config, mutation)
+    }
+
+    pub(super) fn page_request(
+        &self,
+        source: &str,
+        config: &Value,
+        mutation: bool,
+    ) -> Result<Value, OutlookWebError> {
+        if mutation && !self.allow_mutation {
+            return Err(OutlookWebError::SafariReadOnly);
+        }
         let unknown = || OutlookWebError::OutcomeUnknown {
             action: "product write",
         };
-        let script = page_script(include_str!("safari_products.js"), config);
+        let script = page_script(source, config);
         let result = self
             .runtime
             .block_on(safari::eval_document(
@@ -463,10 +681,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transfer_options_keep_transport_bounded_and_total_is_a_ceiling() {
+        let options = transfer_options(crate::DEFAULT_MAX_FILE_BYTES);
+        assert!(options.validate().is_ok());
+        assert!(options.allow_eval);
+        assert_eq!(options.chunk_bytes, 128_000);
+        assert_eq!(options.total_bytes, 250_000_000);
+        assert_eq!(options.timeout, 60);
+        assert_eq!(options.idle_timeout, 120);
+        assert!(transfer_options(0).validate().is_ok());
+    }
+
+    #[test]
     fn accepts_only_loaded_outlook_product_tabs() {
         for url in [
             "https://outlook.office.com/mail/",
             "https://outlook.cloud.microsoft/calendar/view/week",
+            "https://outlook.cloud.microsoft/host/4a6520d6-94a8-4730-9184-24997b9b3401/auth",
         ] {
             assert!(outlook_url(url));
         }
@@ -475,6 +706,8 @@ mod tests {
             "https://outlook.office.com.evil/mail/",
             "https://outlook.office.com/",
             "https://user@outlook.office.com/mail/",
+            "https://outlook.cloud.microsoft/host/invalid/auth",
+            "https://outlook.cloud.microsoft/host/4a6520d6-94a8-4730-9184-24997b9b3401/auth/other",
         ] {
             assert!(!outlook_url(url));
         }
