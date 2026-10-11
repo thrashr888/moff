@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use chrono::{DateTime, FixedOffset, SecondsFormat};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
@@ -9,20 +9,96 @@ use crate::{
     header,
 };
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DraftInput {
     pub subject: Option<String>,
     pub body: Option<String>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventInput {
     pub subject: Option<String>,
     pub body: Option<String>,
     pub start: Option<String>,
     pub end: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplyInput {
+    pub body: String,
+}
+
+pub fn batch_item_request(ids: &[String], calendar: bool) -> Result<Value, OutlookWebError> {
+    if ids.is_empty() || ids.len() > 20 || ids.iter().collect::<HashSet<_>>().len() != ids.len() {
+        return Err(OutlookWebError::InvalidInput(
+            "provide 1-20 unique item IDs",
+        ));
+    }
+    for id in ids {
+        nonempty(id)?;
+    }
+    let mut request = if calendar {
+        calendar_item_request(&ids[0])
+    } else {
+        get_item_request(&ids[0])
+    };
+    request["Body"]["ItemIds"] = json!(ids.iter().map(|id| item_id(id)).collect::<Vec<_>>());
+    Ok(request)
+}
+
+pub fn reply_draft_request(
+    id: &str,
+    key: &str,
+    input: &ReplyInput,
+) -> Result<Value, OutlookWebError> {
+    nonempty(id)?;
+    nonempty(key)?;
+    nonempty(&input.body)?;
+    Ok(envelope(
+        "CreateItem",
+        json!({
+            "__type":"CreateItemRequest:#Exchange","MessageDisposition":"SaveOnly",
+            "ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly"},
+            "Items":[{"__type":"ReplyToItem:#Exchange",
+                "ReferenceItemId":{"__type":"ItemId:#Exchange","Id":id,"ChangeKey":key},
+                "NewBodyContent":text_body(&input.body)}]
+        }),
+    ))
+}
+
+pub fn categories_request(
+    id: &str,
+    key: &str,
+    categories: &[String],
+) -> Result<Value, OutlookWebError> {
+    nonempty(id)?;
+    nonempty(key)?;
+    for category in categories {
+        nonempty(category)?;
+    }
+    Ok(envelope(
+        "UpdateItem",
+        json!({
+            "__type":"UpdateItemRequest:#Exchange","MessageDisposition":"SaveOnly",
+            "ConflictResolution":"NeverOverwrite","SuppressReadReceipts":true,
+            "ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly"},
+            "ItemChanges":[{"__type":"ItemChange:#Exchange",
+                "ItemId":{"__type":"ItemId:#Exchange","Id":id,"ChangeKey":key},
+                "Updates":[change("Categories",json!(categories),"Message:#Exchange")]}]
+        }),
+    ))
+}
+
+fn categories(item: &Value) -> Result<Vec<String>, OutlookWebError> {
+    match item.get("Categories") {
+        None => Ok(Vec::new()),
+        Some(value) => {
+            serde_json::from_value(value.clone()).map_err(|_| OutlookWebError::InvalidResponse)
+        }
+    }
 }
 
 fn nonempty(value: &str) -> Result<(), OutlookWebError> {
@@ -140,7 +216,7 @@ pub fn update_draft_request(
     Ok(envelope(
         "UpdateItem",
         json!({"__type":"UpdateItemRequest:#Exchange","MessageDisposition":"SaveOnly",
-        "ConflictResolution":"AlwaysOverwrite","SuppressReadReceipts":true,
+        "ConflictResolution":"NeverOverwrite","SuppressReadReceipts":true,
         "ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly"},
         "ItemChanges":[{"__type":"ItemChange:#Exchange","ItemId":{"__type":"ItemId:#Exchange","Id":id,"ChangeKey":key},"Updates":updates}]}),
     ))
@@ -178,9 +254,8 @@ pub fn create_event_request(folder: &str, input: &EventInput) -> Result<Value, O
         "SavedItemFolderId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":{"__type":"FolderId:#Exchange","Id":folder}},
         "ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly"},
         "Items":[{"__type":"CalendarItem:#Exchange","Subject":subject,"Body":text_body(input.body.as_deref().unwrap_or("")),
-            "Start":utc(start)?,"End":utc(end)?,"StartTimeZoneId":"UTC","EndTimeZoneId":"UTC",
-            "ParentFolderId":{"Id":folder},"IsAllDayEvent":false,"IsDraft":false,"IsOrganizer":true,
-            "ReminderIsSet":false,"Resources":[]}]}),
+            "Start":utc(start)?,"End":utc(end)?,"IsAllDayEvent":false,
+            "LegacyFreeBusyStatus":"Busy","ReminderIsSet":false}]}),
     ))
 }
 pub fn update_event_request(id: &str, input: &EventInput) -> Result<Value, OutlookWebError> {
@@ -241,17 +316,16 @@ enum Mutation {
 impl Mutation {
     fn action(&self) -> &'static str {
         match self {
-            Self::CreateDraft => "CreateItem",
+            Self::CreateDraft | Self::CreateEvent => "CreateItem",
             Self::UpdateDraft => "UpdateItem",
             Self::DeleteMessage => "DeleteItem",
-            Self::CreateEvent => "CreateCalendarEvent",
             Self::UpdateEvent => "UpdateCalendarEvent",
             Self::DeleteEvent => "DeleteCalendarEvent",
         }
     }
 }
 
-fn single_item(value: &Value) -> Result<&Value, OutlookWebError> {
+pub(crate) fn single_item(value: &Value) -> Result<&Value, OutlookWebError> {
     let responses = value
         .pointer("/Body/ResponseMessages/Items")
         .and_then(Value::as_array)
@@ -271,13 +345,13 @@ fn type_is(item: &Value, name: &str) -> Result<(), OutlookWebError> {
         Err(OutlookWebError::UnsupportedItem)
     }
 }
-fn field<'a>(item: &'a Value, pointer: &str) -> Result<&'a str, OutlookWebError> {
+pub(crate) fn field<'a>(item: &'a Value, pointer: &str) -> Result<&'a str, OutlookWebError> {
     item.pointer(pointer)
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or(OutlookWebError::InvalidResponse)
 }
-fn appointment(item: &Value) -> Result<(), OutlookWebError> {
+pub(crate) fn appointment(item: &Value) -> Result<(), OutlookWebError> {
     type_is(item, "CalendarItem:#Exchange")?;
     if item.get("IsMeeting").and_then(Value::as_bool) != Some(false)
         || item.get("IsOrganizer").and_then(Value::as_bool) != Some(true)
@@ -351,11 +425,148 @@ pub fn calendar_item_request(id: &str) -> Value {
             "OptionalAttendees",
             "Resources",
             "Location",
+            "IsAllDayEvent",
+            "LegacyFreeBusyStatus",
         ],
     )
 }
 
 impl OutlookWebSession {
+    pub fn get_batch(&self, ids: &[String], calendar: bool) -> Result<Value, OutlookWebError> {
+        let response = self.call("GetItem", &batch_item_request(ids, calendar)?)?;
+        let messages = response
+            .pointer("/Body/ResponseMessages/Items")
+            .and_then(Value::as_array)
+            .ok_or(OutlookWebError::InvalidResponse)?;
+        let mut items = Vec::new();
+        for message in messages {
+            for item in message
+                .get("Items")
+                .and_then(Value::as_array)
+                .ok_or(OutlookWebError::InvalidResponse)?
+            {
+                if calendar {
+                    type_is(item, "CalendarItem:#Exchange")?;
+                }
+                items.push(item.clone());
+            }
+        }
+        let returned: HashSet<_> = items
+            .iter()
+            .map(|item| field(item, "/ItemId/Id"))
+            .collect::<Result<_, _>>()?;
+        if items.len() != ids.len()
+            || returned.len() != ids.len()
+            || !ids.iter().all(|id| returned.contains(id.as_str()))
+        {
+            return Err(OutlookWebError::InvalidResponse);
+        }
+        Ok(json!({"items":items,"count":items.len(),"has_more":false}))
+    }
+
+    pub fn mail_categories(
+        &self,
+        id: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<Value, OutlookWebError> {
+        if add.is_empty() && remove.is_empty() {
+            return Err(OutlookWebError::InvalidInput(
+                "provide at least one category to add or remove",
+            ));
+        }
+        for category in add.iter().chain(remove) {
+            nonempty(category)?;
+        }
+        if add.iter().any(|c| remove.contains(c)) {
+            return Err(OutlookWebError::InvalidInput(
+                "cannot add and remove the same category",
+            ));
+        }
+        let shape =
+            |id| item_properties_request(id, &["Subject", "Categories", "IsRead", "IsDraft"]);
+        let before_response = self.call("GetItem", &shape(id))?;
+        let before = single_item(&before_response)?;
+        type_is(before, "Message:#Exchange")?;
+        let read = before
+            .get("IsRead")
+            .and_then(Value::as_bool)
+            .ok_or(OutlookWebError::InvalidResponse)?;
+        let mut updated = categories(before)?;
+        updated.retain(|c| !remove.contains(c));
+        for category in add {
+            if !updated.contains(category) {
+                updated.push(category.clone());
+            }
+        }
+        if updated != categories(before)? {
+            self.execute(
+                "UpdateItem",
+                &categories_request(id, field(before, "/ItemId/ChangeKey")?, &updated)?,
+                true,
+            )?;
+        }
+        let response = self
+            .call("GetItem", &shape(id))
+            .map_err(|_| OutlookWebError::VerificationFailed)?;
+        let after = single_item(&response).map_err(|_| OutlookWebError::VerificationFailed)?;
+        let actual = categories(after).map_err(|_| OutlookWebError::VerificationFailed)?;
+        if actual.iter().collect::<HashSet<_>>() != updated.iter().collect::<HashSet<_>>()
+            || after.get("IsRead").and_then(Value::as_bool) != Some(read)
+        {
+            return Err(OutlookWebError::VerificationFailed);
+        }
+        Ok(json!({"id":id,"categories":actual,"read_state_preserved":true,"verified":true}))
+    }
+
+    pub fn reply_draft(&self, id: &str, input: &ReplyInput) -> Result<Value, OutlookWebError> {
+        nonempty(&input.body)?;
+        let response = self.mail_get(id)?;
+        let original = single_item(&response)?;
+        type_is(original, "Message:#Exchange")?;
+        let read = original
+            .get("IsRead")
+            .and_then(Value::as_bool)
+            .ok_or(OutlookWebError::InvalidResponse)?;
+        if original.get("IsDraft").and_then(Value::as_bool) != Some(false) {
+            return Err(OutlookWebError::UnsupportedItem);
+        }
+        let created = self.execute(
+            "CreateItem",
+            &reply_draft_request(id, field(original, "/ItemId/ChangeKey")?, input)?,
+            true,
+        )?;
+        let draft_id = field(
+            single_item(&created).map_err(|_| OutlookWebError::OutcomeUnknown {
+                action: "CreateItem",
+            })?,
+            "/ItemId/Id",
+        )
+        .map_err(|_| OutlookWebError::OutcomeUnknown {
+            action: "CreateItem",
+        })?;
+        let verified = self
+            .mail_get(draft_id)
+            .map_err(|_| OutlookWebError::VerificationFailed)?;
+        if single_item(&verified)?
+            .get("IsDraft")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err(OutlookWebError::VerificationFailed);
+        }
+        let original_after = self
+            .mail_get(id)
+            .map_err(|_| OutlookWebError::VerificationFailed)?;
+        if single_item(&original_after)?
+            .get("IsRead")
+            .and_then(Value::as_bool)
+            != Some(read)
+        {
+            return Err(OutlookWebError::VerificationFailed);
+        }
+        Ok(json!({"source_id":id,"draft_id":draft_id,"sent":false,"verified":true}))
+    }
     pub fn mail_list(
         &self,
         folder: &str,
@@ -432,11 +643,31 @@ impl OutlookWebSession {
         }
     }
     pub fn create_draft(&self, input: &DraftInput) -> Result<Value, OutlookWebError> {
-        self.execute(
+        let result = self.execute(
             Mutation::CreateDraft.action(),
             &create_draft_request(input)?,
             true,
+        )?;
+        let id = field(
+            single_item(&result).map_err(|_| OutlookWebError::OutcomeUnknown {
+                action: "CreateItem",
+            })?,
+            "/ItemId/Id",
         )
+        .map_err(|_| OutlookWebError::OutcomeUnknown {
+            action: "CreateItem",
+        })?;
+        let fetched = self
+            .mail_get(id)
+            .map_err(|_| OutlookWebError::VerificationFailed)?;
+        if single_item(&fetched)?
+            .get("IsDraft")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err(OutlookWebError::VerificationFailed);
+        }
+        Ok(result)
     }
     pub fn update_draft(&self, id: &str, input: &DraftInput) -> Result<Value, OutlookWebError> {
         draft_updates(input)?;
@@ -514,11 +745,22 @@ impl OutlookWebSession {
         Ok(search_result(matches, limit))
     }
     pub fn create_event(&self, folder: &str, input: &EventInput) -> Result<Value, OutlookWebError> {
-        self.execute(
+        let result = self.execute(
             Mutation::CreateEvent.action(),
             &create_event_request(folder, input)?,
             true,
+        )?;
+        let id = field(
+            single_item(&result).map_err(|_| OutlookWebError::OutcomeUnknown {
+                action: "CreateItem",
+            })?,
+            "/ItemId/Id",
         )
+        .map_err(|_| OutlookWebError::OutcomeUnknown {
+            action: "CreateItem",
+        })?;
+        self.verify_event(id, input)?;
+        Ok(result)
     }
     pub fn update_event(&self, id: &str, input: &EventInput) -> Result<Value, OutlookWebError> {
         let body = update_event_request(id, input)?;
@@ -529,7 +771,36 @@ impl OutlookWebSession {
             input.start.as_deref().unwrap_or(field(item, "/Start")?),
             input.end.as_deref().unwrap_or(field(item, "/End")?),
         )?;
-        self.execute(Mutation::UpdateEvent.action(), &body, true)
+        let mut body = body;
+        body["Body"]["EventId"] = item["ItemId"].clone();
+        body["Body"]["ItemChange"]["ItemId"] = item["ItemId"].clone();
+        let result = self.execute(Mutation::UpdateEvent.action(), &body, true)?;
+        let verified = self.verify_event(id, input)?;
+        if input.body.is_none() && verified.pointer("/Body/Value") != item.pointer("/Body/Value") {
+            return Err(OutlookWebError::VerificationFailed);
+        }
+        Ok(result)
+    }
+    fn verify_event(&self, id: &str, input: &EventInput) -> Result<Value, OutlookWebError> {
+        let response = self
+            .calendar_get(id)
+            .map_err(|_| OutlookWebError::VerificationFailed)?;
+        let item = single_item(&response).map_err(|_| OutlookWebError::VerificationFailed)?;
+        appointment(item).map_err(|_| OutlookWebError::VerificationFailed)?;
+        if input
+            .subject
+            .as_ref()
+            .is_some_and(|subject| item["Subject"].as_str() != Some(subject))
+            || input.start.as_deref().is_some_and(|start| {
+                datetime(start).ok() != item["Start"].as_str().and_then(|v| datetime(v).ok())
+            })
+            || input.end.as_deref().is_some_and(|end| {
+                datetime(end).ok() != item["End"].as_str().and_then(|v| datetime(v).ok())
+            })
+        {
+            return Err(OutlookWebError::VerificationFailed);
+        }
+        Ok(item.clone())
     }
     pub fn delete_event(&self, id: &str) -> Result<Value, OutlookWebError> {
         let response = self.calendar_get(id)?;
@@ -545,6 +816,80 @@ impl OutlookWebSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{message, mock};
+
+    #[test]
+    fn category_update_preserves_existing_categories_and_unread_state() {
+        let before = json!({"__type":"Message:#Exchange","ItemId":{"Id":"id","ChangeKey":"key"},
+            "Categories":["Existing"],"IsRead":false,"Subject":"Test"});
+        let after = json!({"__type":"Message:#Exchange","ItemId":{"Id":"id","ChangeKey":"new"},
+            "Categories":["Existing","Needs Response"],"IsRead":false,"Subject":"Test"});
+        let (session, requests, worker) = mock(vec![
+            ("GetItem", message(before)),
+            ("UpdateItem", message(json!({"ItemId":{"Id":"id"}}))),
+            ("GetItem", message(after)),
+        ]);
+        let result = session
+            .mail_categories("id", &["Needs Response".into()], &[])
+            .unwrap();
+        assert_eq!(result["read_state_preserved"], true);
+        worker.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[1]["Body"]["ItemChanges"][0]["Updates"][0]["Item"]["Categories"],
+            json!(["Existing", "Needs Response"])
+        );
+        assert_eq!(requests[1]["Body"]["ConflictResolution"], "NeverOverwrite");
+    }
+
+    #[test]
+    fn reply_draft_is_threaded_and_verified_without_marking_source_read() {
+        let original = json!({"__type":"Message:#Exchange","ItemId":{"Id":"source","ChangeKey":"key"},
+            "IsRead":false,"IsDraft":false});
+        let (session, requests, worker) = mock(vec![
+            ("GetItem", message(original.clone())),
+            ("CreateItem", message(json!({"ItemId":{"Id":"draft"}}))),
+            (
+                "GetItem",
+                message(json!({"ItemId":{"Id":"draft"},"IsDraft":true})),
+            ),
+            ("GetItem", message(original)),
+        ]);
+        assert_eq!(
+            session
+                .reply_draft(
+                    "source",
+                    &ReplyInput {
+                        body: "Hello".into()
+                    }
+                )
+                .unwrap()["sent"],
+            false
+        );
+        worker.join().unwrap();
+        assert_eq!(
+            requests.lock().unwrap()[1]["Body"]["Items"][0]["ReferenceItemId"]["Id"],
+            "source"
+        );
+    }
+
+    #[test]
+    fn category_noop_does_not_write_and_verification_failure_is_explicit() {
+        let item = json!({"__type":"Message:#Exchange","ItemId":{"Id":"id","ChangeKey":"key"},
+            "Categories":["Needs Response"],"IsRead":false});
+        let mut changed = item.clone();
+        changed["IsRead"] = json!(true);
+        let (session, requests, worker) = mock(vec![
+            ("GetItem", message(item)),
+            ("GetItem", message(changed)),
+        ]);
+        assert!(matches!(
+            session.mail_categories("id", &["Needs Response".into()], &[]),
+            Err(OutlookWebError::VerificationFailed)
+        ));
+        worker.join().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
 
     #[test]
     fn appointments_with_attendees_or_recurrence_cannot_be_mutated() {

@@ -8,6 +8,154 @@ fn moff() -> Command {
 }
 
 #[test]
+fn safari_mutations_and_graph_are_rejected_without_browser_access() {
+    for product in ["mail", "calendar"] {
+        moff()
+            .args([
+                "outlook",
+                "--safari",
+                product,
+                "delete",
+                "--id",
+                "fake",
+                "--confirm",
+            ])
+            .assert()
+            .failure()
+            .code(2)
+            .stderr(contains("deletion is not supported through Safari"));
+    }
+    moff()
+        .args(["outlook", "--safari", "people", "search"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(contains("Mail/Calendar reads only"));
+}
+
+#[test]
+fn safari_requires_complete_targets_and_excludes_exports() {
+    moff()
+        .args([
+            "outlook",
+            "--safari",
+            "--safari-window",
+            "1",
+            "mail",
+            "list",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("--safari-tab"));
+    moff()
+        .args([
+            "outlook",
+            "--safari",
+            "--session-curl",
+            "fake",
+            "mail",
+            "list",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("cannot be used"));
+}
+
+#[test]
+fn assistant_commands_expose_safe_gates_and_planning() {
+    for args in [
+        vec![
+            "outlook",
+            "--safari",
+            "mail",
+            "categories",
+            "--id",
+            "id",
+            "--add",
+            "Needs Response",
+            "--confirm",
+        ],
+        vec![
+            "outlook",
+            "--safari",
+            "mail",
+            "reply-draft",
+            "--id",
+            "id",
+            "--body-file",
+            "/not/read",
+            "--confirm",
+        ],
+        vec![
+            "outlook",
+            "--safari",
+            "calendar",
+            "work-blocks",
+            "apply",
+            "--body-file",
+            "/not/read",
+            "--confirm",
+        ],
+    ] {
+        moff()
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(contains("--allow-mutation"));
+    }
+    moff()
+        .args(["outlook", "--allow-mutation", "mail", "list"])
+        .assert()
+        .failure()
+        .stderr(contains("--safari"));
+    moff()
+        .args([
+            "outlook",
+            "--safari",
+            "--allow-mutation",
+            "calendar",
+            "work-blocks",
+            "apply",
+            "--body-file",
+            "/not/read",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("--confirm"));
+    for product in ["mail", "calendar"] {
+        moff()
+            .args([
+                "outlook",
+                product,
+                "get-batch",
+                "--id",
+                "one",
+                "two",
+                "--help",
+            ])
+            .assert()
+            .success();
+    }
+    moff()
+        .args(["outlook", "calendar", "work-blocks", "plan", "--help"])
+        .assert()
+        .success();
+    let output = moff()
+        .arg("schema")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let schema: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(schema["commands"]["mail"]["categories"], true);
+    assert_eq!(schema["commands"]["mail"]["reply-draft"], true);
+    assert_eq!(schema["commands"]["calendar"]["availability"], true);
+    assert_eq!(schema["commands"]["calendar"]["work-blocks"]["apply"], true);
+    assert_eq!(schema["transports"]["safari"]["delete"], false);
+}
+
+#[test]
 fn help_exposes_all_browser_session_read_products() {
     moff()
         .arg("--help")

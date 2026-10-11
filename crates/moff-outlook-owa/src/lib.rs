@@ -2,9 +2,14 @@
 #![allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
 mod graph;
 mod operations;
+mod safari;
+mod scheduling;
+#[cfg(test)]
+mod test_support;
 
 pub use graph::GraphWebSession;
 pub use operations::*;
+pub use scheduling::*;
 
 use std::{collections::BTreeMap, fmt, fs, path::Path, time::Duration};
 
@@ -39,6 +44,17 @@ pub enum OutlookWebError {
     },
     UnsupportedItem,
     TruncatedSearch,
+    SafariUnavailable,
+    SafariOperationFailed,
+    SafariReadOnly,
+    VerificationFailed,
+    PlanChanged,
+    SafariBeforeDispatch,
+    SafariOutcomeUnknown {
+        action: &'static str,
+        phase: cider::sources::safari::OperationPhase,
+        cancellation: cider::sources::safari::CancellationStatus,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -66,10 +82,19 @@ impl fmt::Display for OutlookWebError {
             }
             Self::InvalidResponse => "Outlook Web returned an invalid response",
             Self::SessionPermissions => "session exports require an owner-only file (0600) and directory (0700)",
-            Self::SessionExpired => "the browser session expired (HTTP 401); refresh the browser session export",
+            Self::SessionExpired => "the browser session expired (HTTP 401); sign in again in Safari or refresh the browser session export",
             Self::InvalidInput(message) => message,
             Self::UnsupportedItem => "this mutation requires an unsent mail draft, mail message, or single organizer-owned appointment without attendees, as applicable",
             Self::TruncatedSearch => "Outlook returned incomplete search data; narrow the folder or calendar range",
+            Self::SafariUnavailable => "select exactly one loaded Outlook Safari tab, or provide both --safari-window and --safari-tab",
+            Self::SafariOperationFailed => "Safari operation failed; check Safari Automation permission, JavaScript from Apple Events, and that Outlook is signed in; the private Outlook adapter may need an update",
+            Self::SafariReadOnly => "Safari writes require --allow-mutation and --confirm; deletion is not supported through Safari",
+            Self::VerificationFailed => "the write completed but verification failed; inspect the affected item before retrying",
+            Self::PlanChanged => "the calendar or target appointment changed since preview; generate and review a new plan",
+            Self::SafariBeforeDispatch => "Safari target failed before dispatch; no caller operation was started; sign in and select the intended document again",
+            Self::SafariOutcomeUnknown { action, phase, cancellation } => {
+                return write!(f,"the outcome of {action} is unknown (phase: {phase:?}, cancellation: {cancellation:?}); cancellation does not undo server writes; inspect the affected item before retrying");
+            }
             Self::OperationRejected { action, code } => {
                 return write!(f, "Outlook Web rejected {action} ({code:?})");
             }
@@ -91,6 +116,7 @@ pub struct OutlookWebSession {
     origin: Url,
     headers: BTreeMap<String, String>,
     client: Client,
+    safari: Option<safari::SafariSession>,
 }
 impl fmt::Debug for RequestParts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -220,6 +246,7 @@ impl OutlookWebSession {
             origin,
             headers,
             client: http_client()?,
+            safari: None,
         })
     }
     pub fn request_parts(
@@ -258,6 +285,16 @@ impl OutlookWebSession {
         body: &Value,
         mutation: bool,
     ) -> Result<Value, OutlookWebError> {
+        if let Some(session) = &self.safari {
+            let value = session.call(action, body, mutation)?;
+            check_response(action, &value).map_err(|error| match error {
+                OutlookWebError::InvalidResponse if mutation => {
+                    OutlookWebError::OutcomeUnknown { action }
+                }
+                other => other,
+            })?;
+            return Ok(value);
+        }
         let parts = self.parts(action)?;
         let mut headers = HeaderMap::new();
         for (name, value) in parts.headers {
@@ -506,6 +543,7 @@ mod tests {
                 origin: Url::parse(&format!("http://{address}/")).unwrap(),
                 headers: BTreeMap::new(),
                 client: http_client().unwrap(),
+                safari: None,
             };
             let error = session.create_draft(&DraftInput::default()).unwrap_err();
             if status.starts_with("500") {
