@@ -1,13 +1,14 @@
 use std::{
     env, fs,
+    io::Read,
     path::{Path, PathBuf},
     process::ExitCode,
 };
 
 use clap::{Args, Parser, Subcommand};
 use moff_outlook_owa::{
-    DraftInput, EventInput, GraphWebSession, OutlookWebError, OutlookWebSession,
-    calendar_folders_request, calendar_view_request, validate_read_action,
+    DraftInput, EventInput, GraphWebSession, OutlookWebError, OutlookWebSession, ReplyInput,
+    WorkInput, WorkPlan, calendar_folders_request, calendar_view_request, validate_read_action,
 };
 use serde_json::{Value, json};
 
@@ -38,9 +39,15 @@ struct SessionArgs {
     #[arg(
         long,
         conflicts_with = "session_curl",
-        help = "Read Mail/Calendar through a loaded Outlook Safari tab (experimental, read-only)"
+        help = "Use Mail/Calendar through a loaded Outlook Safari tab (experimental)"
     )]
     safari: bool,
+    #[arg(
+        long,
+        requires = "safari",
+        help = "Permit typed non-sending Safari writes; each write also requires --confirm"
+    )]
+    allow_mutation: bool,
     #[arg(long, requires = "safari", requires = "safari_tab", value_parser = clap::value_parser!(u32).range(1..))]
     safari_window: Option<u32>,
     #[arg(long, requires = "safari", requires = "safari_window", value_parser = clap::value_parser!(u32).range(1..))]
@@ -91,6 +98,31 @@ enum OutlookCommand {
 
 #[derive(Debug, Subcommand)]
 enum MailCommand {
+    /// Read 1-20 messages in one non-marking request.
+    GetBatch {
+        #[arg(long, required = true, num_args = 1..=20)]
+        id: Vec<String>,
+    },
+    /// Add/remove categories without replacing unrelated categories or read state.
+    Categories {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        add: Vec<String>,
+        #[arg(long)]
+        remove: Vec<String>,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Save a threaded reply-to-sender draft, never send it.
+    ReplyDraft {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        body_file: PathBuf,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
     List {
         #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
@@ -139,6 +171,28 @@ enum MailCommand {
 
 #[derive(Debug, Subcommand)]
 enum CalendarCommand {
+    /// Read 1-20 calendar items in one request.
+    GetBatch {
+        #[arg(long, required = true, num_args = 1..=20)]
+        id: Vec<String>,
+    },
+    /// Find empty gaps; explicitly permitted title overlaps are ranked after empty gaps.
+    Availability {
+        #[arg(long)]
+        folder_id: String,
+        #[arg(long)]
+        start: String,
+        #[arg(long)]
+        end: String,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u16).range(1..=480))]
+        minutes: u16,
+        #[arg(long)]
+        allow_overlap_title: Vec<String>,
+    },
+    WorkBlocks {
+        #[command(subcommand)]
+        command: WorkBlockCommand,
+    },
     Folders,
     View {
         #[arg(long)]
@@ -195,6 +249,22 @@ enum CalendarCommand {
     Delete {
         #[arg(long)]
         id: String,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkBlockCommand {
+    /// Produce a read-only plan using explicit work windows and tasks.
+    Plan {
+        #[arg(long)]
+        body_file: PathBuf,
+    },
+    /// Apply a reviewed plan, rejecting changed calendars and stopping at first failure.
+    Apply {
+        #[arg(long)]
+        body_file: PathBuf,
         #[arg(long, required = true)]
         confirm: bool,
     },
@@ -282,8 +352,11 @@ fn error(message: impl std::fmt::Display) -> ExitCode {
 
 fn session(args: SessionArgs) -> Result<OutlookWebSession, String> {
     if args.safari {
-        return OutlookWebSession::from_safari(args.safari_window.zip(args.safari_tab))
-            .map_err(|error| error.to_string());
+        return OutlookWebSession::from_safari_with_mutations(
+            args.safari_window.zip(args.safari_tab),
+            args.allow_mutation,
+        )
+        .map_err(|error| error.to_string());
     }
     let path = args.session_curl.or_else(|| {
         env::var_os("HOME")
@@ -360,15 +433,30 @@ fn graph_result(
     Ok((command, value))
 }
 
-fn confirmed_json(path: PathBuf, confirm: bool) -> Result<Value, String> {
+fn confirmed_json(path: &Path, confirm: bool) -> Result<Value, String> {
     if !confirm {
         return Err("mutations require --confirm".to_owned());
     }
-    fs::read_to_string(path)
-        .map_err(|_| "--body-file could not be read".to_owned())
-        .and_then(|body| {
-            serde_json::from_str(&body).map_err(|_| "--body-file must contain JSON".to_owned())
-        })
+    read_json(path)
+}
+
+fn read_json(path: &Path) -> Result<Value, String> {
+    let file = fs::File::open(path).map_err(|_| "--body-file could not be read".to_owned())?;
+    let mut body = String::new();
+    file.take(1_000_001)
+        .read_to_string(&mut body)
+        .map_err(|_| "--body-file must be UTF-8".to_owned())?;
+    if body.len() > 1_000_000 {
+        return Err("--body-file exceeds 1MB".to_owned());
+    }
+    serde_json::from_str(&body).map_err(|_| "--body-file must contain JSON".to_owned())
+}
+
+fn safari_write_guard(args: &SessionArgs, mutation: bool, delete: bool) -> Result<(), String> {
+    if args.safari && mutation && (!args.allow_mutation || delete) {
+        return Err(OutlookWebError::SafariReadOnly.to_string());
+    }
+    Ok(())
 }
 
 fn with_owa(
@@ -379,15 +467,55 @@ fn with_owa(
 }
 
 fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str, Value), String> {
-    if args.safari
-        && matches!(
+    safari_write_guard(
+        &args,
+        matches!(
             command,
-            MailCommand::Create { .. } | MailCommand::Update { .. } | MailCommand::Delete { .. }
-        )
-    {
-        return Err(OutlookWebError::SafariReadOnly.to_string());
-    }
+            MailCommand::Create { .. }
+                | MailCommand::Update { .. }
+                | MailCommand::Delete { .. }
+                | MailCommand::Categories { .. }
+                | MailCommand::ReplyDraft { .. }
+        ),
+        matches!(command, MailCommand::Delete { .. }),
+    )?;
     match command {
+        MailCommand::GetBatch { id } => Ok((
+            "outlook.mail.get-batch",
+            with_owa(args, |s| s.get_batch(&id, false))?,
+        )),
+        MailCommand::Categories {
+            id,
+            add,
+            remove,
+            confirm,
+        } => {
+            if !confirm {
+                return Err("mutations require --confirm".into());
+            }
+            if add.is_empty() && remove.is_empty() {
+                return Err("provide --add or --remove".into());
+            }
+            Ok((
+                "outlook.mail.categories",
+                with_owa(args, |s| s.mail_categories(&id, &add, &remove))?,
+            ))
+        }
+        MailCommand::ReplyDraft {
+            id,
+            body_file,
+            confirm,
+        } => {
+            let input: ReplyInput = serde_json::from_value(confirmed_json(&body_file, confirm)?)
+                .map_err(|_| "reply input accepts only a nonempty body string")?;
+            if input.body.trim().is_empty() {
+                return Err("reply body must not be empty".into());
+            }
+            Ok((
+                "outlook.mail.reply-draft",
+                with_owa(args, |s| s.reply_draft(&id, &input))?,
+            ))
+        }
         MailCommand::List {
             folder,
             limit,
@@ -406,7 +534,7 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
             with_owa(args, |s| s.mail_search(&folder, &query, limit))?,
         )),
         MailCommand::Create { body_file, confirm } => {
-            let input: DraftInput = serde_json::from_value(confirmed_json(body_file, confirm)?)
+            let input: DraftInput = serde_json::from_value(confirmed_json(&body_file, confirm)?)
                 .map_err(|_| "--body-file must contain only optional subject and body strings")?;
             Ok((
                 "outlook.mail.create",
@@ -418,7 +546,7 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
             body_file,
             confirm,
         } => {
-            let input: DraftInput = serde_json::from_value(confirmed_json(body_file, confirm)?)
+            let input: DraftInput = serde_json::from_value(confirmed_json(&body_file, confirm)?)
                 .map_err(|_| "--body-file must contain only optional subject and body strings")?;
             Ok((
                 "outlook.mail.update",
@@ -437,21 +565,63 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn calendar_result(
     args: SessionArgs,
     command: CalendarCommand,
 ) -> Result<(&'static str, Value), String> {
-    if args.safari
-        && matches!(
+    safari_write_guard(
+        &args,
+        matches!(
             command,
             CalendarCommand::Create { .. }
                 | CalendarCommand::Update { .. }
                 | CalendarCommand::Delete { .. }
-        )
-    {
-        return Err(OutlookWebError::SafariReadOnly.to_string());
-    }
+                | CalendarCommand::WorkBlocks {
+                    command: WorkBlockCommand::Apply { .. }
+                }
+        ),
+        matches!(command, CalendarCommand::Delete { .. }),
+    )?;
     match command {
+        CalendarCommand::GetBatch { id } => Ok((
+            "outlook.calendar.get-batch",
+            with_owa(args, |s| s.get_batch(&id, true))?,
+        )),
+        CalendarCommand::Availability {
+            folder_id,
+            start,
+            end,
+            minutes,
+            allow_overlap_title,
+        } => Ok((
+            "outlook.calendar.availability",
+            with_owa(args, |s| {
+                s.availability(&folder_id, &start, &end, minutes, &allow_overlap_title)
+            })?,
+        )),
+        CalendarCommand::WorkBlocks {
+            command: WorkBlockCommand::Plan { body_file },
+        } => {
+            let input: WorkInput = serde_json::from_value(read_json(&body_file)?)
+                .map_err(|_| "invalid work input: expected folder_id, windows, tasks and optional allow_overlap_titles")?;
+            let s = session(args)?;
+            let plan = s.plan_work_blocks(&input).map_err(|e| e.to_string())?;
+            Ok((
+                "outlook.calendar.work-blocks.plan",
+                serde_json::to_value(plan).map_err(|e| e.to_string())?,
+            ))
+        }
+        CalendarCommand::WorkBlocks {
+            command: WorkBlockCommand::Apply { body_file, confirm },
+        } => {
+            let plan: WorkPlan = serde_json::from_value(confirmed_json(&body_file, confirm)?)
+                .map_err(|_| "invalid work plan: use value from work-blocks plan output")?;
+            Ok((
+                "outlook.calendar.work-blocks.apply",
+                with_owa(args, |s| s.apply_work_blocks(&plan))?,
+            ))
+        }
         CalendarCommand::Folders => Ok((
             "outlook.calendar.folders",
             with_owa(args, |s| {
@@ -500,7 +670,7 @@ fn calendar_result(
             body_file,
             confirm,
         } => {
-            let input: EventInput = serde_json::from_value(confirmed_json(body_file, confirm)?)
+            let input: EventInput = serde_json::from_value(confirmed_json(&body_file, confirm)?)
                 .map_err(
                     |_| "--body-file must contain only subject, body, start, and end strings",
                 )?;
@@ -514,7 +684,7 @@ fn calendar_result(
             body_file,
             confirm,
         } => {
-            let input: EventInput = serde_json::from_value(confirmed_json(body_file, confirm)?)
+            let input: EventInput = serde_json::from_value(confirmed_json(&body_file, confirm)?)
                 .map_err(
                     |_| "--body-file must contain only subject, body, start, and end strings",
                 )?;
@@ -541,7 +711,7 @@ fn main() -> ExitCode {
     match cli.command {
         Some(Command::Schema) => {
             print_json(
-                &json!({"schema":moff_core::SCHEMA_VERSION,"provider":"browser-session","transports":{"curl-export":{"mutations":true},"safari":{"experimental":true,"mutations":false,"products":["mail","calendar"],"requires":"loaded authenticated Outlook tab","credential_export":false}},"commands":{"mail":{"list":true,"search":true,"get":true,"create":true,"update":true,"delete":true,"send":false},"calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"create":true,"update":true,"delete":true},"people":{"search":true,"get":true},"org":{"manager":true,"reports":true},"onedrive":{"list":true,"get":true},"groups":{"list":true},"loop":{"list":true,"get":true},"service":{"read":true}},"unimplemented_products":[],"mutations":true,"mutation_confirmation":"--confirm","mail_delete":"permanent","calendar_delete":"deleted-items","calendar_mutation_scope":"single appointments without attendees","search_semantics":"case-insensitive literal subject/body search within the chosen folder or calendar range"}),
+                &json!({"schema":moff_core::SCHEMA_VERSION,"provider":"browser-session","transports":{"curl-export":{"mutations":true},"safari":{"experimental":true,"mutations":true,"mutation_gate":"--allow-mutation and --confirm","delete":false,"products":["mail","calendar"],"requires":"loaded authenticated Outlook tab","credential_export":false}},"commands":{"mail":{"list":true,"search":true,"get":true,"get-batch":true,"categories":true,"reply-draft":true,"create":true,"update":true,"delete":true,"send":false},"calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"get-batch":true,"availability":true,"work-blocks":{"plan":true,"apply":true},"create":true,"update":true,"delete":true},"people":{"search":true,"get":true},"org":{"manager":true,"reports":true},"onedrive":{"list":true,"get":true},"groups":{"list":true},"loop":{"list":true,"get":true},"service":{"read":true}},"unimplemented_products":[],"mutations":true,"mutation_confirmation":"--confirm","mail_delete":"permanent","calendar_delete":"deleted-items","calendar_mutation_scope":"single appointments without attendees","scheduling_policy":"empty gaps first; explicit exact-title overlap fallback","batch_limit":20,"search_semantics":"case-insensitive literal subject/body search within the chosen folder or calendar range"}),
             );
             ExitCode::SUCCESS
         }
@@ -585,7 +755,11 @@ fn main() -> ExitCode {
         }) => match calendar_result(args, command) {
             Ok((command, value)) => {
                 output(command, &value);
-                ExitCode::SUCCESS
+                if value["complete"] == false {
+                    ExitCode::from(2)
+                } else {
+                    ExitCode::SUCCESS
+                }
             }
             Err(e) => error(e),
         },

@@ -3,9 +3,13 @@
 mod graph;
 mod operations;
 mod safari;
+mod scheduling;
+#[cfg(test)]
+mod test_support;
 
 pub use graph::GraphWebSession;
 pub use operations::*;
+pub use scheduling::*;
 
 use std::{collections::BTreeMap, fmt, fs, path::Path, time::Duration};
 
@@ -43,6 +47,8 @@ pub enum OutlookWebError {
     SafariUnavailable,
     SafariOperationFailed,
     SafariReadOnly,
+    VerificationFailed,
+    PlanChanged,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -70,13 +76,15 @@ impl fmt::Display for OutlookWebError {
             }
             Self::InvalidResponse => "Outlook Web returned an invalid response",
             Self::SessionPermissions => "session exports require an owner-only file (0600) and directory (0700)",
-            Self::SessionExpired => "the browser session expired (HTTP 401); refresh the browser session export",
+            Self::SessionExpired => "the browser session expired (HTTP 401); sign in again in Safari or refresh the browser session export",
             Self::InvalidInput(message) => message,
             Self::UnsupportedItem => "this mutation requires an unsent mail draft, mail message, or single organizer-owned appointment without attendees, as applicable",
             Self::TruncatedSearch => "Outlook returned incomplete search data; narrow the folder or calendar range",
             Self::SafariUnavailable => "select exactly one loaded Outlook Safari tab, or provide both --safari-window and --safari-tab",
-            Self::SafariOperationFailed => "Safari read failed; check Safari Automation permission, JavaScript from Apple Events, and that Outlook is signed in; the private Outlook adapter may need an update",
-            Self::SafariReadOnly => "the Safari provider supports reads only; use an explicit session export for confirmed mutations",
+            Self::SafariOperationFailed => "Safari operation failed; check Safari Automation permission, JavaScript from Apple Events, and that Outlook is signed in; the private Outlook adapter may need an update",
+            Self::SafariReadOnly => "Safari writes require --allow-mutation and --confirm; deletion is not supported through Safari",
+            Self::VerificationFailed => "the write completed but verification failed; inspect the affected item before retrying",
+            Self::PlanChanged => "the calendar or target appointment changed since preview; generate and review a new plan",
             Self::OperationRejected { action, code } => {
                 return write!(f, "Outlook Web rejected {action} ({code:?})");
             }
@@ -268,11 +276,13 @@ impl OutlookWebSession {
         mutation: bool,
     ) -> Result<Value, OutlookWebError> {
         if let Some(session) = &self.safari {
-            if mutation {
-                return Err(OutlookWebError::SafariReadOnly);
-            }
-            let value = session.call(action, body)?;
-            check_response(action, &value)?;
+            let value = session.call(action, body, mutation)?;
+            check_response(action, &value).map_err(|error| match error {
+                OutlookWebError::InvalidResponse if mutation => {
+                    OutlookWebError::OutcomeUnknown { action }
+                }
+                other => other,
+            })?;
             return Ok(value);
         }
         let parts = self.parts(action)?;

@@ -1,6 +1,6 @@
 # Moff
 
-Moff is a personal **Outlook Web mail and calendar CLI**. It uses existing authenticated browser sessions: exported cURL requests, or an experimental read-only Safari adapter backed by the Cider library. Moff does not register an Entra application, run its own OAuth flow, use Azure CLI, access Keychain, automate desktop Outlook, use OCR, or persist a separate token cache.
+Moff is a personal **Outlook Web mail and calendar CLI**. It uses existing authenticated browser sessions: exported cURL requests, or an experimental Safari adapter backed by the Cider library. Moff does not register an Entra application, run its own OAuth flow, use Azure CLI, access Keychain, automate desktop Outlook, use OCR, or persist a separate token cache.
 
 The export is read only while Moff runs. It is never copied, logged, cached, or added to source control.
 
@@ -82,7 +82,7 @@ Mail folders are `inbox`, `drafts`, `sentitems`, `deleteditems`, `archive`, `jun
 
 ## Session export
 
-### Experimental Safari reads
+### Experimental Safari transport
 
 ```sh
 moff outlook --safari mail list --limit 5
@@ -100,8 +100,10 @@ Moff links Cider directly; an installed `cider` executable is not required.
 The dependency is pinned to the Cider 0.11.0 source revision containing the Safari
 library APIs; it does not track Cider's default branch.
 
-Safari mode supports the existing Mail/Calendar reads and searches only; mutations
-are rejected before browser access. Graph products still require their cURL export.
+Safari mode supports Mail/Calendar reads, batch reads and searches. Typed, non-sending
+writes require both `--allow-mutation` (next to `--safari`) and the operation's
+`--confirm`. Deletion remains unavailable in Safari, even with both flags.
+Graph products still require their cURL export.
 Credentials stay in the tab: Moff calls Outlook's silent authentication helper and
 performs the OWA request there, returning only response data. It never exports or
 stores a token. Session expiry requires signing in again in Safari; cached visible
@@ -120,7 +122,102 @@ account. Responses are limited to 900 KB; oversized data is rejected, not trunca
 into a successful result. Use a smaller page or calendar range. Automatic sign-in
 and MFA handling are not implemented.
 
-### cURL exports
+## Mail triage and reply drafts
+
+```sh
+# One request for up to 20 unique IDs; no reading-pane selection or IsRead changes.
+moff outlook --safari mail get-batch --id '<id-1>' '<id-2>'
+moff outlook --safari calendar get-batch --id '<event-1>' '<event-2>'
+
+# Preserve other categories and verify the read flag after the change.
+moff outlook --safari --allow-mutation mail categories \
+  --id '<message-id>' --add 'Needs Response' --confirm
+moff outlook --safari --allow-mutation mail categories \
+  --id '<message-id>' --remove 'Needs Response' --confirm
+
+# reply.json contains only {"body":"Reply text"}.
+moff outlook --safari --allow-mutation mail reply-draft \
+  --id '<source-message-id>' --body-file reply.json --confirm
+```
+
+Categories use the current change key with `NeverOverwrite`; adding an existing
+category is a no-op. Replies use Exchange `ReplyToItem` and `SaveOnly`, preserving
+native reply-to-sender threading without manually copying recipients. Moff verifies
+that the saved item is still a draft and the source read flag is unchanged. This
+is not reply-all and does not send mail. The reply-draft contract has deterministic
+coverage but has not yet been validated by saving a draft in a live mailbox.
+Triage decisions and reply text remain caller-supplied, not an embedded AI service.
+
+## Availability and work blocks
+
+```sh
+moff outlook --safari calendar availability --folder-id '<calendar-id>' \
+  --start 2026-10-12T09:00:00-07:00 --end 2026-10-12T17:00:00-07:00 \
+  --minutes 60
+# Optional fallback, never the default:
+# --allow-overlap-title 'Focus Time' --allow-overlap-title 'Lunch'
+```
+
+Availability returns empty gaps first, followed by explicitly permitted exact-title
+overlap gaps. All-day free/busy metadata is fetched in batches because calendar view
+omits it; free deadline reminders do not block a whole day. Missing metadata remains
+conservatively occupied; explicit `Free` and cancelled events are ignored. The scope is the
+selected calendar, not all calendars or attendee availability.
+
+Work-block input specifies work windows with explicit RFC3339 offsets (up to 14)
+and tasks (up to 20). Empty earlier slots are preferred across all windows before
+any overlap fallback. Tasks are allocated in input priority order, without splitting
+their durations. Supply the appropriate offset on each date across daylight-saving
+changes; Moff does not assume a timezone or schedule before your chosen work hours.
+
+```json
+{
+  "folder_id": "<calendar-id>",
+  "windows": [
+    {"start":"2026-10-12T09:00:00-07:00","end":"2026-10-12T15:00:00-07:00"},
+    {"start":"2026-10-13T09:00:00-07:00","end":"2026-10-13T15:00:00-07:00"}
+  ],
+  "tasks": [
+    {"subject":"Work block: Follow-up replies","body":"Review and draft replies","minutes":60},
+    {"subject":"Work block: Demo preparation","minutes":90,"deadline":"2026-10-13T15:00:00-07:00"}
+  ],
+  "allow_overlap_titles": []
+}
+```
+
+```sh
+# Planning is read-only. Save ONLY value, not the outer response envelope.
+moff outlook --safari calendar work-blocks plan --body-file work.json \
+  | jq '.value' > plan.json
+# Review plan.json before applying.
+moff outlook --safari --allow-mutation calendar work-blocks apply \
+  --body-file plan.json --confirm
+```
+
+To relocate an existing personal appointment, add its `id` to a task and retain
+its exact subject and duration; omit `body` to preserve its notes. Moves reject
+meetings, recurring items, other calendars and attendees. No focus/lunch events
+are edited or deleted. Plans include target preconditions and calendar snapshots;
+apply rejects stale plans, rechecks between writes, verifies each result, and stops
+on the first failure. Batch writes are **not atomic**: partial results include
+completed IDs, the failed block and an explicit error, with exit status 2. Do not
+blindly reapply after an error; inspect the calendar and generate a new plan.
+Plan files contain private calendar data and must not be committed or shared.
+
+### Cider follow-ups
+
+No Cider update is required for these commands: its gated eval library is sufficient.
+Two transport improvements would help future reliability:
+
+- Stable tab identity and same-origin SPA route-change tolerance: positional targeting
+  and route changes during evaluation can produce an unknown write outcome.
+- Structured page-operation failure phases and cancellation status, so Moff can
+  distinguish failure before dispatch from a potentially completed request.
+
+Full regular-tab HTTP history and automated sign-in remain separate, unresolved
+capabilities. Moff never silently retries writes or bypasses authentication prompts.
+
+## cURL exports
 
 Keep both files local and owner-readable only. They contain browser credentials and must never be committed, logged, or pasted into chat.
 
@@ -137,7 +234,7 @@ Moff checks that export files are `0600` and their containing directories are `0
 
 ## Request-contract sources
 
-- **Outlook Web mail and calendar:** browser Network captures, with read request construction in [`lib.rs`](crates/moff-outlook-owa/src/lib.rs) and typed mutation builders in [`operations.rs`](crates/moff-outlook-owa/src/operations.rs). Reads use `FindItem`, `GetItem`, `GetCalendarFoldersV2`, and `GetCalendarView`. Draft/message writes use `CreateItem`, `UpdateItem`, and `DeleteItem`; appointment writes use `CreateCalendarEvent`, `UpdateCalendarEvent`, and `DeleteCalendarEvent`. These are browser OWA contracts, not Graph payloads.
+- **Outlook Web mail and calendar:** browser Network captures and live in-tab requests, with read request construction in [`lib.rs`](crates/moff-outlook-owa/src/lib.rs) and typed mutation builders in [`operations.rs`](crates/moff-outlook-owa/src/operations.rs). Reads use `FindItem`, `GetItem`, `GetCalendarFoldersV2`, and `GetCalendarView`. Draft/message writes use `CreateItem`, `UpdateItem`, and `DeleteItem`; appointment writes use `CreateItem`, `UpdateCalendarEvent`, and `DeleteCalendarEvent`. Creation omits read-only timezone-ID and organizer properties rejected by the live API. These are browser OWA contracts, not Graph payloads.
 - **People:** [Microsoft Graph — List people](https://learn.microsoft.com/en-us/graph/api/user-list-people?view=graph-rest-1.0).
 - **Org Explorer:** [Microsoft Graph — List manager](https://learn.microsoft.com/en-us/graph/api/user-list-manager?view=graph-rest-1.0) and [List direct reports](https://learn.microsoft.com/en-us/graph/api/user-list-directreports?view=graph-rest-1.0).
 - **OneDrive and Loop:** [Microsoft Graph — List children of a driveItem](https://learn.microsoft.com/en-us/graph/api/driveitem-list-children?view=graph-rest-1.0), [Get driveItem metadata](https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0), [Search for files](https://learn.microsoft.com/en-us/graph/api/driveitem-search?view=graph-rest-1.0), and [Loop storage](https://learn.microsoft.com/en-us/microsoft-365/loop/loop-storage).

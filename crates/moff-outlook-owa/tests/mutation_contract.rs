@@ -1,7 +1,8 @@
 use moff_outlook_owa::{
-    DraftInput, EventInput, GraphWebSession, OutlookWebSession, create_draft_request,
-    create_event_request, delete_event_request, delete_message_request, search_item_request,
-    update_draft_request, update_event_request,
+    DraftInput, EventInput, GraphWebSession, OutlookWebSession, ReplyInput, batch_item_request,
+    categories_request, create_draft_request, create_event_request, delete_event_request,
+    delete_message_request, reply_draft_request, search_item_request, update_draft_request,
+    update_event_request,
 };
 use serde_json::json;
 
@@ -59,6 +60,16 @@ fn calendar_writes_use_distinct_observed_actions_and_single_event_scope() {
     );
     assert_eq!(create["Body"]["SendMeetingInvitations"], "SendToNone");
     assert_eq!(create["Body"]["Items"][0]["ReminderIsSet"], false);
+    for property in [
+        "StartTimeZoneId",
+        "EndTimeZoneId",
+        "ParentFolderId",
+        "IsDraft",
+        "IsOrganizer",
+    ] {
+        assert!(create["Body"]["Items"][0].get(property).is_none());
+    }
+    assert_eq!(create["Body"]["Items"][0]["LegacyFreeBusyStatus"], "Busy");
     let update = update_event_request("synthetic-id", &input).unwrap();
     assert_eq!(update["__type"], "UpdateCalendarEventJsonRequest:#Exchange");
     assert_eq!(update["Body"]["EventScope"], 0);
@@ -69,6 +80,38 @@ fn calendar_writes_use_distinct_observed_actions_and_single_event_scope() {
         "DeleteCalendarEventRequest:#Exchange"
     );
     assert_eq!(delete["Body"]["EventScope"], 0);
+}
+
+#[test]
+fn triage_builders_do_not_mark_read_send_or_replace_unrelated_fields() {
+    let update =
+        categories_request("id", "key", &["Existing".into(), "Needs Response".into()]).unwrap();
+    assert_eq!(update["Body"]["ConflictResolution"], "NeverOverwrite");
+    let changes = update["Body"]["ItemChanges"][0]["Updates"]
+        .as_array()
+        .unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["Path"]["FieldURI"], "Categories");
+    let reply = reply_draft_request(
+        "id",
+        "key",
+        &ReplyInput {
+            body: "<draft>".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(reply["Body"]["MessageDisposition"], "SaveOnly");
+    assert_eq!(reply["Body"]["Items"][0]["__type"], "ReplyToItem:#Exchange");
+    assert_eq!(reply["Body"]["Items"][0]["ReferenceItemId"]["Id"], "id");
+    assert_eq!(
+        reply["Body"]["Items"][0]["NewBodyContent"]["Value"],
+        "&lt;draft&gt;"
+    );
+    assert!(batch_item_request(&[], false).is_err());
+    assert!(batch_item_request(&["id".into(), "id".into()], false).is_err());
+    let batch = batch_item_request(&["a".into(), "b".into()], false).unwrap();
+    assert_eq!(batch["Body"]["ItemIds"].as_array().unwrap().len(), 2);
+    assert!(batch.to_string().find("\"IsRead\":").is_none());
 }
 
 #[test]

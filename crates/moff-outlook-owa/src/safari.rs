@@ -11,6 +11,7 @@ use crate::{
 pub(super) struct SafariSession {
     target: TabTarget,
     runtime: tokio::runtime::Runtime,
+    allow_mutation: bool,
 }
 
 fn outlook_url(value: &str) -> bool {
@@ -30,6 +31,14 @@ fn outlook_url(value: &str) -> bool {
 impl OutlookWebSession {
     /// Use a loaded Outlook tab without exporting browser credentials.
     pub fn from_safari(target: Option<(u32, u32)>) -> Result<Self, OutlookWebError> {
+        Self::from_safari_with_mutations(target, false)
+    }
+
+    /// Explicitly opt into typed, non-sending writes; the raw read surface stays read-only.
+    pub fn from_safari_with_mutations(
+        target: Option<(u32, u32)>,
+        allow_mutation: bool,
+    ) -> Result<Self, OutlookWebError> {
         let runtime =
             tokio::runtime::Runtime::new().map_err(|_| OutlookWebError::SafariOperationFailed)?;
         let tabs = runtime
@@ -55,18 +64,35 @@ impl OutlookWebSession {
             origin: Url::parse(&tab.url).map_err(|_| OutlookWebError::SafariUnavailable)?,
             headers: BTreeMap::new(),
             client: http_client()?,
-            safari: Some(SafariSession { target, runtime }),
+            safari: Some(SafariSession {
+                target,
+                runtime,
+                allow_mutation,
+            }),
         })
     }
 }
 
 impl SafariSession {
-    pub(super) fn call(&self, action: &str, body: &Value) -> Result<Value, OutlookWebError> {
-        validate_read_action(action)?;
+    pub(super) fn call(
+        &self,
+        action: &'static str,
+        body: &Value,
+        mutation: bool,
+    ) -> Result<Value, OutlookWebError> {
+        if mutation {
+            if !self.allow_mutation
+                || !["CreateItem", "UpdateItem", "UpdateCalendarEvent"].contains(&action)
+            {
+                return Err(OutlookWebError::SafariReadOnly);
+            }
+        } else {
+            validate_read_action(action)?;
+        }
         let script = format!(
             "({})({})",
             include_str!("safari_read.js"),
-            json!({ "action": action, "body": body })
+            json!({ "action": action, "body": body, "mutation": mutation, "allow_mutation": self.allow_mutation })
         );
         let result = self
             .runtime
@@ -79,26 +105,50 @@ impl SafariSession {
                     timeout: 60,
                 },
             ))
-            .map_err(|_| OutlookWebError::SafariOperationFailed)?;
+            .map_err(|_| {
+                if mutation {
+                    OutlookWebError::OutcomeUnknown { action }
+                } else {
+                    OutlookWebError::SafariOperationFailed
+                }
+            })?;
         if result.truncated {
-            return Err(OutlookWebError::TruncatedSearch);
+            return Err(if mutation {
+                OutlookWebError::OutcomeUnknown { action }
+            } else {
+                OutlookWebError::TruncatedSearch
+            });
         }
         let value = result.value;
         let status = value["status"]
             .as_u64()
             .and_then(|n| u16::try_from(n).ok())
-            .ok_or(OutlookWebError::InvalidResponse)?;
+            .ok_or(if mutation {
+                OutlookWebError::OutcomeUnknown { action }
+            } else {
+                OutlookWebError::InvalidResponse
+            })?;
         if status == 401 {
             return Err(OutlookWebError::SessionExpired);
         }
         if !(200..300).contains(&status) {
+            if mutation && status >= 500 {
+                return Err(OutlookWebError::OutcomeUnknown { action });
+            }
             return Err(OutlookWebError::RequestRejected(status));
         }
-        decode_response(
-            value["body"]
-                .as_str()
-                .ok_or(OutlookWebError::InvalidResponse)?,
-        )
+        decode_response(value["body"].as_str().ok_or(if mutation {
+            OutlookWebError::OutcomeUnknown { action }
+        } else {
+            OutlookWebError::InvalidResponse
+        })?)
+        .map_err(|_| {
+            if mutation {
+                OutlookWebError::OutcomeUnknown { action }
+            } else {
+                OutlookWebError::InvalidResponse
+            }
+        })
     }
 }
 

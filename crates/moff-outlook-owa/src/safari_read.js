@@ -4,7 +4,26 @@ async function(config) {
     }
     const allowed = ["FindItem", "FindConversation", "GetItem", "GetConversationItems",
         "GetCalendarFolders", "GetCalendarFoldersV2", "GetCalendarView"];
-    if (!allowed.includes(config.action)) throw new Error("Unsupported read action");
+    const writes = ["CreateItem", "UpdateItem", "UpdateCalendarEvent"];
+    if (config.mutation === true) {
+        if (config.allow_mutation !== true || !writes.includes(config.action)) throw new Error("Unsupported write action");
+        const body = config.body?.Body;
+        if (!body || body.__type !== config.action + "Request:#Exchange") throw new Error("Invalid write envelope");
+        if (config.action === "CreateItem") {
+            if (!Array.isArray(body.Items) || body.Items.length !== 1) throw new Error("Invalid item count");
+            const item = body.Items[0];
+            if (item.__type === "CalendarItem:#Exchange") {
+                if (body.SendMeetingInvitations !== "SendToNone"
+                    || (body.MessageDisposition !== undefined && body.MessageDisposition !== "SaveOnly")
+                    || ["RequiredAttendees", "OptionalAttendees", "Resources"].some(k => item[k]?.length)) {
+                    throw new Error("Invitations are prohibited");
+                }
+            } else if (!["Message:#Exchange", "ReplyToItem:#Exchange"].includes(item.__type)
+                || body.MessageDisposition !== "SaveOnly") throw new Error("Sending is prohibited");
+        }
+        if (config.action === "UpdateItem" && body.MessageDisposition !== "SaveOnly") throw new Error("Sending is prohibited");
+        if (config.action === "UpdateCalendarEvent" && body.ShouldSendUpdateToAttendees !== false) throw new Error("Invitations are prohibited");
+    } else if (!allowed.includes(config.action)) throw new Error("Unsupported read action");
     if (!window.webpackChunkOwa) throw new Error("Outlook is not loaded; sign in and wait for Mail");
     let runtime;
     const chunks = window.webpackChunkOwa;

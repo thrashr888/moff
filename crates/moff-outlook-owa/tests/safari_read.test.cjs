@@ -51,3 +51,21 @@ test("contract drift and oversized data fail explicitly", async () => {
     await assert.rejects(fixture({changed: true}).call({action: "FindItem", body: {}}), /contract changed/);
     await assert.rejects(fixture({oversized: true}).call({action: "FindItem", body: {}}), /exceeds/);
 });
+test("typed writes require gate, save-only disposition and supported actions", async () => {
+    for (const config of [
+        {action:"CreateItem",mutation:true,body:{Body:{__type:"CreateItemRequest:#Exchange",MessageDisposition:"SaveOnly"}}},
+        {action:"SendItem",mutation:true,allow_mutation:true,body:{}},
+        {action:"CreateItem",mutation:true,allow_mutation:true,body:{Body:{__type:"CreateItemRequest:#Exchange",MessageDisposition:"SendAndSaveCopy"}}},
+        {action:"UpdateCalendarEvent",mutation:true,allow_mutation:true,body:{Body:{__type:"UpdateCalendarEventRequest:#Exchange",ShouldSendUpdateToAttendees:true}}}
+    ]) {
+        const f=fixture();
+        await assert.rejects(f.call(config));
+        assert.equal(f.requests.length,0);
+    }
+    const f=fixture();
+    const result=await f.call({action:"CreateItem",mutation:true,allow_mutation:true,
+        body:{Body:{__type:"CreateItemRequest:#Exchange",MessageDisposition:"SaveOnly",
+            Items:[{__type:"ReplyToItem:#Exchange"}]}}});
+    assert.equal(result.status,200);
+    assert.ok(!JSON.stringify(result).includes("test-secret"));
+});
