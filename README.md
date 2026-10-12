@@ -9,6 +9,14 @@ its own OAuth flow, use Azure CLI, access Keychain, automate desktop Outlook, us
 OCR, or persist a separate token cache. Exported-cURL transports and `--session-curl`
 have been removed; existing credential files are never read or deleted.
 
+## Installation
+
+Install Moff with Homebrew:
+
+```sh
+brew install thrashr888/tap/moff
+```
+
 ## Implemented commands
 
 ```sh
