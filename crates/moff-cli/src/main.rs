@@ -8,8 +8,8 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use moff_outlook_owa::{
     DEFAULT_MAX_FILE_BYTES, DraftInput, EventInput, EventMoveInput, LoopWorkspaceRequest,
-    MeetingResponseInput, OutlookWebError, OutlookWebSession, ProductWrite, ReplyInput,
-    WorkInput, WorkPlan, calendar_folders_request, calendar_view_request, product_segment,
+    MeetingResponseInput, OutlookWebError, OutlookWebSession, ProductWrite, ReplyInput, WorkInput,
+    WorkPlan, calendar_folders_request, calendar_view_request, product_segment,
     validate_contact_input, validate_file_size, validate_read_action,
 };
 use serde_json::{Value, json};
