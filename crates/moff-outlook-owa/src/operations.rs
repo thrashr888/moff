@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    OutlookWebError, OutlookWebSession, calendar_view_request, find_item_request, get_item_request,
-    header,
+    OutlookWebError, OutlookWebSession, ServiceCode, calendar_view_request, find_item_request,
+    get_item_request, header,
 };
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -31,6 +31,146 @@ pub struct ReplyInput {
     pub body: String,
     #[serde(default)]
     pub reply_all: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingResponse {
+    Accept,
+    Tentative,
+    Decline,
+}
+
+impl MeetingResponse {
+    fn item_type(self) -> &'static str {
+        match self {
+            Self::Accept => "AcceptItem:#Exchange",
+            Self::Tentative => "TentativelyAcceptItem:#Exchange",
+            Self::Decline => "DeclineItem:#Exchange",
+        }
+    }
+
+    fn response_type(self) -> &'static str {
+        match self {
+            Self::Accept => "Accept",
+            Self::Tentative => "Tentative",
+            Self::Decline => "Decline",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeetingResponseInput {
+    pub response: MeetingResponse,
+    pub message: Option<String>,
+    pub proposed_start: Option<String>,
+    pub proposed_end: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventMoveInput {
+    pub start: String,
+    pub end: String,
+}
+
+pub fn respond_event_request(
+    item: &Value,
+    input: &MeetingResponseInput,
+) -> Result<Value, OutlookWebError> {
+    type_is(item, "CalendarItem:#Exchange")?;
+    if item.get("IsMeeting").and_then(Value::as_bool) != Some(true)
+        || item.get("IsOrganizer").and_then(Value::as_bool) != Some(false)
+        || !matches!(
+            item.get("CalendarItemType").and_then(Value::as_str),
+            Some("Single" | "Occurrence" | "Exception")
+        )
+    {
+        return Err(OutlookWebError::UnsupportedItem);
+    }
+    let item_id = item.get("ItemId").ok_or(OutlookWebError::InvalidResponse)?;
+    nonempty(field(item_id, "/Id")?)?;
+    nonempty(field(item_id, "/ChangeKey")?)?;
+    if input
+        .message
+        .as_ref()
+        .is_some_and(|message| message.trim().is_empty())
+    {
+        return Err(OutlookWebError::InvalidInput(
+            "meeting response message must not be empty",
+        ));
+    }
+    let proposed_start = input.proposed_start.as_deref();
+    let proposed_end = input.proposed_end.as_deref();
+    if proposed_start.is_some() != proposed_end.is_some() {
+        return Err(OutlookWebError::InvalidInput(
+            "proposed_start and proposed_end must be provided together",
+        ));
+    }
+    if let (Some(start), Some(end)) = (proposed_start, proposed_end) {
+        if input.response == MeetingResponse::Accept {
+            return Err(OutlookWebError::InvalidInput(
+                "a proposed new time is only supported for tentative or decline responses",
+            ));
+        }
+        interval(start, end)?;
+    }
+
+    let mut response = json!({
+        "__type": input.response.item_type(),
+        "ReferenceItemId": item_id,
+    });
+    if let Some(message) = &input.message {
+        response["Body"] = json!({
+            "__type":"BodyContentType:#Exchange",
+            "BodyType":"Text",
+            "Value":message,
+        });
+    }
+    if let (Some(start), Some(end)) = (proposed_start, proposed_end) {
+        response["ProposedStart"] = json!(utc(start)?);
+        response["ProposedEnd"] = json!(utc(end)?);
+    }
+    Ok(envelope(
+        "CreateItem",
+        json!({
+            "__type":"CreateItemRequest:#Exchange",
+            "MessageDisposition":"SendAndSaveCopy",
+            "Items":[response]
+        }),
+    ))
+}
+
+fn meeting_organizer(item: &Value) -> Result<(), OutlookWebError> {
+    type_is(item, "CalendarItem:#Exchange")?;
+    if item.get("IsMeeting").and_then(Value::as_bool) != Some(true)
+        || item.get("IsOrganizer").and_then(Value::as_bool) != Some(true)
+        || !matches!(
+            item.get("CalendarItemType").and_then(Value::as_str),
+            Some("Single" | "Occurrence" | "Exception")
+        )
+    {
+        return Err(OutlookWebError::UnsupportedItem);
+    }
+    Ok(())
+}
+
+pub fn move_event_request(item: &Value, input: &EventMoveInput) -> Result<Value, OutlookWebError> {
+    meeting_organizer(item)?;
+    interval(&input.start, &input.end)?;
+    let mut request = update_event_request(
+        field(item, "/ItemId/Id")?,
+        &EventInput {
+            start: Some(input.start.clone()),
+            end: Some(input.end.clone()),
+            ..EventInput::default()
+        },
+    )?;
+    request["Body"]["ShouldSendUpdateToAttendees"] = json!(true);
+    request["Body"]["EventId"] = item["ItemId"].clone();
+    request["Body"]["ItemChange"]["ItemId"] = item["ItemId"].clone();
+    Ok(request)
 }
 
 pub fn batch_item_request(ids: &[String], calendar: bool) -> Result<Value, OutlookWebError> {
@@ -320,6 +460,23 @@ pub fn delete_event_request(id: &str, key: &str) -> Result<Value, OutlookWebErro
     delete_message_request(id, key)
 }
 
+pub fn cancel_meeting_request(item: &Value) -> Result<Value, OutlookWebError> {
+    meeting_organizer(item)?;
+    let item_id = item.get("ItemId").ok_or(OutlookWebError::InvalidResponse)?;
+    nonempty(field(item_id, "/Id")?)?;
+    nonempty(field(item_id, "/ChangeKey")?)?;
+    Ok(envelope(
+        "DeleteItem",
+        json!({
+            "__type":"DeleteItemRequest:#Exchange",
+            "DeleteType":"MoveToDeletedItems",
+            "SendMeetingCancellations":"SendToAllAndSaveCopy",
+            "SuppressReadReceipts":true,
+            "ItemIds":[item_id]
+        }),
+    ))
+}
+
 enum Mutation {
     CreateDraft,
     UpdateDraft,
@@ -327,14 +484,17 @@ enum Mutation {
     CreateEvent,
     UpdateEvent,
     DeleteEvent,
+    RespondEvent,
+    MoveEvent,
+    CancelMeeting,
 }
 impl Mutation {
     fn action(&self) -> &'static str {
         match self {
-            Self::CreateDraft | Self::CreateEvent => "CreateItem",
+            Self::CreateDraft | Self::CreateEvent | Self::RespondEvent => "CreateItem",
             Self::UpdateDraft => "UpdateItem",
-            Self::DeleteMessage | Self::DeleteEvent => "DeleteItem",
-            Self::UpdateEvent => "UpdateCalendarEvent",
+            Self::DeleteMessage | Self::DeleteEvent | Self::CancelMeeting => "DeleteItem",
+            Self::UpdateEvent | Self::MoveEvent => "UpdateCalendarEvent",
         }
     }
 }
@@ -441,6 +601,7 @@ pub fn calendar_item_request(id: &str) -> Value {
             "Location",
             "IsAllDayEvent",
             "LegacyFreeBusyStatus",
+            "MyResponseType",
         ],
     )
 }
@@ -706,6 +867,60 @@ impl OutlookWebSession {
             .get("IsDraft")
             .and_then(Value::as_bool)
             != Some(true)
+        {
+            return Err(OutlookWebError::VerificationFailed);
+        }
+        Ok(result)
+    }
+    pub fn move_event(&self, id: &str, input: &EventMoveInput) -> Result<Value, OutlookWebError> {
+        nonempty(id)?;
+        let response = self.calendar_get(id)?;
+        let item = single_item(&response)?;
+        let request = move_event_request(item, input)?;
+        let result = self.execute(Mutation::MoveEvent.action(), &request, true)?;
+        let verified = self
+            .calendar_get(id)
+            .map_err(|_| OutlookWebError::VerificationFailed)?;
+        let moved = single_item(&verified).map_err(|_| OutlookWebError::VerificationFailed)?;
+        if datetime(&input.start).ok() != moved["Start"].as_str().and_then(|v| datetime(v).ok())
+            || datetime(&input.end).ok() != moved["End"].as_str().and_then(|v| datetime(v).ok())
+        {
+            return Err(OutlookWebError::VerificationFailed);
+        }
+        Ok(result)
+    }
+    pub fn cancel_meeting(&self, id: &str) -> Result<Value, OutlookWebError> {
+        nonempty(id)?;
+        let response = self.calendar_get(id)?;
+        let item = single_item(&response)?;
+        let request = cancel_meeting_request(item)?;
+        self.execute(Mutation::CancelMeeting.action(), &request, true)?;
+        match self.calendar_get(id) {
+            Err(OutlookWebError::OperationRejected {
+                code: ServiceCode::ItemNotFound,
+                ..
+            }) => Ok(json!({"cancelled":true,"item_id":id,"attendee_notifications":"sent"})),
+            Ok(_) => Err(OutlookWebError::VerificationFailed),
+            Err(error) => Err(error),
+        }
+    }
+    pub fn respond_event(
+        &self,
+        id: &str,
+        input: &MeetingResponseInput,
+    ) -> Result<Value, OutlookWebError> {
+        nonempty(id)?;
+        let response = self.calendar_get(id)?;
+        let item = single_item(&response)?;
+        let request = respond_event_request(item, input)?;
+        let result = self.execute(Mutation::RespondEvent.action(), &request, true)?;
+        let verified = self
+            .calendar_get(id)
+            .map_err(|_| OutlookWebError::VerificationFailed)?;
+        let verified_item =
+            single_item(&verified).map_err(|_| OutlookWebError::VerificationFailed)?;
+        if verified_item.get("MyResponseType").and_then(Value::as_str)
+            != Some(input.response.response_type())
         {
             return Err(OutlookWebError::VerificationFailed);
         }

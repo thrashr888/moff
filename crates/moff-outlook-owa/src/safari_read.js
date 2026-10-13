@@ -23,17 +23,57 @@ async function(config, acquireToken, readResponse) {
                     || ["RequiredAttendees", "OptionalAttendees", "Resources"].some(k => item[k]?.length)) {
                     throw new Error("Invitations are prohibited");
                 }
+            } else if (["AcceptItem:#Exchange", "TentativelyAcceptItem:#Exchange", "DeclineItem:#Exchange"].includes(item.__type)) {
+                const allowedKeys = ["__type", "ReferenceItemId", "Body", "ProposedStart", "ProposedEnd"];
+                const allowedBodyKeys = ["__type", "MessageDisposition", "ItemShape", "Items"];
+                const hasProposal = item.ProposedStart !== undefined || item.ProposedEnd !== undefined;
+                const proposalStart = Date.parse(item.ProposedStart);
+                const proposalEnd = Date.parse(item.ProposedEnd);
+                if (body.MessageDisposition !== "SendAndSaveCopy" || body.Items.length !== 1
+                    || Object.keys(body).some(k => !allowedBodyKeys.includes(k))
+                    || Object.keys(item).some(k => !allowedKeys.includes(k))
+                    || !item.ReferenceItemId?.Id || !item.ReferenceItemId?.ChangeKey
+                    || Object.keys(item.ReferenceItemId).some(k => !["__type", "Id", "ChangeKey"].includes(k))
+                    || (item.Body !== undefined
+                        && (item.Body.__type !== "BodyContentType:#Exchange"
+                            || item.Body.BodyType !== "Text" || typeof item.Body.Value !== "string"))
+                    || (hasProposal && (!["DeclineItem:#Exchange", "TentativelyAcceptItem:#Exchange"].includes(item.__type)
+                        || !item.ProposedStart || !item.ProposedEnd || !Number.isFinite(proposalStart)
+                        || !Number.isFinite(proposalEnd) || proposalEnd <= proposalStart))) {
+                    throw new Error("Invalid meeting response");
+                }
             } else if (!["Message:#Exchange", "ReplyToItem:#Exchange", "ReplyAllToItem:#Exchange","Contact:#Exchange"].includes(item.__type)
                 || body.MessageDisposition !== "SaveOnly") throw new Error("Sending is prohibited");
             if (item.__type === "Contact:#Exchange" && body.SavedItemFolderId?.BaseFolderId?.Id !== "contacts")
                 throw new Error("Contacts must be created in the personal contacts folder");
         }
         if (config.action === "UpdateItem" && body.MessageDisposition !== "SaveOnly") throw new Error("Sending is prohibited");
-        if (config.action === "UpdateCalendarEvent" && body.ShouldSendUpdateToAttendees !== false) throw new Error("Invitations are prohibited");
+        if (config.action === "UpdateCalendarEvent") {
+            if (body.ShouldSendUpdateToAttendees === true) {
+                const itemId = body.ItemChange?.ItemId;
+                const eventId = body.EventId;
+                const updates = body.ItemChange?.Updates;
+                const fields = Array.isArray(updates)
+                    ? updates.map(update => update.Path?.FieldURI).sort()
+                    : [];
+                const start = updates?.find(update => update.Path?.FieldURI === "Start")?.Item?.Start;
+                const end = updates?.find(update => update.Path?.FieldURI === "End")?.Item?.End;
+                if (body.EventScope !== 0 || body.TargetAudience !== 0 || fields.join(",") !== "End,Start"
+                    || !itemId?.Id || !itemId?.ChangeKey || eventId?.Id !== itemId.Id
+                    || eventId?.ChangeKey !== itemId.ChangeKey || !start || !end
+                    || !Number.isFinite(Date.parse(start)) || !Number.isFinite(Date.parse(end))
+                    || Date.parse(end) <= Date.parse(start)) {
+                    throw new Error("Only an explicit, versioned meeting-time move may notify attendees");
+                }
+            } else if (body.ShouldSendUpdateToAttendees !== false) {
+                throw new Error("Invitations are prohibited");
+            }
+        }
         if (config.action === "DeleteItem" && (body.DeleteType !== "MoveToDeletedItems"
-            || body.SendMeetingCancellations !== "SendToNone" || body.SuppressReadReceipts !== true
+            || !["SendToNone", "SendToAllAndSaveCopy"].includes(body.SendMeetingCancellations)
+            || body.SuppressReadReceipts !== true
             || !Array.isArray(body.ItemIds) || body.ItemIds.length !== 1
-            || !body.ItemIds[0].Id || !body.ItemIds[0].ChangeKey)) throw new Error("Only a single versioned, non-sending recycle operation is allowed");
+            || !body.ItemIds[0].Id || !body.ItemIds[0].ChangeKey)) throw new Error("Only a single versioned recycle or attendee-notifying cancellation is allowed");
     } else if (!authOnly && !allowed.includes(config.action)) throw new Error("Unsupported read action");
     let token = await acquireToken(location.origin);
     if (token.status !== 200) {

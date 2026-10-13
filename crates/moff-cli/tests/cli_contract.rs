@@ -113,6 +113,74 @@ fn mutations_require_confirmation_and_opt_in_before_browser_access() {
 }
 
 #[test]
+fn meeting_mutations_require_opt_in_and_confirmation() {
+    for args in [
+        vec![
+            "calendar",
+            "respond",
+            "--id",
+            "fake",
+            "--body-file",
+            "/not/read",
+            "--confirm",
+        ],
+        vec![
+            "calendar",
+            "move",
+            "--id",
+            "fake",
+            "--body-file",
+            "/not/read",
+            "--confirm",
+        ],
+        vec!["calendar", "cancel", "--id", "fake", "--confirm"],
+    ] {
+        moff()
+            .arg("outlook")
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(contains("--allow-mutation"));
+    }
+    for args in [
+        vec![
+            "outlook",
+            "--allow-mutation",
+            "calendar",
+            "respond",
+            "--id",
+            "fake",
+            "--body-file",
+            "/not/read",
+        ],
+        vec![
+            "outlook",
+            "--allow-mutation",
+            "calendar",
+            "move",
+            "--id",
+            "fake",
+            "--body-file",
+            "/not/read",
+        ],
+        vec![
+            "outlook",
+            "--allow-mutation",
+            "calendar",
+            "cancel",
+            "--id",
+            "fake",
+        ],
+    ] {
+        moff()
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(contains("--confirm"));
+    }
+}
+
+#[test]
 fn auth_has_root_and_outlook_aliases_and_an_explicit_refresh_gate() {
     for prefix in [vec!["auth"], vec!["outlook", "auth"]] {
         moff()
@@ -158,6 +226,9 @@ fn schema_is_honest_about_unavailable_products_and_safe_writes() {
     assert_eq!(schema["commands"]["mail"]["mark"], true);
     assert_eq!(schema["commands"]["mail"]["reply_all_draft"], true);
     assert_eq!(schema["commands"]["mail"]["send"], false);
+    assert_eq!(schema["commands"]["calendar"]["respond"], true);
+    assert_eq!(schema["commands"]["calendar"]["move"], true);
+    assert_eq!(schema["commands"]["calendar"]["cancel"], true);
     for product in ["mail", "calendar"] {
         assert_eq!(schema["commands"][product]["delete"], true);
         assert_eq!(schema["commands"][product]["get-batch"], true);
