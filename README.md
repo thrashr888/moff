@@ -55,7 +55,47 @@ moff outlook calendar get --id '<event-id>'
 moff outlook --allow-mutation calendar create --folder-id '<calendar-folder-id>' \
   --body-file event.json --confirm
 moff outlook --allow-mutation calendar update --id '<event-id>' --body-file event-update.json --confirm
+
+# Send an RSVP to one received meeting invitation. Response is accept, tentative, or decline.
+moff outlook --allow-mutation calendar respond --id '<meeting-event-id>' \
+  --body-file meeting-response.json --confirm
+
+# Move one meeting you organized and send the updated time to attendees.
+moff outlook --allow-mutation calendar move --id '<meeting-event-id>' \
+  --body-file meeting-time.json --confirm
+
+# Cancel one meeting you organized and notify all attendees.
+moff outlook --allow-mutation calendar cancel --id '<meeting-event-id>' --confirm
 ```
+
+`meeting-response.json` contains a `response` value (`accept`, `tentative`, or
+`decline`), an optional `message` string, and optional `proposed_start` and
+`proposed_end` RFC3339 strings. A proposed time requires both endpoints and
+works only with `tentative` or `decline`. This sends a meeting response; it is
+not a draft. Moff verifies that the target is a meeting you received, not one
+you organized, and rejects recurring-series masters. Respond to individual
+occurrences separately. `meeting-time.json` contains `start` and `end` RFC3339
+strings; move sends the update to attendees and is limited to meetings you
+organized. It rejects recurring-series masters.
+
+For example:
+
+```json
+{
+  "response": "tentative",
+  "message": "I may be able to attend; could we move this?",
+  "proposed_start": "2026-10-28T16:00:00Z",
+  "proposed_end": "2026-10-28T17:00:00Z"
+}
+```
+
+`calendar cancel` cancels one meeting you organized and sends a cancellation
+notification to attendees. The current Outlook service contract does not expose
+a custom cancellation message, so the command cannot attach one. It rejects
+received invitations and recurring-series masters.
+
+`calendar delete` remains a non-notifying recycle operation for personal
+appointments. It does not cancel a meeting or notify attendees.
 
 Mail, Calendar, and personal Contacts use only allowlisted, in-tab `POST /owa/service.svc?action=<Action>&app=Mail` requests. `outlook service read` remains read-only and cannot invoke mutation actions. People recommendations, Org, OneDrive, Groups, and drive-backed Loop files read metadata through allowlisted Graph GET requests executed inside the same Safari session. Native Loop workspaces use a separate in-page Substrate adapter.
 
@@ -228,7 +268,7 @@ Event creation requires `subject`, `start`, and `end`, with an optional plain-te
 
 Unknown JSON fields are rejected, including recipients, attendees, recurrence, and raw Graph/OWA request envelopes. Draft updates verify that the message is still a draft and include its current change key. Mail/calendar deletion moves a single versioned item to Deleted Items; permanent deletion and cancellation notifications are prohibited.
 
-Calendar writes are limited to **single, organizer-owned appointments without attendees**. Creation sends no invitations and disables reminders. Updates reject meetings, attendee/resource lists, and recurring events.
+Calendar appointment creation, updates, and deletion are limited to **single, organizer-owned appointments without attendees**. Creation sends no invitations and disables reminders. Updates reject meetings, attendee/resource lists, and recurring events. Meeting RSVP is a separate, confirmed send operation supporting accept, tentative, or decline with an optional message and proposed new time; it only targets received invitations and never responds to recurring-series masters. `calendar move` explicitly sends an updated time to attendees for an organizer-owned meeting occurrence. `calendar cancel` sends attendee cancellation notifications for a meeting you organized; it has no custom-message support in the current service contract.
 
 There is **no send command**. Moff never automatically retries requests or follows redirects. An ambiguous mutation result reports that its outcome is unknown: inspect the source folder/calendar before deciding what to do, rather than repeating the mutation.
 

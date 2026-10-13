@@ -1,8 +1,9 @@
 use moff_outlook_owa::{
-    DraftInput, EventInput, ReplyInput, batch_item_request, categories_request,
-    create_draft_request, create_event_request, delete_event_request, delete_message_request,
-    reply_draft_request, search_item_request, update_draft_request, update_event_request,
-    validate_read_action,
+    DraftInput, EventInput, EventMoveInput, MeetingResponse, MeetingResponseInput, ReplyInput,
+    batch_item_request, cancel_meeting_request, categories_request, create_draft_request,
+    create_event_request, delete_event_request, delete_message_request, move_event_request,
+    reply_draft_request, respond_event_request, search_item_request, update_draft_request,
+    update_event_request, validate_read_action,
 };
 use serde_json::json;
 
@@ -79,6 +80,168 @@ fn calendar_writes_use_distinct_observed_actions_and_single_event_scope() {
     assert_eq!(delete["Body"]["__type"], "DeleteItemRequest:#Exchange");
     assert_eq!(delete["Body"]["DeleteType"], "MoveToDeletedItems");
     assert_eq!(delete["Body"]["ItemIds"][0]["ChangeKey"], "synthetic-key");
+}
+
+#[test]
+fn meeting_responses_send_only_typed_rsvps_with_optional_message() {
+    let meeting = json!({
+        "__type":"CalendarItem:#Exchange",
+        "ItemId":{"__type":"ItemId:#Exchange","Id":"synthetic-id","ChangeKey":"synthetic-key"},
+        "IsMeeting":true,
+        "IsOrganizer":false,
+        "CalendarItemType":"Occurrence"
+    });
+    let input = MeetingResponseInput {
+        response: MeetingResponse::Decline,
+        message: Some("I will be at HashiConf.".into()),
+        proposed_start: Some("2026-10-28T16:00:00Z".into()),
+        proposed_end: Some("2026-10-28T17:00:00Z".into()),
+    };
+    let request = respond_event_request(&meeting, &input).unwrap();
+    assert_eq!(request["__type"], "CreateItemJsonRequest:#Exchange");
+    assert_eq!(request["Body"]["MessageDisposition"], "SendAndSaveCopy");
+    assert_eq!(
+        request["Body"]["Items"][0]["__type"],
+        "DeclineItem:#Exchange"
+    );
+    assert_eq!(
+        request["Body"]["Items"][0]["ReferenceItemId"]["ChangeKey"],
+        "synthetic-key"
+    );
+    assert_eq!(
+        request["Body"]["Items"][0]["Body"]["Value"],
+        "I will be at HashiConf."
+    );
+    assert_eq!(request["Body"]["Items"][0]["Body"]["BodyType"], "Text");
+    assert_eq!(
+        request["Body"]["Items"][0]["ProposedStart"],
+        "2026-10-28T16:00:00Z"
+    );
+    for (meeting, response) in [
+        (
+            json!({"__type":"CalendarItem:#Exchange","IsMeeting":false,"IsOrganizer":false,"CalendarItemType":"Single"}),
+            MeetingResponse::Accept,
+        ),
+        (
+            json!({"__type":"CalendarItem:#Exchange","IsMeeting":true,"IsOrganizer":true,"CalendarItemType":"Single"}),
+            MeetingResponse::Decline,
+        ),
+        (
+            json!({"__type":"CalendarItem:#Exchange","IsMeeting":true,"IsOrganizer":false,"CalendarItemType":"RecurringMaster"}),
+            MeetingResponse::Tentative,
+        ),
+    ] {
+        assert!(
+            respond_event_request(
+                &meeting,
+                &MeetingResponseInput {
+                    response,
+                    message: None,
+                    proposed_start: None,
+                    proposed_end: None,
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            respond_event_request(
+                &meeting,
+                &MeetingResponseInput {
+                    response: MeetingResponse::Tentative,
+                    message: None,
+                    proposed_start: Some("2026-10-28T17:00:00Z".into()),
+                    proposed_end: Some("2026-10-28T16:00:00Z".into()),
+                }
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        serde_json::from_value::<MeetingResponseInput>(json!({
+            "response":"decline","message":"Away","recipients":["someone@example.com"]
+        }))
+        .is_err()
+    );
+    assert!(
+        respond_event_request(
+            &meeting,
+            &MeetingResponseInput {
+                response: MeetingResponse::Accept,
+                message: None,
+                proposed_start: Some("2026-10-28T16:00:00Z".into()),
+                proposed_end: Some("2026-10-28T17:00:00Z".into()),
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn moving_meetings_requires_organizer_and_notifies_attendees() {
+    let meeting = json!({
+        "__type":"CalendarItem:#Exchange",
+        "ItemId":{"__type":"ItemId:#Exchange","Id":"synthetic-id","ChangeKey":"synthetic-key"},
+        "IsMeeting":true,
+        "IsOrganizer":true,
+        "CalendarItemType":"Occurrence"
+    });
+    let input = EventMoveInput {
+        start: "2026-10-28T16:00:00Z".into(),
+        end: "2026-10-28T17:00:00Z".into(),
+    };
+    let request = move_event_request(&meeting, &input).unwrap();
+    assert_eq!(
+        request["Body"]["__type"],
+        "UpdateCalendarEventRequest:#Exchange"
+    );
+    assert_eq!(request["Body"]["ShouldSendUpdateToAttendees"], true);
+    assert_eq!(
+        request["Body"]["ItemChange"]["ItemId"]["ChangeKey"],
+        "synthetic-key"
+    );
+    assert_eq!(
+        request["Body"]["ItemChange"]["Updates"][0]["Path"]["FieldURI"],
+        "Start"
+    );
+    assert_eq!(
+        request["Body"]["ItemChange"]["Updates"][1]["Path"]["FieldURI"],
+        "End"
+    );
+    let attendee_meeting = json!({
+        "__type":"CalendarItem:#Exchange",
+        "ItemId":{"Id":"id","ChangeKey":"key"},
+        "IsMeeting":true,
+        "IsOrganizer":false,
+        "CalendarItemType":"Single"
+    });
+    assert!(move_event_request(&attendee_meeting, &input).is_err());
+}
+
+#[test]
+fn cancelling_meetings_notifies_attendees_and_requires_the_organizer() {
+    let meeting = json!({
+        "__type":"CalendarItem:#Exchange",
+        "ItemId":{"__type":"ItemId:#Exchange","Id":"synthetic-id","ChangeKey":"synthetic-key"},
+        "IsMeeting":true,
+        "IsOrganizer":true,
+        "CalendarItemType":"Single"
+    });
+    let request = cancel_meeting_request(&meeting).unwrap();
+    assert_eq!(request["Body"]["__type"], "DeleteItemRequest:#Exchange");
+    assert_eq!(request["Body"]["DeleteType"], "MoveToDeletedItems");
+    assert_eq!(
+        request["Body"]["SendMeetingCancellations"],
+        "SendToAllAndSaveCopy"
+    );
+    assert_eq!(request["Body"]["ItemIds"][0]["ChangeKey"], "synthetic-key");
+    let attendee_meeting = json!({
+        "__type":"CalendarItem:#Exchange",
+        "ItemId":{"Id":"id","ChangeKey":"key"},
+        "IsMeeting":true,
+        "IsOrganizer":false,
+        "CalendarItemType":"Single"
+    });
+    assert!(cancel_meeting_request(&attendee_meeting).is_err());
 }
 
 #[test]

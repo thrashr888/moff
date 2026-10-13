@@ -7,10 +7,10 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use moff_outlook_owa::{
-    DEFAULT_MAX_FILE_BYTES, DraftInput, EventInput, LoopWorkspaceRequest, OutlookWebError,
-    OutlookWebSession, ProductWrite, ReplyInput, WorkInput, WorkPlan, calendar_folders_request,
-    calendar_view_request, product_segment, validate_contact_input, validate_file_size,
-    validate_read_action,
+    DEFAULT_MAX_FILE_BYTES, DraftInput, EventInput, EventMoveInput, LoopWorkspaceRequest,
+    MeetingResponseInput, OutlookWebError, OutlookWebSession, ProductWrite, ReplyInput,
+    WorkInput, WorkPlan, calendar_folders_request, calendar_view_request, product_segment,
+    validate_contact_input, validate_file_size, validate_read_action,
 };
 use serde_json::{Value, json};
 
@@ -279,6 +279,31 @@ enum CalendarCommand {
     },
     /// Recycle one personal appointment without sending cancellations.
     Delete {
+        #[arg(long)]
+        id: String,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Respond to one received meeting invitation and send the RSVP.
+    Respond {
+        #[arg(long)]
+        id: String,
+        #[arg(long, value_name = "PATH")]
+        body_file: PathBuf,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Move one organizer-owned meeting and send an update to its attendees.
+    Move {
+        #[arg(long)]
+        id: String,
+        #[arg(long, value_name = "PATH")]
+        body_file: PathBuf,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Cancel one organizer-owned meeting and notify all attendees.
+    Cancel {
         #[arg(long)]
         id: String,
         #[arg(long, required = true)]
@@ -579,7 +604,7 @@ fn schema() -> Value {
         "commands":{
             "auth":{"refresh":true,"status":true},
             "mail":{"list":true,"search":true,"get":true,"get-batch":true,"categories":true,"reply-draft":true,"reply_all_draft":true,"mark":true,"create":true,"update":true,"delete":true,"send":false},
-            "calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"get-batch":true,"availability":true,"work-blocks":{"plan":true,"apply":true},"create":true,"update":true,"delete":true},
+            "calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"get-batch":true,"availability":true,"work-blocks":{"plan":true,"apply":true},"create":true,"update":true,"delete":true,"respond":true,"move":true,"cancel":true},
             "people":{"list":true,"search":true,"get":true,"contacts":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true}},
             "org":{"list":true,"get":true,"search":true,"manager":true,"reports":true,"create":false,"update":false,"delete":false},
             "onedrive":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true,"upload":true,"download":true},
@@ -1380,6 +1405,9 @@ fn calendar_result(
             CalendarCommand::Create { .. }
                 | CalendarCommand::Update { .. }
                 | CalendarCommand::Delete { .. }
+                | CalendarCommand::Respond { .. }
+                | CalendarCommand::Move { .. }
+                | CalendarCommand::Cancel { .. }
                 | CalendarCommand::WorkBlocks {
                     command: WorkBlockCommand::Apply { .. }
                 }
@@ -1502,6 +1530,41 @@ fn calendar_result(
             Ok((
                 "outlook.calendar.delete",
                 with_owa(args, |s| s.delete_event(&id))?,
+            ))
+        }
+        CalendarCommand::Respond {
+            id,
+            body_file,
+            confirm,
+        } => {
+            let input: MeetingResponseInput =
+                serde_json::from_value(confirmed_json(&body_file, confirm)?)
+                    .map_err(|_| "--body-file must contain response (accept, tentative, or decline), an optional message, and optional proposed_start/proposed_end RFC3339 timestamps")?;
+            Ok((
+                "outlook.calendar.respond",
+                with_owa(args, |s| s.respond_event(&id, &input))?,
+            ))
+        }
+        CalendarCommand::Move {
+            id,
+            body_file,
+            confirm,
+        } => {
+            let input: EventMoveInput =
+                serde_json::from_value(confirmed_json(&body_file, confirm)?)
+                    .map_err(|_| "--body-file must contain start and end RFC3339 strings")?;
+            Ok((
+                "outlook.calendar.move",
+                with_owa(args, |s| s.move_event(&id, &input))?,
+            ))
+        }
+        CalendarCommand::Cancel { id, confirm } => {
+            if !confirm {
+                return Err("mutations require --confirm".to_owned());
+            }
+            Ok((
+                "outlook.calendar.cancel",
+                with_owa(args, |s| s.cancel_meeting(&id))?,
             ))
         }
     }

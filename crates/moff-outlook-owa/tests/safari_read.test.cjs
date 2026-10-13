@@ -144,12 +144,67 @@ test("typed writes require gate, save-only disposition and supported actions", a
             SavedItemFolderId:{BaseFolderId:{Id:"inbox"}},Items:[{__type:"Contact:#Exchange"}]}}}));
 });
 
+test("meeting responses require a typed, versioned RSVP and explicit send disposition", async () => {
+    const response = {Body:{__type:"CreateItemRequest:#Exchange",MessageDisposition:"SendAndSaveCopy",
+        ItemShape:{__type:"ItemResponseShape:#Exchange",BaseShape:"IdOnly"},
+        Items:[{__type:"DeclineItem:#Exchange",
+            ReferenceItemId:{__type:"ItemId:#Exchange",Id:"synthetic",ChangeKey:"key"},
+            Body:{__type:"BodyContentType:#Exchange",BodyType:"Text",Value:"I'll be at HashiConf."},
+            ProposedStart:"2026-10-28T16:00:00Z",ProposedEnd:"2026-10-28T17:00:00Z"}]}};
+    const f=fixture();
+    assert.equal((await f.call({action:"CreateItem",mutation:true,allow_mutation:true,body:response})).status,200);
+    for (const change of [
+        {MessageDisposition:"SaveOnly"},
+        {ToRecipients:[{EmailAddress:"other@example.com"}]},
+        {Items:[{...response.Body.Items[0],ReferenceItemId:{Id:"synthetic"}}]},
+        {Items:[{...response.Body.Items[0],Unexpected:"value"}]},
+        {Items:[{...response.Body.Items[0],Body:{BodyType:"Text",Value:"message"}}]},
+        {Items:[{...response.Body.Items[0],__type:"AcceptItem:#Exchange"}]},
+        {Items:[{...response.Body.Items[0],ProposedEnd:undefined}]},
+    ]) {
+        const f=fixture();
+        await assert.rejects(f.call({action:"CreateItem",mutation:true,allow_mutation:true,
+            body:{Body:{...response.Body,...change}}}));
+        assert.equal(f.requests.length,0);
+    }
+});
+
+test("attendee notifications are allowed only for a versioned start/end move", async () => {
+    const body = {Body:{__type:"UpdateCalendarEventRequest:#Exchange",
+        EventId:{__type:"ItemId:#Exchange",Id:"synthetic",ChangeKey:"key"},
+        EventScope:0,TargetAudience:0,ShouldSendUpdateToAttendees:true,
+        ItemChange:{__type:"ItemChange:#Exchange",
+            ItemId:{__type:"ItemId:#Exchange",Id:"synthetic",ChangeKey:"key"},
+            Updates:[
+                {__type:"SetItemField:#Exchange",Path:{__type:"PropertyUri:#Exchange",FieldURI:"Start"},
+                    Item:{__type:"CalendarItem:#Exchange",Start:"2026-10-28T16:00:00Z"}},
+                {__type:"SetItemField:#Exchange",Path:{__type:"PropertyUri:#Exchange",FieldURI:"End"},
+                    Item:{__type:"CalendarItem:#Exchange",End:"2026-10-28T17:00:00Z"}}
+            ]}}};
+    const f=fixture();
+    assert.equal((await f.call({action:"UpdateCalendarEvent",mutation:true,allow_mutation:true,body})).status,200);
+    for (const change of [
+        {EventScope:1},
+        {ItemChange:{...body.Body.ItemChange,Updates:[...body.Body.ItemChange.Updates,
+            {__type:"SetItemField:#Exchange",Path:{__type:"PropertyUri:#Exchange",FieldURI:"Subject"},
+                Item:{__type:"CalendarItem:#Exchange",Subject:"Changed"}}]}},
+    ]) {
+        const f=fixture();
+        await assert.rejects(f.call({action:"UpdateCalendarEvent",mutation:true,allow_mutation:true,
+            body:{Body:{...body.Body,...change}}}));
+        assert.equal(f.requests.length,0);
+    }
+});
+
 test("recycle operations require one versioned item and prohibit permanent deletion or notifications", async () => {
     const body = {Body:{__type:"DeleteItemRequest:#Exchange",DeleteType:"MoveToDeletedItems",
         SendMeetingCancellations:"SendToNone",SuppressReadReceipts:true,
         ItemIds:[{Id:"synthetic",ChangeKey:"key"}]}};
     const f = fixture();
     assert.equal((await f.call({action:"DeleteItem",mutation:true,allow_mutation:true,body})).status,200);
+    const cancel = fixture();
+    assert.equal((await cancel.call({action:"DeleteItem",mutation:true,allow_mutation:true,
+        body:{Body:{...body.Body,SendMeetingCancellations:"SendToAllAndSaveCopy"}}})).status,200);
     for (const change of [{DeleteType:"HardDelete"},{SendMeetingCancellations:"SendToAll"},
         {SuppressReadReceipts:false},{ItemIds:[{Id:"synthetic"}]}]) {
         const f = fixture();
