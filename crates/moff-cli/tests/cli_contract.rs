@@ -233,12 +233,7 @@ fn schema_is_honest_about_unavailable_products_and_safe_writes() {
         assert_eq!(schema["commands"][product]["delete"], true);
         assert_eq!(schema["commands"][product]["get-batch"], true);
     }
-    assert!(
-        schema["unimplemented_products"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(schema["unimplemented_products"], serde_json::json!([]));
     assert_eq!(schema["commands"]["people"]["search"], true);
     assert_eq!(schema["commands"]["people"]["contacts"]["create"], true);
     assert_eq!(schema["commands"]["groups"]["update"], true);

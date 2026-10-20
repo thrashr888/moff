@@ -1,3 +1,5 @@
+mod mcp;
+
 use std::{
     fs,
     io::Read,
@@ -47,6 +49,13 @@ enum Command {
         command: OutlookCommand,
     },
     Schema,
+    /// Serve read-only Outlook mail and calendar tools over MCP (stdio), with MCP Apps cards.
+    Mcp {
+        #[arg(long, requires = "safari_tab", value_parser = clap::value_parser!(u32).range(1..))]
+        safari_window: Option<u32>,
+        #[arg(long, requires = "safari_window", value_parser = clap::value_parser!(u32).range(1..))]
+        safari_tab: Option<u32>,
+    },
 }
 
 #[derive(Debug, Args, Clone, Copy)]
@@ -1587,6 +1596,13 @@ fn main() -> ExitCode {
                     },
             },
         ) => run_workspace(args, &command),
+        Some(Command::Mcp {
+            safari_window,
+            safari_tab,
+        }) => match mcp::serve_stdio(safari_window.zip(safari_tab)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => error(e),
+        },
         Some(Command::Schema) => {
             print_json(&schema());
             ExitCode::SUCCESS
