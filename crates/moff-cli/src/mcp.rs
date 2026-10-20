@@ -439,7 +439,8 @@ fn message(item: &Value) -> Value {
         "conversation_id": item.pointer("/ConversationId/Id"),
         "subject": item["Subject"],
         "from": mailbox(item.get("From").unwrap_or(&item["Sender"])),
-        "received": item["DateTimeReceived"],
+        // Folder listings carry only DateTimeSent; full reads carry DateTimeReceived.
+        "received": item.get("DateTimeReceived").unwrap_or(&item["DateTimeSent"]),
         "is_read": item["IsRead"],
         "is_draft": item["IsDraft"],
         "has_attachments": item["HasAttachments"],

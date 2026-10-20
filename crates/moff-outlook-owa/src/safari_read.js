@@ -92,7 +92,7 @@ async function(config, acquireToken, readResponse) {
         const response = await fetch("/owa/service.svc?action=" + config.action + "&app=Mail", {
             method: "POST", mode: "same-origin", credentials: "same-origin", redirect: "error",
             headers: {"content-type": "application/json", action: config.action,
-                authorization: "Bearer " + token.accessToken},
+                authorization: token.authorization},
             body: JSON.stringify(config.body), signal: controller.signal
         });
         token = null;

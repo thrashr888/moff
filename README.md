@@ -480,7 +480,8 @@ are `ui://` resources (`text/html;profile=mcp-app`) linked from each tool's
 
 Moff works in a signed-in Outlook tab on `outlook.office.com` or
 `outlook.cloud.microsoft` (work and school accounts) and `outlook.live.com`
-(personal Microsoft accounts). Graph-backed commands (people, org, groups, Loop)
+(personal Microsoft accounts). On personal accounts, Mail and Calendar
+requests use Outlook's own MSA service token (`MSAuth1.0`); Graph-backed commands (people, org, groups, Loop)
 apply only to work and school accounts.
 
 ## Request-contract sources
