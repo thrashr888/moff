@@ -19,9 +19,10 @@
     host: () => host,
   };
 
+  // Measure the body: the root element is never shorter than the frame, so it can't shrink.
   const reportSize = () =>
-    notify("ui/notifications/size-changed", { width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight });
-  new ResizeObserver(reportSize).observe(document.documentElement);
+    notify("ui/notifications/size-changed", { width: document.documentElement.scrollWidth, height: Math.ceil(document.body.getBoundingClientRect().height) });
+  new ResizeObserver(reportSize).observe(document.body);
 
   window.addEventListener("message", (event) => {
     const message = event.data;
