@@ -1,5 +1,5 @@
 async function(config, acquireToken, readResponse, signal) {
-    if (!["https://outlook.office.com", "https://outlook.cloud.microsoft"].includes(location.origin))
+    if (!["https://outlook.office.com", "https://outlook.cloud.microsoft", "https://outlook.live.com"].includes(location.origin))
         throw new Error("Transfers require an Outlook document");
     const url = new URL(config.url);
     const item = /^\/v1\.0\/me\/drive\/items\/[^/]+$/.test(url.pathname);

@@ -261,8 +261,14 @@ pub fn get_item_request(id: &str) -> Value {
 pub fn calendar_folders_request() -> Value {
     json!({"ShouldReturnLinkedCalendarEntryV2":false,"IncludeOrganizationCalendars":false,"Header":header()})
 }
+/// `folder_id` is an opaque calendar folder ID, or `calendar` for the mailbox's default calendar.
 pub fn calendar_view_request(folder_id: &str, start: &str, end: &str) -> Value {
-    json!({"Header":header(),"Body":{"__type":"GetCalendarViewRequest:#Exchange","CalendarId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":{"__type":"FolderId:#Exchange","Id":folder_id}},"RangeStart":start,"RangeEnd":end}})
+    let folder = if folder_id == "calendar" {
+        json!({"__type":"DistinguishedFolderId:#Exchange","Id":"calendar"})
+    } else {
+        json!({"__type":"FolderId:#Exchange","Id":folder_id})
+    };
+    json!({"Header":header(),"Body":{"__type":"GetCalendarViewRequest:#Exchange","CalendarId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":folder},"RangeStart":start,"RangeEnd":end}})
 }
 
 #[cfg(test)]

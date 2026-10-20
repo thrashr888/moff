@@ -1,5 +1,5 @@
 async function(config, acquireToken, readResponse) {
-    if (!["https://outlook.office.com", "https://outlook.cloud.microsoft"].includes(location.origin)) {
+    if (!["https://outlook.office.com", "https://outlook.cloud.microsoft", "https://outlook.live.com"].includes(location.origin)) {
         throw new Error("Product reads require an HTTPS Outlook document");
     }
     const rawPath = config.url.split("?")[0].replace(/^https:\/\/graph\.microsoft\.com/, "");

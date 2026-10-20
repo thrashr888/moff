@@ -629,7 +629,7 @@ mod tests {
             plan.blocks[0].event.start.as_deref(),
             Some("2026-10-12T10:00:00-07:00")
         );
-        assert!(plan.blocks[0].overlaps.is_empty());
+        assert_eq!(plan.blocks[0].overlaps.len(), 0);
         task_input.tasks[0].deadline = Some("2026-10-12T10:30:00-07:00".into());
         assert!(session.plan_work_blocks(&task_input).is_err());
         worker.join().unwrap();

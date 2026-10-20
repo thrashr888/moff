@@ -1,5 +1,5 @@
 async function(resource) {
-    if (!["https://outlook.office.com", "https://outlook.cloud.microsoft"].includes(location.origin)
+    if (!["https://outlook.office.com", "https://outlook.cloud.microsoft", "https://outlook.live.com"].includes(location.origin)
         || ![location.origin, "https://graph.microsoft.com", "https://substrate.office.com"].includes(resource)) {
         throw new Error("Unsupported browser authentication resource");
     }

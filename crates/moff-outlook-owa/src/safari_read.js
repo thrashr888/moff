@@ -1,5 +1,5 @@
 async function(config, acquireToken, readResponse) {
-    if (!["https://outlook.office.com", "https://outlook.cloud.microsoft"].includes(location.origin)) {
+    if (!["https://outlook.office.com", "https://outlook.cloud.microsoft", "https://outlook.live.com"].includes(location.origin)) {
         throw new Error("Moff requires an HTTPS Outlook tab");
     }
     const allowed = ["FindItem", "FindConversation", "GetItem", "GetConversationItems",

@@ -1,0 +1,43 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>/*STYLE*/
+.head { margin-bottom: 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.msg { display: grid; grid-template-columns: 8px 1fr auto; gap: 4px 10px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.msg:last-child { border-bottom: 0; }
+.unread { width: 8px; height: 8px; margin-top: 5px; border-radius: 50%; background: var(--accent); }
+.from { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.read .from { font-weight: 400; }
+.when { font-size: 12px; font-variant-numeric: tabular-nums; }
+.subject, .preview { grid-column: 2 / 4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.read .subject { color: var(--muted); }
+.tag { font-size: 11px; padding: 0 6px; border-radius: 8px; background: var(--card); margin-left: 6px; }
+</style></head>
+<body><div id="app" class="muted">Loading mail…</div>
+<script>/*BRIDGE*/</script>
+<script>
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+function when(iso, locale) {
+  if (!iso) return "";
+  const d = new Date(iso), now = new Date();
+  if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString(locale, { hour: "numeric", minute: "2-digit" });
+  const days = (now - d) / 864e5;
+  return d.toLocaleDateString(locale, days < 6 ? { weekday: "short" } : { month: "short", day: "numeric" });
+}
+function render(result, host) {
+  const app = document.getElementById("app");
+  const out = result.structuredContent ?? {};
+  if (!out.ok) { app.innerHTML = `<span class="error">${esc(out.error?.message || "No mail")}</span>`; return; }
+  const messages = out.data?.messages || [];
+  const title = out.data?.query ? `“${esc(out.data.query)}” in ${esc(out.data.folder)}` : esc(out.data?.folder || "inbox");
+  if (!messages.length) { app.textContent = out.data?.query ? "No matching mail." : "Nothing here."; return; }
+  const unread = messages.filter((m) => !m.is_read).length;
+  let html = `<div class="head muted">${title}${unread ? ` · ${unread} unread` : ""}</div>`;
+  html += messages.map((m) => `<div class="msg ${m.is_read ? "read" : ""}">
+    <div>${m.is_read ? "" : `<div class="unread"></div>`}</div>
+    <div class="from">${esc(m.from?.name || m.from?.address || "(no sender)")}${m.importance === "High" ? `<span class="tag">!</span>` : ""}${m.has_attachments ? `<span class="tag">📎</span>` : ""}</div>
+    <div class="when muted">${esc(when(m.received, host.locale))}</div>
+    <div class="subject">${esc(m.subject || "(no subject)")}</div>
+    ${m.preview ? `<div class="preview muted">${esc(m.preview)}</div>` : ""}</div>`).join("");
+  app.className = ""; app.innerHTML = html;
+}
+</script></body></html>

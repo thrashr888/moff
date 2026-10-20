@@ -442,6 +442,47 @@ Full regular-tab HTTP history remains unresolved. SSO refresh recovery does not
 automate interactive sign-in. Moff never silently retries writes or bypasses
 authentication prompts.
 
+## MCP server for agents
+
+`moff mcp` serves read-only Outlook tools over the Model Context Protocol (stdio),
+for agent hosts such as Pi or Claude Code:
+
+```json
+{"mcpServers": {"moff": {"command": "moff", "args": ["mcp"]}}}
+```
+
+| Tool | Does |
+|------|------|
+| `auth_status` | Checks the signed-in Outlook tab without refreshing it |
+| `mail_list` | Lists a folder newest first: sender, subject, preview, read state |
+| `mail_search` | Finds literal text in subjects and bodies |
+| `mail_get` | Reads one message with recipients and plain-text body |
+| `calendar_folders` | Lists calendars and their IDs |
+| `calendar_agenda` | Lists events in a range (default: the next 7 days of the main calendar) |
+| `calendar_availability` | Finds free gaps of a given length |
+
+Nothing is sent, changed or marked read; writes stay CLI-only behind
+`--allow-mutation --confirm`. Results are normalized JSON with
+`content_origin: microsoft_browser_session_untrusted`. One Outlook request runs at a
+time. Pass `--safari-window`/`--safari-tab` when several Outlook tabs are open.
+
+Hosts that support [MCP Apps](https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp)
+(the `io.modelcontextprotocol/ui` extension) can show a card with a result. Cards
+are `ui://` resources (`text/html;profile=mcp-app`) linked from each tool's
+`_meta.ui.resourceUri`, self-contained, with no network loads:
+
+| Card | Tools | Shows |
+|------|-------|-------|
+| `ui://moff/inbox` | `mail_list`, `mail_search` | Sender, subject, preview, unread dot |
+| `ui://moff/agenda` | `calendar_agenda` | Events grouped by day, with show-as status |
+
+## Outlook domains
+
+Moff works in a signed-in Outlook tab on `outlook.office.com` or
+`outlook.cloud.microsoft` (work and school accounts) and `outlook.live.com`
+(personal Microsoft accounts). Graph-backed commands (people, org, groups, Loop)
+apply only to work and school accounts.
+
 ## Request-contract sources
 
 - **Outlook Web mail and calendar:** browser Network captures and live in-tab requests, with read request construction in [`lib.rs`](crates/moff-outlook-owa/src/lib.rs) and typed mutation builders in [`operations.rs`](crates/moff-outlook-owa/src/operations.rs). Reads use `FindItem`, `GetItem`, `GetCalendarFoldersV2`, and `GetCalendarView`. Draft/message writes use `CreateItem` and `UpdateItem`; appointment writes use `CreateItem` and `UpdateCalendarEvent`. Creation omits read-only timezone-ID and organizer properties rejected by the live API. These are browser OWA contracts, not Graph payloads.
