@@ -2,7 +2,7 @@ async function(config, acquireToken, readResponse) {
     if (!["https://outlook.office.com", "https://outlook.cloud.microsoft", "https://outlook.live.com"].includes(location.origin)) {
         throw new Error("Moff requires an HTTPS Outlook tab");
     }
-    const allowed = ["FindFolder", "GetFolder", "FindItem", "FindConversation", "GetItem", "GetConversationItems",
+    const allowed = ["FindFolder", "GetFolder", "FindItem", "FindConversation", "GetItem", "GetAttachment", "GetConversationItems",
         "GetCalendarFolders", "GetCalendarFoldersV2", "GetCalendarView"];
     const authOnly = config.action === "__MoffAuthStatus" && config.mutation !== true;
     if (authOnly && config.recovery_marker !== undefined

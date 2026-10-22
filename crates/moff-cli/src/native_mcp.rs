@@ -641,6 +641,25 @@ fn recipients(value: &Value) -> Value {
         .as_array()
         .map_or_else(|| json!([]), |list| list.iter().map(mailbox).collect())
 }
+fn attachments(item: &Value) -> Value {
+    item.pointer("/Attachments/Items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|attachment| {
+                    json!({
+                        "id": attachment.pointer("/AttachmentId/Id"),
+                        "name": attachment.get("Name"),
+                        "content_type": attachment.get("ContentType"),
+                        "size": attachment.get("Size"),
+                        "is_inline": attachment.get("IsInline"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .map_or_else(|| json!([]), Value::Array)
+}
 fn message(item: &Value) -> Value {
     let from = [item.get("From"), item.get("Sender")]
         .into_iter()
@@ -666,6 +685,7 @@ fn message(item: &Value) -> Value {
         "is_read": item["IsRead"],
         "is_draft": item["IsDraft"],
         "has_attachments": item["HasAttachments"],
+        "attachments": attachments(item),
         "importance": item["Importance"],
         "categories": item["Categories"],
         "preview": item["Preview"],

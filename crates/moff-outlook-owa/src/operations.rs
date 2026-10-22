@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::{
     OutlookWebError, OutlookWebSession, ServiceCode, calendar_view_request, find_item_request,
-    get_item_request, header,
+    get_attachment_request, get_item_request, header,
 };
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -799,6 +799,10 @@ impl OutlookWebSession {
     pub fn mail_get(&self, id: &str) -> Result<Value, OutlookWebError> {
         nonempty(id)?;
         self.call("GetItem", &get_item_request(id))
+    }
+    pub fn mail_attachment_get(&self, id: &str) -> Result<Value, OutlookWebError> {
+        nonempty(id)?;
+        self.call("GetAttachment", &get_attachment_request(id))
     }
 
     fn search_batch(
