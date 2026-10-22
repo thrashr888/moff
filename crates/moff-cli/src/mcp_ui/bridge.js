@@ -12,7 +12,25 @@
     });
   const notify = (method, params) => send({ method, params });
   let host = { theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light", locale: navigator.language };
-  const applyTheme = () => document.documentElement.dataset.theme = host.theme || "light";
+  // A host's style variables (SEP-1865 hostContext.styles) win over the card's own palette, so a
+  // host can tint cards to its theme. Moff only knows light and dark itself.
+  const VARIABLES = {
+    "--color-text-primary": "--fg", "--color-text-secondary": "--muted", "--color-background-secondary": "--card",
+    "--color-border-primary": "--line", "--color-text-info": "--accent", "--font-sans": "font-family",
+  };
+  const applied = new Set();
+  const applyTheme = () => {
+    const root = document.documentElement;
+    root.dataset.theme = host.theme === "dark" ? "dark" : "light";
+    // Drop the last context's overrides so a removed one falls back to the theme.
+    for (const name of applied) root.style.removeProperty(name);
+    applied.clear();
+    for (const [name, value] of Object.entries(host.styles?.variables ?? {})) {
+      if (typeof value !== "string" || !value) continue;
+      const target = /^--(fg|muted|card|line|accent)$/.test(name) ? name : VARIABLES[name];
+      if (target) { root.style.setProperty(target, value); applied.add(target); }
+    }
+  };
 
   window.moff = {
     openLink: (url) => request("ui/open-link", { url }).catch(() => {}),
