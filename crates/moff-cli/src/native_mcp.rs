@@ -642,8 +642,9 @@ fn recipients(value: &Value) -> Value {
         .map_or_else(|| json!([]), |list| list.iter().map(mailbox).collect())
 }
 fn attachments(item: &Value) -> Value {
-    item.pointer("/Attachments/Items")
+    item.get("Attachments")
         .and_then(Value::as_array)
+        .or_else(|| item.pointer("/Attachments/Items").and_then(Value::as_array))
         .map(|items| {
             items
                 .iter()

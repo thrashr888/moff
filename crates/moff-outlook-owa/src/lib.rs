@@ -234,6 +234,7 @@ const READ_ACTIONS: &[&str] = &[
     "FindItem",
     "FindConversation",
     "GetItem",
+    "GetAttachment",
     "GetConversationItems",
     "GetCalendarFolders",
     "GetCalendarFoldersV2",
