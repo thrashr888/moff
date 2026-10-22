@@ -31,6 +31,10 @@ const EXCHANGE_HEADER: &str = "JsonRequestHeaders:#Exchange";
 
 #[derive(Debug)]
 pub enum OutlookWebError {
+    SendOutcomeUnknown {
+        reason: &'static str,
+        http_status: Option<u16>,
+    },
     AttachmentVerificationFailed {
         field: &'static str,
     },
@@ -104,6 +108,9 @@ pub enum ServiceCode {
 impl fmt::Display for OutlookWebError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::SendOutcomeUnknown { reason, http_status } => {
+                return write!(f, "the outcome of SendItem is unknown (reason: {reason}; HTTP status: {http_status:?}); no completion is established; inspect Drafts, Outbox and Sent Items; do not retry automatically");
+            }
             Self::AttachmentVerificationFailed { field } => {
                 return write!(f, "attachment draft read-back mismatch: {field}; send was not attempted");
             }
@@ -225,7 +232,14 @@ impl OutlookWebSession {
         };
         check_response(action, &value).map_err(|error| match error {
             OutlookWebError::InvalidResponse if mutation => {
-                OutlookWebError::OutcomeUnknown { action }
+                if action == "SendItem" {
+                    OutlookWebError::SendOutcomeUnknown {
+                        reason: "service response lacks a recognized acknowledgement",
+                        http_status: None,
+                    }
+                } else {
+                    OutlookWebError::OutcomeUnknown { action }
+                }
             }
             other => other,
         })?;

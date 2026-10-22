@@ -466,7 +466,7 @@ Moff reads the draft and verifies its exact recipients, subject, plain-text body
 attachment names/count, then reads each attachment with `GetAttachment` and
 compares its ID, name, non-inline flag and exact base64 bytes. Only after all
 checks pass does a versioned `SendItem` with `SaveItemToFolder:true` submit that
-new draft to Sent Items. No public CLI command sends an arbitrary draft.
+new draft to Sent Items.
 OWA suppresses default-valued properties: an omitted Cc/Bcc collection is accepted
 only when the approved collection is empty, and omitted `IsInline` means false.
 Explicit null, malformed values, unexpected recipients and true inline flags
@@ -497,6 +497,22 @@ The corrected complete verifier has also been exercised read-only against an
 existing failed draft, including exact local/remote attachment bytes; no new
 draft, send or cleanup was performed. This confirms read-back compatibility,
 not live `SendItem` acceptance or delivery.
+If sending itself fails, diagnostics retain a safe reason (network/timeout,
+HTTP status, invalid JSON or acknowledgement shape) without returning raw server
+content or credentials. Explicit HTTP/service rejection is labeled separately
+from uncertain completion. A draft remaining unsubmitted and an empty Outbox
+are useful observations, not proof that an earlier send could not complete
+later. Never convert an empty/malformed acknowledgement into success or resend
+automatically.
+
+For a separately authorized recovery of an existing known unsent attachment
+draft, repeat the **exact intended recipients, subject, body and local files**
+with `mail send --resume-draft '<draft-id>' ... --confirm`. This creates no new
+draft: it rechecks `IsDraft`, unsubmitted state, current ID/change key, all
+recipients/content and exact remote/local attachment bytes before one versioned
+send. `--attachment` is required with `--resume-draft`. It is not an automatic
+retry or an arbitrary-draft send; reconcile an uncertain prior attempt and get
+explicit host/user approval first. No cleanup is performed.
 
 ### Drafts and calendar
 

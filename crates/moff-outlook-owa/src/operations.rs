@@ -726,17 +726,27 @@ pub(crate) fn send_acknowledgement(
     action: &'static str,
 ) -> Result<Value, OutlookWebError> {
     // SendAndSaveCopy need not return an item ID. Never invent delivery/read-back evidence.
+    let unknown = |reason| {
+        if action == "SendItem" {
+            OutlookWebError::SendOutcomeUnknown {
+                reason,
+                http_status: None,
+            }
+        } else {
+            OutlookWebError::OutcomeUnknown { action }
+        }
+    };
     let responses = result
         .pointer("/Body/ResponseMessages/Items")
         .and_then(Value::as_array)
         .filter(|responses| responses.len() == 1)
-        .ok_or(OutlookWebError::OutcomeUnknown { action })?;
+        .ok_or_else(|| unknown("expected exactly one service acknowledgement"))?;
     if responses[0]["ResponseCode"] != "NoError"
         || responses[0]
             .get("ResponseClass")
             .is_some_and(|class| class != "Success")
     {
-        return Err(OutlookWebError::OutcomeUnknown { action });
+        return Err(unknown("service acknowledgement did not establish success"));
     }
     Ok(json!({
         "status":"submission_acknowledged","acknowledged":true,

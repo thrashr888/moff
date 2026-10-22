@@ -167,6 +167,22 @@ impl OutlookWebSession {
             .ok_or(OutlookWebError::OutcomeUnknown {
                 action: "CreateItem attachment draft",
             })?;
+        self.resume_attachment_mail(id, input, attachments)
+    }
+
+    pub fn resume_attachment_mail(
+        &self,
+        id: &str,
+        input: &SendMailInput,
+        attachments: &[MailAttachment],
+    ) -> Result<Value, OutlookWebError> {
+        input.validate()?;
+        validate_attachments(attachments)?;
+        if id.trim().is_empty() {
+            return Err(OutlookWebError::InvalidInput(
+                "resume requires an existing draft ID",
+            ));
+        }
         let partial = |stage, source| OutlookWebError::AttachmentSendFailed {
             draft_id: id.to_owned(),
             stage,
@@ -178,7 +194,22 @@ impl OutlookWebSession {
         let result = self
             .execute("SendItem", &verified, true)
             .and_then(|result| crate::operations::send_acknowledgement(&result, "SendItem"))
-            .map_err(|error| partial("send; submission may be uncertain", error))?;
+            .map_err(|error| {
+                let stage = match &error {
+                    OutlookWebError::RequestRejected(_)
+                    | OutlookWebError::OperationRejected { .. }
+                    | OutlookWebError::SessionExpired
+                    | OutlookWebError::OutlookNotReady
+                    | OutlookWebError::AuthenticationAdapterChanged => {
+                        "send request rejected; submission not acknowledged"
+                    }
+                    OutlookWebError::SafariBeforeDispatch | OutlookWebError::SafariReadOnly => {
+                        "send not dispatched"
+                    }
+                    _ => "send; submission may be uncertain",
+                };
+                partial(stage, error)
+            })?;
         Ok(
             json!({"status":"submission_acknowledged","acknowledged":true,
             "delivery_verified":false,"sent_copy_verified":false,"attachment_count":attachments.len(),
@@ -196,6 +227,7 @@ impl OutlookWebSession {
         let draft = single_item(&response).map_err(|_| verification("draft response shape"))?;
         if draft["__type"] != "Message:#Exchange"
             || draft["IsDraft"] != true
+            || !omitted_false(draft.get("IsSubmitted"))
             || draft["ItemId"]["Id"] != id
         {
             return Err(verification("draft identity/type/state"));
@@ -464,6 +496,32 @@ mod tests {
     }
 
     #[test]
+    fn explicit_resume_reverifies_exact_draft_and_bytes_without_creating_another_draft() {
+        let (session, requests, worker) = mock(replies().into_iter().skip(1).collect());
+        assert_eq!(
+            session
+                .resume_attachment_mail("draft", &input(), &files())
+                .unwrap()["acknowledged"],
+            true
+        );
+        worker.join().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 4);
+        for state in [json!(true), Value::Null, json!("false")] {
+            let mut responses = replies();
+            responses[1].1["Body"]["ResponseMessages"]["Items"][0]["Items"][0]["IsSubmitted"] =
+                state;
+            let (session, requests, worker) = mock(vec![responses.remove(1)]);
+            assert!(
+                session
+                    .resume_attachment_mail("draft", &input(), &files())
+                    .is_err()
+            );
+            worker.join().unwrap();
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
     fn attachment_workflow_stops_at_each_failed_stage_without_retry_or_cleanup() {
         for stage in 0..5 {
             for failure in [
@@ -481,16 +539,42 @@ mod tests {
                     .to_string();
                 if stage > 0 {
                     assert!(error.contains("draft ID draft"), "{error}");
-                    assert!(error.contains(if stage == 4 {
-                        "submission may be uncertain"
+                    if stage == 4 {
+                        assert!(
+                            error.contains("submission may be uncertain")
+                                || error.contains("send request rejected"),
+                            "{error}"
+                        );
                     } else {
-                        "send not attempted"
-                    }));
+                        assert!(error.contains("send not attempted"), "{error}");
+                    }
                 }
                 worker.join().unwrap();
                 assert_eq!(requests.lock().unwrap().len(), stage + 1);
             }
         }
+    }
+
+    #[test]
+    fn send_rejection_retains_service_cause_without_claiming_uncertain_completion() {
+        let mut responses = replies();
+        responses[4].1 = json!({"Body":{"ResponseMessages":{"Items":[{
+            "ResponseCode":"ErrorAccessDenied","ResponseClass":"Error","MessageText":"private body/token must not leak"
+        }]}}});
+        let (session, requests, worker) = mock(responses);
+        let error = session
+            .send_mail_with_attachments(&input(), &files())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("send request rejected; submission not acknowledged"),
+            "{error}"
+        );
+        assert!(error.contains("AccessDenied"), "{error}");
+        assert!(!error.contains("submission may be uncertain"));
+        assert!(!error.contains("private body/token"));
+        worker.join().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 5);
     }
 
     #[test]

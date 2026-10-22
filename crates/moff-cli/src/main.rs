@@ -144,7 +144,7 @@ enum AuthCommand {
 enum MailCommand {
     /// Submit new plain-text mail from the selected Outlook account; acknowledgement is not delivery.
     #[command(
-        after_help = "Example: moff outlook --allow-mutation mail send --to recipient@example.com --subject 'Subject' --body 'Message' --attachment /absolute/path/avatar.png --confirm\nRequires host approval through moff_action for exact files and recipients. Repeat --to/--cc/--bcc for exact addresses (20 total max). Repeat --attachment for up to 5 regular non-symlink files, 500000 bytes combined, subject to a 1000000-byte serialized browser script limit. Attachments create/verify a draft then send it; failures may leave a draft or uncertain submission. No custom sender, HTML, arbitrary draft sending or automatic retries."
+        after_help = "Example: moff outlook --allow-mutation mail send --to recipient@example.com --subject 'Subject' --body 'Message' --attachment /absolute/path/avatar.png --confirm\nRequires host approval through moff_action for exact files and recipients. Repeat --to/--cc/--bcc for exact addresses (20 total max). Repeat --attachment for up to 5 regular non-symlink files, 500000 bytes combined, subject to a 1000000-byte serialized browser script limit. Attachments create/verify a draft then send it; failures may leave a draft or uncertain submission. To recover a separately authorized known unsent draft, add --resume-draft ID with all exact recipients/content/files: reverify before sending, no new draft. Reconcile prior uncertain sends before approval. No custom sender, HTML, arbitrary draft sending or automatic retries."
     )]
     Send {
         #[arg(long, required = true)]
@@ -160,6 +160,9 @@ enum MailCommand {
         /// Local regular file to attach; repeat for up to 5 files (500000 bytes combined).
         #[arg(long)]
         attachment: Vec<PathBuf>,
+        /// Reverify and submit this existing unsent attachment draft; creates no new draft.
+        #[arg(long, requires = "attachment")]
+        resume_draft: Option<String>,
         #[arg(long, required = true)]
         confirm: bool,
     },
@@ -705,7 +708,8 @@ fn schema() -> Value {
             "attachment_source":"regular non-symlink local files; snapshotted before first write; duplicate names rejected",
             "attachment_transport":"CreateItem SaveOnly with FileAttachments; verify draft/bytes; versioned SendItem to Sent Items",
             "max_serialized_browser_script_bytes":1_000_000,"attachment_failure":"no retries/cleanup; draft ID and stage reported when known",
-            "send_existing_draft":false,"reply_send":false,"automatic_retry":false,
+            "send_existing_draft":"--resume-draft ID with exact recipients/subject/body/local attachments; reverify unsent state and bytes; explicit approval required",
+            "reply_send":false,"automatic_retry":false,
             "verification":"single successful OWA response acknowledges submission only; delivery and sent copy are not verified",
             "live_send_validated":false},
         "unimplemented_products":[],
@@ -1465,6 +1469,7 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
             subject,
             body,
             attachment,
+            resume_draft,
             confirm,
         } => {
             if !confirm {
@@ -1486,7 +1491,9 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
             Ok((
                 "outlook.mail.send",
                 with_owa(args, |s| {
-                    if files.is_empty() {
+                    if let Some(id) = resume_draft {
+                        s.resume_attachment_mail(&id, &input, &files)
+                    } else if files.is_empty() {
                         s.send_mail(&input)
                     } else {
                         s.send_mail_with_attachments(&input, &files)
