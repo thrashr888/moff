@@ -1,13 +1,18 @@
 //! Outlook Mail and Calendar operations through Safari and the Cider library.
 #![allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
+mod archive;
+mod mail_actions;
+pub use mail_actions::{flag_request, mail_action_item_request, native_pin_state};
 mod contacts;
+pub use archive::*;
 mod operations;
 pub use contacts::validate_contact_input;
 mod loop_workspaces;
 mod products;
 pub use loop_workspaces::LoopWorkspaceRequest;
 pub use products::{
-    DEFAULT_MAX_FILE_BYTES, MAX_FILE_BYTES, ProductWrite, product_segment, validate_file_size,
+    DEFAULT_MAX_FILE_BYTES, MAX_FILE_BYTES, ProductWrite, drive_item_path, product_segment,
+    sharepoint_library_location, validate_file_size,
 };
 mod safari;
 mod scheduling;
@@ -28,6 +33,18 @@ pub enum OutlookWebError {
     RequestRejected(u16),
     InvalidResponse,
     SessionExpired,
+    OutlookNotReady,
+    AuthenticationAdapterChanged,
+    ReadTimedOut {
+        action: &'static str,
+    },
+    ReadNetworkFailed {
+        action: &'static str,
+    },
+    ResponseTooLarge,
+    SearchTimedOut {
+        scanned: usize,
+    },
     InvalidInput(&'static str),
     FileTransferIo(std::io::Error),
     FileUploadOutcomeUnknown {
@@ -81,8 +98,14 @@ impl fmt::Display for OutlookWebError {
             Self::RequestRejected(status) => {
                 return write!(f, "Outlook Web rejected the request (HTTP {status})");
             }
-            Self::InvalidResponse => "Outlook Web returned an invalid response",
+            Self::InvalidResponse => "Outlook Web returned missing or invalid data; this is not an empty result, and does not establish that the session expired; check moff outlook auth status before refreshing",
             Self::SessionExpired => "the browser session expired (HTTP 401); run moff outlook auth refresh --confirm, then complete any sign-in steps yourself in Safari",
+            Self::OutlookNotReady => "Outlook is not loaded; open the selected Safari tab, finish sign-in if prompted, and wait for Mail before retrying",
+            Self::AuthenticationAdapterChanged => "Outlook's authentication adapter no longer matches the page; Moff needs an adapter update, not repeated session refreshes",
+            Self::ReadTimedOut { action } => return write!(f, "Outlook {action} exceeded its browser request deadline; no complete data was read. A timeout does not establish that the session expired; check moff outlook auth status before refreshing"),
+            Self::ReadNetworkFailed { action } => return write!(f, "Outlook {action} failed at the network layer; no complete data was read. Check connectivity and moff outlook auth status; a network failure does not establish that the session expired"),
+            Self::ResponseTooLarge => "Outlook's response exceeded Moff's browser size limit; no complete data was read; reduce the batch size or narrow the range, rather than refreshing the session",
+            Self::SearchTimedOut { scanned } => return write!(f, "mail search exhausted its 40-second scan budget after checking {scanned} messages; the folder search is incomplete, not empty. No mailbox changes were made. Use mail list with --offset and bounded get-batch calls to continue; refreshing the session will not make a full-folder scan smaller"),
             Self::InvalidInput(message) => message,
             Self::FileTransferIo(error) => return write!(f, "local file transfer failed (a partial download may remain): {error}"),
             Self::FileUploadOutcomeUnknown { stage, status } => return write!(f,
@@ -140,6 +163,31 @@ impl fmt::Debug for OutlookWebSession {
 }
 
 impl OutlookWebSession {
+    fn search_call(
+        &self,
+        action: &'static str,
+        body: &Value,
+        deadline: std::time::Instant,
+        scanned: usize,
+    ) -> Result<Value, OutlookWebError> {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(OutlookWebError::SearchTimedOut { scanned });
+        }
+        let value = match &self.transport {
+            SessionTransport::Safari(session) => session.call_with_timeout(
+                action,
+                body,
+                false,
+                remaining.min(std::time::Duration::from_secs(25)),
+            ),
+            #[cfg(test)]
+            SessionTransport::Mock(session) => Ok(session.call(action, body)),
+        }?;
+        check_response(action, &value)?;
+        Ok(value)
+    }
+
     pub fn call(&self, action: &str, body: &Value) -> Result<Value, OutlookWebError> {
         let action = READ_ACTIONS
             .iter()
@@ -181,6 +229,8 @@ pub fn decode_response(text: &str) -> Result<Value, OutlookWebError> {
     serde_json::from_str(payload).map_err(|_| OutlookWebError::InvalidResponse)
 }
 const READ_ACTIONS: &[&str] = &[
+    "FindFolder",
+    "GetFolder",
     "FindItem",
     "FindConversation",
     "GetItem",
@@ -253,7 +303,15 @@ fn header() -> Value {
     json!({"__type": EXCHANGE_HEADER, "RequestServerVersion":"V2018_01_08"})
 }
 pub fn find_item_request(limit: u16) -> Value {
-    json!({"Header":header(),"Body":{"__type":"FindItemRequest:#Exchange","Traversal":"Shallow","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"Default"},"ParentFolderIds":[{"__type":"DistinguishedFolderId:#Exchange","Id":"inbox"}],"Paging":{"__type":"IndexedPageView:#Exchange","BasePoint":"Beginning","Offset":0,"MaxEntriesReturned":limit}}})
+    json!({"Header":header(),"Body":{"__type":"FindItemRequest:#Exchange","Traversal":"Shallow","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"Default","AdditionalProperties":[
+        {"__type":"PropertyUri:#Exchange","FieldURI":"Flag"},
+        {"__type":"PropertyUri:#Exchange","FieldURI":"ConversationId"},
+        {"__type":"PropertyUri:#Exchange","FieldURI":"ReceivedOrRenewTime"},
+        {"__type":"PropertyUri:#Exchange","FieldURI":"DateTimeReceived"},
+        {"__type":"PropertyUri:#Exchange","FieldURI":"Preview"},
+        {"__type":"PropertyUri:#Exchange","FieldURI":"Sender"}
+        ,{"__type":"PropertyUri:#Exchange","FieldURI":"IsDraft"}
+    ]},"ParentFolderIds":[{"__type":"DistinguishedFolderId:#Exchange","Id":"inbox"}],"Paging":{"__type":"IndexedPageView:#Exchange","BasePoint":"Beginning","Offset":0,"MaxEntriesReturned":limit}}})
 }
 pub fn get_item_request(id: &str) -> Value {
     json!({"Header":header(),"Body":{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"AllProperties","BodyType":"Text"},"ItemIds":[{"__type":"ItemId:#Exchange","Id":id}]}})

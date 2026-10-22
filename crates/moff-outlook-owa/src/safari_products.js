@@ -18,13 +18,20 @@ async function(config, acquireToken, readResponse) {
         /^\/v1\.0\/groups\/[^/]+\/members\/(\$ref|[^/]+\/\$ref)$/,
         /^\/v1\.0\/me\/drive\/(root|items\/[^/]+)\/children$/,
         /^\/v1\.0\/me\/drive\/items\/[^/]+$/,
+        /^\/v1\.0\/(?:me\/drive|drives\/[^/]+)\/items\/[^/]+\/(?:invite|permissions(?:\/[^/]+)?)$/,
+        /^\/v1\.0\/drives\/[^/]+\/items\/[^/]+$/,
         /^\/v1\.0\/me\/drive\/root\/search\(q='[^/]*'\)$/,
+        /^\/v1\.0\/drives\/[^/]+\/root\/search\(q='[^/]*'\)$/,
+        /^\/v1\.0\/sites\/[^/]+(?:\/(?:sites|teams)\/[^/]+|\/drives)?$/,
     ];
     if (url.origin !== "https://graph.microsoft.com" || url.username || url.password || url.hash
         || !paths.some(pattern => pattern.test(url.pathname))
         || /%2f|%5c|%25/i.test(url.pathname)) throw new Error("Unsupported product read URL");
     const paged = url.pathname === "/v1.0/me/people" || url.pathname === "/v1.0/me/contacts" || url.pathname === "/v1.0/groups" || url.pathname === "/v1.0/users"
         || /^\/v1\.0\/groups\/[^/]+\/(owners|members)$/.test(url.pathname)
+        || /^\/v1\.0\/(?:me\/drive|drives\/[^/]+)\/items\/[^/]+\/permissions$/.test(url.pathname)
+        || /^\/v1\.0\/sites\/[^/]+\/drives$/.test(url.pathname)
+        || /^\/v1\.0\/drives\/[^/]+\/root\/search\(q='[^/]*'\)$/.test(url.pathname)
         || url.pathname.endsWith("/children") || /^\/v1\.0\/me\/drive\/root\/search\(q='[^/]*'\)$/.test(url.pathname);
     const user = /^\/v1\.0\/users\/[^/]+$/.test(url.pathname), keys = new Set();
     for (const [key, value] of url.searchParams) {
@@ -58,8 +65,21 @@ async function(config, acquireToken, readResponse) {
         const folder = /^\/v1\.0\/me\/drive\/(root|items\/[^/]+)\/children$/.test(url.pathname);
         const memberAdd = /^\/v1\.0\/groups\/[^/]+\/members\/\$ref$/.test(url.pathname);
         const memberRemove = /^\/v1\.0\/groups\/[^/]+\/members\/[^/]+\/\$ref$/.test(url.pathname);
+        const invite = /^\/v1\.0\/(?:me\/drive|drives\/[^/]+)\/items\/[^/]+\/invite$/.test(url.pathname);
         if (method === "DELETE") {
             if (!(contact || drive || group || memberRemove) || config.body != null) throw new Error("Unsupported product delete");
+        } else if (method === "POST" && invite) {
+            objectFields(config.body, ["recipients","roles","requireSignIn","sendInvitation","retainInheritedPermissions"]);
+            const body = config.body;
+            if (!Array.isArray(body.recipients) || body.recipients.length !== 1
+                || JSON.stringify(body.roles) !== '["read"]' || body.requireSignIn !== true
+                || typeof body.sendInvitation !== "boolean" || body.retainInheritedPermissions !== true)
+                throw new Error("Sharing requires one named recipient with signed-in read access");
+            strings(body.recipients[0], ["email"]);
+            const email = body.recipients[0].email;
+            if (typeof email !== "string" || email.length > 254 || /[\s\x00-\x1f\x7f]/.test(email)
+                || !/^[a-z0-9.!#$%&'*+\-/=?^_`{|}~]+@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/i.test(email))
+                throw new Error("Sharing requires one explicit email address");
         } else if (method === "POST" && memberAdd) {
             strings(config.body, ["@odata.id"]);
             const member = new URL(config.body["@odata.id"]);
@@ -107,7 +127,7 @@ async function(config, acquireToken, readResponse) {
                 || config.body.mailEnabled !== true || config.body.securityEnabled !== false)) throw new Error("Only Microsoft 365 groups can be created");
         } else throw new Error("Unsupported product write route");
         if (drive && !config.etag) throw new Error("Drive writes require the current entity tag");
-    } else if (config.body != null || config.etag != null || config.bytes != null
+    } else if (config.body != null || config.etag != null || config.bytes != null || url.pathname.endsWith("/invite")
         || url.pathname.endsWith("/$ref")) throw new Error("Read cannot carry write fields");
     if (config.bytes != null || config.download === true) throw new Error("Use the streamed transfer adapter");
     if (config.etag != null && (typeof config.etag !== "string" || !config.etag || /[\r\n]/.test(config.etag))) throw new Error("Invalid entity tag");

@@ -54,8 +54,18 @@ pub(crate) fn product_url(path: &str) -> Result<Url, OutlookWebError> {
                 "root",
                 "children" | "search(q='.loop')"
             ]
-            | ["v1.0", "me", "drive", "items", _, "children"]
-    ) || matches!(segments.as_slice(), ["v1.0","me","drive","root", search] if search.starts_with("search(q='") && search.ends_with("')"));
+            | [
+                "v1.0",
+                "me",
+                "drive",
+                "items",
+                _,
+                "children" | "permissions"
+            ]
+            | ["v1.0", "drives", _, "items", _, "permissions"]
+            | ["v1.0", "sites", _, "drives"]
+    ) || matches!(segments.as_slice(), ["v1.0","me","drive","root", search]
+        | ["v1.0","drives",_,"root",search] if search.starts_with("search(q='") && search.ends_with("')"));
     let user = matches!(segments.as_slice(), ["v1.0", "users", _]);
     let allowed = paged
         || user
@@ -63,10 +73,14 @@ pub(crate) fn product_url(path: &str) -> Result<Url, OutlookWebError> {
             segments.as_slice(),
             ["v1.0", "me"]
                 | ["v1.0", "me", "contacts", _]
-                | ["v1.0", "groups", _]
+                | ["v1.0", "groups" | "sites", _]
                 | ["v1.0", "me", "manager" | "directReports"]
                 | ["v1.0", "users", _, "manager" | "directReports"]
                 | ["v1.0", "me", "drive", "items", _]
+                | ["v1.0", "drives", _, "items", _]
+                | ["v1.0", "me", "drive", "items", _, "permissions", _]
+                | ["v1.0", "drives", _, "items", _, "permissions", _]
+                | ["v1.0", "sites", _, "sites" | "teams", _]
         );
     if !allowed {
         return Err(reject());
@@ -101,6 +115,25 @@ pub(crate) fn product_url(path: &str) -> Result<Url, OutlookWebError> {
 }
 
 impl OutlookWebSession {
+    pub fn drive_share(
+        &self,
+        drive: Option<&str>,
+        id: &str,
+        email: &str,
+        notify: bool,
+    ) -> Result<Value, OutlookWebError> {
+        let request = ProductWrite::drive_share(drive, id, email, notify)?;
+        let path = drive_item_path(drive, id)?;
+        share_file_with(
+            &path,
+            id,
+            email,
+            notify,
+            |path| self.product_read(path),
+            || self.product_write(&request),
+        )
+    }
+
     /// Read allowlisted product metadata inside Safari; never export authentication.
     pub fn product_read(&self, path: &str) -> Result<serde_json::Value, OutlookWebError> {
         let url = product_url(path)?;
@@ -183,6 +216,140 @@ pub fn product_segment(value: &str) -> Result<String, OutlookWebError> {
         .replace('+', "%20"))
 }
 
+pub fn drive_item_path(drive: Option<&str>, id: &str) -> Result<String, OutlookWebError> {
+    let base = drive.map_or_else(
+        || Ok("/v1.0/me/drive".to_owned()),
+        |drive| Ok(format!("/v1.0/drives/{}", product_segment(drive)?)),
+    )?;
+    Ok(format!("{base}/items/{}", product_segment(id)?))
+}
+
+pub fn sharepoint_library_location(input: &str) -> Result<(String, String), OutlookWebError> {
+    let valid = |url: &Url| {
+        url.scheme() == "https"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && url.fragment().is_none()
+            && url
+                .host_str()
+                .is_some_and(|host| host.ends_with(".sharepoint.com"))
+    };
+    let mut url =
+        Url::parse(input).map_err(|_| invalid("expected an HTTPS SharePoint library URL"))?;
+    if !valid(&url) {
+        return Err(invalid("expected an HTTPS SharePoint library URL"));
+    }
+    if url.path() == "/shared" {
+        let links: Vec<_> = url
+            .query_pairs()
+            .filter(|(key, _)| key == "listurl")
+            .map(|(_, value)| value.into_owned())
+            .collect();
+        if links.len() != 1 {
+            return Err(invalid(
+                "SharePoint shared URLs require one listurl library URL",
+            ));
+        }
+        let library =
+            Url::parse(&links[0]).map_err(|_| invalid("invalid SharePoint library URL"))?;
+        if !valid(&library)
+            || library.host_str()
+                != url
+                    .host_str()
+                    .map(|host| {
+                        host.strip_suffix("-my.sharepoint.com").map_or_else(
+                            || host.to_owned(),
+                            |tenant| format!("{tenant}.sharepoint.com"),
+                        )
+                    })
+                    .as_deref()
+        {
+            return Err(invalid("library must belong to the same SharePoint tenant"));
+        }
+        url = library;
+    }
+    if url.query().is_some() {
+        return Err(invalid(
+            "use the library root URL, not a file or Forms view URL",
+        ));
+    }
+    let mut path = url.path().to_owned();
+    for byte in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~" {
+        let encoded = format!("%{byte:02X}");
+        path = path
+            .replace(&encoded, &char::from(*byte).to_string())
+            .replace(
+                &encoded.to_ascii_lowercase(),
+                &char::from(*byte).to_string(),
+            );
+    }
+    url.set_path(&path);
+    let parts: Vec<_> = url.path().trim_end_matches('/').split('/').collect();
+    if !matches!(parts.as_slice(), ["", "sites" | "teams", site, library]
+        if !site.is_empty() && !library.is_empty())
+        || url.path().to_ascii_lowercase().contains("%2f")
+        || url.path().contains(['\\', ':'])
+    {
+        return Err(invalid(
+            "expected a site library root such as /sites/Project/Shared%20Documents",
+        ));
+    }
+    let site_path = format!(
+        "/v1.0/sites/{}:/{}/{}",
+        url.host_str().ok_or(invalid("missing host"))?,
+        parts[1],
+        parts[2]
+    );
+    Ok((site_path, url.as_str().trim_end_matches('/').to_owned()))
+}
+
+fn share_file_with(
+    path: &str,
+    id: &str,
+    email: &str,
+    notify: bool,
+    mut read: impl FnMut(&str) -> Result<Value, OutlookWebError>,
+    write: impl FnOnce() -> Result<Value, OutlookWebError>,
+) -> Result<Value, OutlookWebError> {
+    let before = read(path)?;
+    if before["id"] != id || !before["file"].is_object() || before.get("remoteItem").is_some() {
+        return Err(invalid(
+            "sharing requires an exact file ID in its owning drive, not a folder or shortcut",
+        ));
+    }
+    let result = write()?;
+    let unknown = || OutlookWebError::OutcomeUnknown {
+        action: "OneDrive sharing; inspect permissions before retrying",
+    };
+    let permissions = result["value"]
+        .as_array()
+        .filter(|values| values.len() == 1)
+        .ok_or_else(unknown)?;
+    let permission = &permissions[0];
+    let permission_id = permission["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(unknown)?;
+    if permission.get("error").is_some() || permission["roles"] != json!(["read"]) {
+        return Err(unknown());
+    }
+    let permission_id = product_segment(permission_id).map_err(|_| unknown())?;
+    let after = read(&format!("{path}/permissions/{permission_id}")).map_err(|_| unknown())?;
+    if after["id"] != permission["id"]
+        || after["roles"] != json!(["read"])
+        || after.get("link").is_some()
+        || after.get("error").is_some()
+    {
+        return Err(unknown());
+    }
+    Ok(
+        json!({"item":{"id":id,"name":before["name"],"webUrl":before["webUrl"]},
+        "recipient":email,"roles":["read"],"permission":after,"verified":true,
+        "notification":{"requested":notify,"delivery_verified":false}}),
+    )
+}
+
 fn object_fields<'a>(
     body: &'a Value,
     allowed: &[&str],
@@ -206,6 +373,47 @@ fn string_fields(body: &Value, allowed: &[&str]) -> Result<(), OutlookWebError> 
 }
 
 impl ProductWrite {
+    pub fn drive_share(
+        drive: Option<&str>,
+        id: &str,
+        email: &str,
+        notify: bool,
+    ) -> Result<Self, OutlookWebError> {
+        let valid = email.is_ascii()
+            && email.len() <= 254
+            && !email
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+            && email.split_once('@').is_some_and(|(local, domain)| {
+                !local.is_empty()
+                    && !domain.is_empty()
+                    && !domain.contains('@')
+                    && local
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b".!#$%&'*+-/=?^_`{|}~".contains(&b))
+                    && domain.split('.').all(|label| {
+                        !label.is_empty()
+                            && !label.starts_with('-')
+                            && !label.ends_with('-')
+                            && label
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                    })
+            });
+        if !valid {
+            return Err(invalid(
+                "sharing requires one explicit recipient email address",
+            ));
+        }
+        Self::new(
+            format!("{}/invite", drive_item_path(drive, id)?),
+            "POST",
+            Some(json!({"recipients":[{"email":email}],"roles":["read"],
+                "requireSignIn":true,"sendInvitation":notify,"retainInheritedPermissions":true})),
+            None,
+        )
+    }
+
     pub fn drive_upload(
         parent: Option<&str>,
         id: Option<&str>,
@@ -462,9 +670,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sharepoint_library_links_resolve_to_the_named_site_not_personal_onedrive() {
+        let expected = (
+            "/v1.0/sites/ibm.sharepoint.com:/sites/PROJ-Meridian".to_owned(),
+            "https://ibm.sharepoint.com/sites/PROJ-Meridian/Shared%20Documents".to_owned(),
+        );
+        assert_eq!(sharepoint_library_location(&expected.1).unwrap(), expected);
+        assert_eq!(sharepoint_library_location("https://ibm-my.sharepoint.com/shared?id=%2Fsites%2FPROJ%2DMeridian%2FShared%20Documents&listurl=https%3A%2F%2Fibm%2Esharepoint%2Ecom%2Fsites%2FPROJ%2DMeridian%2FShared%20Documents").unwrap().0,
+            "/v1.0/sites/ibm.sharepoint.com:/sites/PROJ-Meridian");
+        for input in [
+            "http://ibm.sharepoint.com/sites/Project/Documents",
+            "https://evil.example/sites/Project/Documents",
+            "https://user@ibm.sharepoint.com/sites/Project/Documents",
+            "https://ibm-my.sharepoint.com/shared?listurl=https://other.sharepoint.com/sites/P/Docs",
+            "https://ibm.sharepoint.com/sites/P/Docs/file.pdf",
+            "https://ibm.sharepoint.com/sites/P/Docs?anything=yes",
+            "https://ibm-my.sharepoint.com/shared",
+        ] {
+            assert!(sharepoint_library_location(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
     fn only_bounded_product_metadata_routes_are_allowed() {
         for path in [
             "/v1.0/me/people?$top=5",
+            "/v1.0/sites/ibm.sharepoint.com:/sites/PROJ-Meridian",
+            "/v1.0/sites/site-id/drives?$top=100",
+            "/v1.0/drives/drive-id/root/search(q='comparison')?$top=20",
             "/v1.0/me/contacts?$top=5&$skip=5",
             "/v1.0/me/contacts/id",
             "/v1.0/me",
@@ -479,6 +712,10 @@ mod tests {
             "/v1.0/me/drive/root/children?$top=5",
             "/v1.0/me/drive/items/id/children?$top=5",
             "/v1.0/me/drive/items/id",
+            "/v1.0/me/drive/items/id/permissions?$top=20",
+            "/v1.0/drives/drive-id/items/file-id",
+            "/v1.0/drives/drive-id/items/file-id/permissions",
+            "/v1.0/drives/drive-id/items/file-id/permissions/permission-id",
             "/v1.0/me/drive/root/search(q='.loop')?$top=5",
             "/v1.0/groups?$filter=groupTypes%2Fany%28c%3Ac%20eq%20%27Unified%27%29&$top=5",
         ] {
@@ -490,6 +727,9 @@ mod tests {
             "/v1.0/me/messages",
             "/v1.0/me/events",
             "/v1.0/me/drive/items/id/content",
+            "/v1.0/me/drive/items/id/invite",
+            "/v1.0/drives/drive-id/items/file-id/invite",
+            "/v1.0/drives/drive-id/root/children",
             "/v1.0/users/id/messages",
             "/v1.0/me/drive/items/%2fmessages",
             "/v1.0/me/drive/items/id/../root",
@@ -507,7 +747,147 @@ mod tests {
             assert!(product_url(path).is_err(), "{path}");
         }
     }
+    #[test]
+    fn sharing_is_one_named_recipient_with_read_access_and_optional_notification() {
+        for (drive, notify, path) in [
+            (None, false, "/v1.0/me/drive/items/file/invite"),
+            (Some("drive"), true, "/v1.0/drives/drive/items/file/invite"),
+        ] {
+            let request =
+                ProductWrite::drive_share(drive, "file", "sarah@example.com", notify).unwrap();
+            assert_eq!(request.url, format!("https://graph.microsoft.com{path}"));
+            assert_eq!(request.method, "POST");
+            assert_eq!(
+                request.body.unwrap(),
+                json!({
+                    "recipients":[{"email":"sarah@example.com"}],"roles":["read"],
+                    "requireSignIn":true,"sendInvitation":notify,"retainInheritedPermissions":true
+                })
+            );
+        }
+        for email in [
+            "",
+            "Sarah",
+            "a@b@c",
+            "a@example.com,b@example.com",
+            "Sarah <sarah@example.com>",
+            "a@example.com\n",
+            "a@-invalid.com",
+            "a@x..com",
+        ] {
+            assert!(
+                ProductWrite::drive_share(None, "file", email, false).is_err(),
+                "{email}"
+            );
+        }
+        assert!(
+            ProductWrite::drive_share(Some("../drive"), "file", "a@example.com", false).is_err()
+        );
+        assert!(ProductWrite::drive_share(None, "", "a@example.com", false).is_err());
+    }
 
+    #[test]
+    fn sharing_verifies_the_returned_permission_without_claiming_delivery() {
+        let mut reads = Vec::new();
+        let result = share_file_with("/v1.0/me/drive/items/file", "file", "a@example.com", true,
+                |path| {
+                    reads.push(path.to_owned());
+                    Ok(if path.ends_with("/permissions/p1") {
+                        json!({"id":"p1","roles":["read"],"invitation":{"email":"a@example.com"}})
+                    } else {
+                        json!({"id":"file","name":"comparison.pdf","file":{},"webUrl":"https://example.com/file"})
+                    })
+                },
+                || Ok(json!({"value":[{"id":"p1","roles":["read"]}]}))).unwrap();
+        assert_eq!(
+            reads,
+            [
+                "/v1.0/me/drive/items/file",
+                "/v1.0/me/drive/items/file/permissions/p1"
+            ]
+        );
+        assert_eq!(result["verified"], true);
+        assert_eq!(result["recipient"], "a@example.com");
+        assert_eq!(result["notification"]["requested"], true);
+        assert_eq!(result["notification"]["delivery_verified"], false);
+    }
+
+    #[test]
+    fn sharing_rejects_folders_shortcuts_and_mismatched_files_before_writing() {
+        for item in [
+            json!({"id":"file","folder":{}}),
+            json!({"id":"other","file":{}}),
+            json!({"id":"file","file":{},"remoteItem":{"id":"remote"}}),
+        ] {
+            assert!(
+                share_file_with(
+                    "/v1.0/me/drive/items/file",
+                    "file",
+                    "a@example.com",
+                    false,
+                    |_| Ok(item.clone()),
+                    || panic!("must not write")
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn sharing_stops_on_partial_invalid_or_unverified_results_without_retry() {
+        for result in [
+            json!({}),
+            json!({"value":[]}),
+            json!({"value":[{"id":"p1","roles":["read"]},{"error":{"code":"denied"}}]}),
+            json!({"value":[{"id":"p1","roles":["write"]}]}),
+            json!({"value":[{"id":"p1","roles":["read"],"error":{}}]}),
+            json!({"value":[{"id":"p1","roles":["read"]}]}),
+        ] {
+            let mut writes = 0;
+            let error = share_file_with(
+                "/v1.0/me/drive/items/file",
+                "file",
+                "a@example.com",
+                false,
+                |path| {
+                    if path.ends_with("/permissions/p1") {
+                        Err(OutlookWebError::ProductRequestRejected(403))
+                    } else {
+                        Ok(json!({"id":"file","file":{}}))
+                    }
+                },
+                || {
+                    writes += 1;
+                    Ok(result.clone())
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, OutlookWebError::OutcomeUnknown { .. }));
+            assert_eq!(writes, 1);
+        }
+        for after in [
+            json!({"id":"other","roles":["read"]}),
+            json!({"id":"p1","roles":["write"]}),
+            json!({"id":"p1","roles":["read"],"link":{"scope":"anonymous"}}),
+        ] {
+            let error = share_file_with(
+                "/v1.0/me/drive/items/file",
+                "file",
+                "a@example.com",
+                false,
+                |path| {
+                    Ok(if path.ends_with("/permissions/p1") {
+                        after.clone()
+                    } else {
+                        json!({"id":"file","file":{}})
+                    })
+                },
+                || Ok(json!({"value":[{"id":"p1","roles":["read"]}]})),
+            )
+            .unwrap_err();
+            assert!(matches!(error, OutlookWebError::OutcomeUnknown { .. }));
+        }
+    }
     #[test]
     fn product_writes_are_typed_and_scoped_to_personal_objects() {
         let contact = json!({"givenName":"Synthetic","emailAddresses":[{"name":"Test","address":"test@example.com"}]});

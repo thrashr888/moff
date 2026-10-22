@@ -1,0 +1,48 @@
+{
+  "name": "@moff/bot-harness",
+  "version": "0.1.0",
+  "description": "Persistent bot harness for Moff using Pi Durable, GitHub Copilot model access, and ACP",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "moff-bot": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "prestart": "npm run build",
+    "start": "node dist/cli.js chat --ollama",
+    "preacp": "npm run build",
+    "acp": "node dist/cli.js acp",
+    "prechat": "npm run build",
+    "chat": "node dist/cli.js chat --ollama",
+    "test:live": "npm run build && node --test tests/cli-live.test.mjs",
+    "test": "npm run build && node --test tests/ollama-messages.test.mjs tests/ollama-stream.test.mjs tests/repetition.test.mjs tests/moff-mcp.test.mjs tests/cli-lifecycle.test.mjs tests/pi-durable.test.mjs tests/acp-agent.test.mjs tests/context.test.mjs tests/moff-evidence.test.mjs",
+    "test:mail:live": "npm run build && node --test tests/mail-live.test.mjs",
+    "test:combined:live": "npm run build && node --test tests/combined-live.test.mjs"
+  },
+  "keywords": [
+    "pi-durable",
+    "copilot",
+    "acp",
+    "agent-client-protocol",
+    "moff",
+    "m365",
+    "persistent-bot"
+  ],
+  "author": "Moff Contributors",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@agentclientprotocol/sdk": "^1.8.0",
+    "@earendil-works/chord": "^1.2.0",
+    "@earendil-works/pi-ai": "^1.2.0",
+    "@earendil-works/pi-durable": "^1.2.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}
