@@ -159,6 +159,43 @@ fn attachment_send_validates_files_and_gates_before_browser_access() {
 }
 
 #[test]
+fn existing_draft_resume_requires_attachments_and_both_mutation_gates() {
+    let send = [
+        "mail",
+        "send",
+        "--to",
+        "recipient@example.com",
+        "--subject",
+        "Synthetic",
+        "--body",
+        "Text",
+        "--resume-draft",
+        "synthetic-draft",
+    ];
+    moff()
+        .args(["outlook", "--allow-mutation"])
+        .args(send)
+        .arg("--confirm")
+        .assert()
+        .failure()
+        .stderr(contains("--attachment"));
+    moff()
+        .arg("outlook")
+        .args(send)
+        .args(["--attachment", "/not/read/avatar.png", "--confirm"])
+        .assert()
+        .failure()
+        .stderr(contains("--allow-mutation"));
+    moff()
+        .args(["outlook", "--allow-mutation"])
+        .args(send)
+        .args(["--attachment", "/not/read/avatar.png"])
+        .assert()
+        .failure()
+        .stderr(contains("--confirm"));
+}
+
+#[test]
 fn safari_is_the_only_transport_and_exports_are_not_accepted() {
     moff()
         .args(["outlook", "--session-curl", "/not/read", "mail", "list"])
