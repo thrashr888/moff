@@ -399,8 +399,10 @@ request shapes, bounds, verification and recovery limitations.
 
 ### Sending email
 
-`mail send` submits **one new plain-text message** through the selected signed-in
-Outlook Safari tab using OWA `CreateItem` with `SendAndSaveCopy`. It does not use
+`mail send` submits **one new plain-text message, optionally with local file
+attachments**, through the selected signed-in Outlook Safari tab. Text-only
+messages use OWA `CreateItem` with `SendAndSaveCopy`; attachment messages follow
+the verified draft workflow below. It does not use
 desktop Mail or switch accounts/transports. If multiple Outlook tabs are open,
 select the intended account with `--safari-window` and `--safari-tab` before
 `mail`. Confirm the account and exact user-authorized recipients/content before
@@ -417,14 +419,14 @@ addresses/quoted local parts are not. Text is literal, not HTML.
 Agents use the normal full-access action without a shell or intermediate file:
 
 ```json
-{"name":"moff_action","arguments":{"args":["outlook","--allow-mutation","mail","send","--to","recipient@example.com","--subject","Project update","--body","The project is ready for review.","--confirm"]}}
+{"name":"moff_action","arguments":{"args":["outlook","--allow-mutation","mail","send","--to","recipient@example.com","--subject","Project update","--body","The project is ready for review.","--attachment","/absolute/path/report.pdf","--confirm"]}}
 ```
 
 Place **`--allow-mutation` before `mail`**. The CLI flags do not replace host
 approval: configure the host to require approval for `moff_action`.
 Read-only `moff`, `mcp-native --mail-actions`, and `mcp-archive` do not expose send.
 
-Only a single successful OWA response yields `status:"submission_acknowledged"`,
+Only a single successful send response yields `status:"submission_acknowledged"`,
 `acknowledged:true`, `delivery_verified:false`, and `sent_copy_verified:false`.
 This is a submission acknowledgement, **not proof of delivery or a verified
 Sent Items copy**; no message ID is invented. Embedded service errors, missing
@@ -432,10 +434,9 @@ or multiple acknowledgements fail explicitly. A timeout/network error after
 dispatch is an unknown outcome: inspect Sent Items/Outbox and never resend
 automatically. There is no idempotency key or automatic retry.
 
-Attachments, custom From/Sender, HTML, sending an existing draft and threaded
-reply sending are unsupported and rejected. `create`/`reply-draft` still only
-save drafts. Attachment sending needs a separate verified upload/attachment
-transport; file sharing notifications are not attachment email. This send path
+Custom From/Sender, HTML, arbitrary existing-draft sending and threaded reply
+sending are unsupported and rejected. `create`/`reply-draft` still only save
+drafts. File sharing notifications are not attachment email. This send path
 is contract-tested with synthetic responses, **not live-send validated**; no live
 message was authorized or sent during implementation. OWA is a private adapter,
 so personal/work account or service-contract drift may require an update.
@@ -443,6 +444,50 @@ The submission/empty-item acknowledgement follows Microsoft's
 [CreateItem email contract](https://learn.microsoft.com/en-us/exchange/client-developer/web-service-reference/createitem-operation-email-message);
 that public Exchange contract is not a guarantee that every private OWA deployment
 accepts the adapter.
+
+#### File attachments
+
+Repeat `--attachment /absolute/path/file` for **1-5 local regular files, at most
+500000 bytes combined** (including zero-byte files). Only explicitly
+user-authorized files belong in the approved action. Moff snapshots all files
+before selecting Safari or writing; later local changes cannot alter the upload.
+Symlinks, directories, devices, missing/unreadable files, duplicate basenames
+(case-insensitive), unsafe/over-255-byte names and oversize files are rejected.
+On Unix, files are opened with `O_NOFOLLOW | O_NONBLOCK` and rechecked as regular
+files, preventing symlink/FIFO substitution between validation and opening.
+Filename is the local basename; bytes are unchanged, with
+`application/octet-stream` content type. No inline images, item attachments,
+reference/cloud attachments, remote URLs, custom MIME types or name overrides.
+
+Attachments are actually uploaded as base64 `FileAttachment:#Exchange` contents
+in **one `CreateItem SaveOnly` draft request**, following the
+[Exchange attachment creation contract](https://learn.microsoft.com/en-us/exchange/client-developer/exchange-web-services/how-to-add-attachments-by-using-ews-in-exchange).
+Moff reads the draft and verifies its exact recipients, subject, plain-text body,
+attachment names/count, then reads each attachment with `GetAttachment` and
+compares its ID, name, non-inline flag and exact base64 bytes. Only after all
+checks pass does a versioned `SendItem` with `SaveItemToFolder:true` submit that
+new draft to Sent Items. No public CLI command sends an arbitrary draft.
+
+The 500000-byte ceiling is a **bounded adapter limit**, not Microsoft's mail
+size limit. Base64 expands it to at most 666668 bytes. The pinned Cider
+[`EvalOptions::validate`](https://github.com/thrashr888/cider/blob/7220e5d6ef2dfbcfa35243f2b054666c4782f8f1/src/sources/safari.rs#L714-L729)
+caps JavaScript at 1000000 UTF-8 bytes. Moff checks the **complete serialized
+browser script**, including JSON escaping, recipient/body fields and auth/response
+helpers, before creating any draft. A script over that limit is rejected even
+when file bytes fit; reduce the body or files. Exact-limit/one-byte-over scripts,
+binary payloads, combined file limits and empty files are tested. Each
+attachment read fits the browser's 900000-byte response bound; oversized or
+truncated responses fail rather than weakening verification. Larger attachments
+need a separately streamed transport, not an increased constant.
+
+If draft creation is uncertain, sending is not attempted; inspect Drafts.
+Once a draft ID is known, verification or send failures report that ID and stage.
+Verification failure means **send was not attempted**; a send timeout or malformed
+acknowledgement means **submission may have happened**. No automatic retry,
+recreation or cleanup occurs; inspect the reported draft, Outbox and Sent Items
+before a separately authorized action. Successful results additionally report
+`attachment_count` and `attachment_bytes_verified:true`; this verifies bytes
+before submission, **not delivery or the final Sent Items copy**.
 
 ### Drafts and calendar
 

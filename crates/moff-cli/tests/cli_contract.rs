@@ -36,9 +36,7 @@ fn send_requires_explicit_content_opt_in_and_confirmation_without_browser_access
         .args(["outlook", "mail", "send", "--help"])
         .assert()
         .success()
-        .stdout(
-            contains("moff outlook --allow-mutation mail send").and(contains("No attachments")),
-        );
+        .stdout(contains("moff outlook --allow-mutation mail send").and(contains("--attachment")));
     for missing in ["--to", "--subject", "--body"] {
         let mut args = vec!["outlook", "--allow-mutation", "mail", "send", "--confirm"];
         for (flag, value) in [
@@ -56,14 +54,7 @@ fn send_requires_explicit_content_opt_in_and_confirmation_without_browser_access
             .failure()
             .stderr(contains(missing));
     }
-    for flag in [
-        "--attachments",
-        "--attachment",
-        "--from",
-        "--sender",
-        "--html",
-        "--id",
-    ] {
+    for flag in ["--attachments", "--from", "--sender", "--html", "--id"] {
         moff()
             .args(["outlook", "--allow-mutation"])
             .args(send)
@@ -108,6 +99,63 @@ fn send_requires_explicit_content_opt_in_and_confirmation_without_browser_access
         .assert()
         .failure()
         .stderr(contains("unique explicit SMTP"));
+}
+
+#[test]
+fn attachment_send_validates_files_and_gates_before_browser_access() {
+    let send = [
+        "mail",
+        "send",
+        "--to",
+        "recipient@example.com",
+        "--subject",
+        "Synthetic",
+        "--body",
+        "Text",
+        "--attachment",
+        "/not/read/avatar.png",
+    ];
+    moff()
+        .arg("outlook")
+        .args(send)
+        .arg("--confirm")
+        .assert()
+        .failure()
+        .stderr(contains("--allow-mutation"));
+    moff()
+        .args(["outlook", "--allow-mutation"])
+        .args(send)
+        .assert()
+        .failure()
+        .stderr(contains("--confirm"));
+    moff()
+        .args(["outlook", "--allow-mutation"])
+        .args(send)
+        .arg("--confirm")
+        .assert()
+        .failure()
+        .stderr(contains("local file transfer failed"));
+    let mut args = vec![
+        "outlook",
+        "--allow-mutation",
+        "mail",
+        "send",
+        "--to",
+        "recipient@example.com",
+        "--subject",
+        "Synthetic",
+        "--body",
+        "Text",
+        "--confirm",
+    ];
+    for _ in 0..6 {
+        args.extend(["--attachment", "/not/read/avatar.png"]);
+    }
+    moff()
+        .args(args)
+        .assert()
+        .failure()
+        .stderr(contains("at most 5 attachments"));
 }
 
 #[test]
@@ -434,7 +482,11 @@ fn schema_is_honest_about_unavailable_products_and_safe_writes() {
     assert_eq!(schema["commands"]["mail"]["mark"], true);
     assert_eq!(schema["commands"]["mail"]["reply_all_draft"], true);
     assert_eq!(schema["commands"]["mail"]["send"], true);
-    assert_eq!(schema["mail_send"]["attachments"], false);
+    assert_eq!(schema["mail_send"]["attachments"], true);
+    assert_eq!(
+        schema["mail_send"]["max_attachment_bytes_combined"],
+        500_000
+    );
     assert_eq!(schema["mail_send"]["live_send_validated"], false);
     assert_eq!(schema["commands"]["calendar"]["respond"], true);
     assert_eq!(schema["commands"]["calendar"]["move"], true);

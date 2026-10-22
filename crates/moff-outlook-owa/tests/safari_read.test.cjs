@@ -26,7 +26,7 @@ function fixture(options = {}) {
             getItem: () => options.marker || null,
             removeItem: () => {},
         },
-        AbortController, setTimeout: options.setTimeout || setTimeout, clearTimeout, TextDecoder, TextEncoder,
+        AbortController, setTimeout: options.setTimeout || setTimeout, clearTimeout, TextDecoder, TextEncoder, atob, btoa,
         fetch: async (url, init) => {
             requests.push({url, init});
             if (options.networkFailure) throw new TypeError("synthetic network failure");
@@ -51,6 +51,115 @@ function sendConfig() {
                 BccRecipients:[mailbox("bcc@example.com")]}]}
     }};
 }
+
+function attachmentDraftConfig(contents = Buffer.from([0,255,1,128])) {
+    const config = sendConfig();
+    config.body.Body.MessageDisposition="SaveOnly";
+    config.body.Body.Items[0].Attachments=[{
+        __type:"FileAttachment:#Exchange",Name:"avatar.png",ContentType:"application/octet-stream",
+        IsInline:false,IsContactPhoto:false,Content:contents.toString("base64")
+    }];
+    return config;
+}
+
+function attachmentSendConfig() {
+    return {action:"SendItem",mutation:true,allow_mutation:true,body:{
+        __type:"SendItemJsonRequest:#Exchange",Body:{
+            __type:"SendItemRequest:#Exchange",SaveItemToFolder:true,
+            ItemIds:[{__type:"ItemId:#Exchange",Id:"draft",ChangeKey:"verified-key"}],
+            SavedItemFolderId:{__type:"TargetFolderId:#Exchange",
+                BaseFolderId:{__type:"DistinguishedFolderId:#Exchange",Id:"sentitems"}}
+        }
+    }};
+}
+
+test("attachment draft transport preserves binary bytes at exact combined limit and sends only versioned drafts", async () => {
+    for (const origin of ["https://outlook.office.com","https://outlook.cloud.microsoft","https://outlook.live.com"]) {
+        const f = fixture({origin});
+        const config = attachmentDraftConfig(Buffer.alloc(500000,255));
+        assert.equal((await f.call(config)).status,200);
+        const sent = JSON.parse(f.requests[0].init.body);
+        assert.equal(sent.Body.MessageDisposition,"SaveOnly");
+        assert.equal(Buffer.from(sent.Body.Items[0].Attachments[0].Content,"base64").length,500000);
+        assert.equal((await f.call(attachmentSendConfig())).status,200);
+        assert.equal(f.requests.length,2);
+        assert.equal(f.requests[1].url,"/owa/service.svc?action=SendItem&app=Mail");
+        assert.deepEqual(JSON.parse(f.requests[1].init.body),attachmentSendConfig().body);
+        const empty = attachmentDraftConfig(Buffer.alloc(0));
+        assert.equal((await f.call(empty)).status,200);
+        const five = attachmentDraftConfig();
+        five.body.Body.Items[0].Attachments=Array.from({length:5},(_,i) =>
+            ({...five.body.Body.Items[0].Attachments[0],Name:`file${i}`,Content:Buffer.alloc(100000,i).toString("base64")}));
+        assert.equal((await f.call(five)).status,200);
+    }
+});
+
+test("browser independently rejects unsafe attachment payloads before authentication", async () => {
+    const changes = [
+        c => {c.body.Body.MessageDisposition="SendAndSaveCopy";},
+        c => {c.body.Body.Items[0].Attachments=[];},
+        c => {c.body.Body.Items[0].Attachments={Items:c.body.Body.Items[0].Attachments};},
+        c => {c.body.Body.Items[0].Attachments=Array.from({length:6},(_,i) => ({...c.body.Body.Items[0].Attachments[0],Name:`file${i}`}));},
+        c => {c.body.Body.Items[0].Attachments.push({...c.body.Body.Items[0].Attachments[0],Name:"AVATAR.PNG"});},
+        c => {c.body.Body.Items[0].Attachments[0].Content=Buffer.alloc(500001).toString("base64");},
+        c => {c.body.Body.Items[0].Attachments=Array.from({length:2},(_,i) =>
+            ({...c.body.Body.Items[0].Attachments[0],Name:`file${i}`,Content:Buffer.alloc(250001).toString("base64")}));},
+        ...["", ".", "..", "/etc/passwd", "a\\b", "a\nb", "a\u2028b", "é".repeat(128)].map(name =>
+            c => {c.body.Body.Items[0].Attachments[0].Name=name;}),
+        ...["?", "YQ", "YR==", "YQ==\n", "YQ==AAAA", "===="].map(content =>
+            c => {c.body.Body.Items[0].Attachments[0].Content=content;}),
+        c => {c.body.Body.Items[0].Attachments[0].__type="ItemAttachment:#Exchange";},
+        c => {c.body.Body.Items[0].Attachments[0].__type="ReferenceAttachment:#Exchange";},
+        c => {c.body.Body.Items[0].Attachments[0].ContentType="text/html";},
+        c => {c.body.Body.Items[0].Attachments[0].IsInline=true;},
+        c => {c.body.Body.Items[0].Attachments[0].IsContactPhoto=true;},
+        c => {c.body.Body.Items[0].Attachments[0].ContentLocation="file:///secret";},
+        c => {c.body.Body.Items[0].From={EmailAddress:"spoof@example.com"};},
+        c => {c.body.Body.Items[0].ToRecipients=[];},
+        c => {c.allow_mutation=false;},
+        c => {c.mutation=false;},
+    ];
+    for (const change of changes) {
+        let authenticated=0;
+        const f = fixture({acquireToken:async () => {authenticated++;return {status:200};}});
+        const config=attachmentDraftConfig();
+        change(config);
+        await assert.rejects(f.call(config));
+        assert.equal(f.requests.length,0);
+        assert.equal(authenticated,0);
+    }
+});
+
+test("SendItem browser gate forbids unversioned bulk alternate-folder or custom sends", async () => {
+    for (const change of [
+        c => {c.mutation=false;},
+        c => {c.allow_mutation=false;},
+        c => {c.body.Body.SaveItemToFolder=false;},
+        c => {c.body.Body.ItemIds=[];},
+        c => {c.body.Body.ItemIds.push(c.body.Body.ItemIds[0]);},
+        c => {delete c.body.Body.ItemIds[0].ChangeKey;},
+        c => {c.body.Body.ItemIds[0].Id="";},
+        c => {c.body.Body.ItemIds[0].ChangeKey="";},
+        c => {c.body.Body.ItemIds[0].__type="Other";},
+        c => {c.body.Body.SavedItemFolderId.BaseFolderId.Id="drafts";},
+        c => {c.body.Body.SavedItemFolderId.BaseFolderId.Other="value";},
+        c => {c.body.Body.From="spoof@example.com";},
+        c => {c.body.Body.Items=[{}];},
+    ]) {
+        let authenticated=0;
+        const f=fixture({acquireToken:async () => {authenticated++;return {status:200};}});
+        const config=attachmentSendConfig();
+        change(config);
+        await assert.rejects(f.call(config));
+        assert.equal(f.requests.length,0);
+        assert.equal(authenticated,0);
+    }
+    for (const config of [attachmentDraftConfig(),attachmentSendConfig()]) {
+        const f=fixture({networkFailure:true});
+        assert.equal((await f.call(config)).failure,"network");
+        assert.equal(f.requests.length,1);
+    }
+});
 
 test("typed explicit-recipient sending uses one same-origin request on work and personal Outlook", async () => {
     for (const origin of ["https://outlook.office.com","https://outlook.cloud.microsoft","https://outlook.live.com"]) {

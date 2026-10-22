@@ -2,18 +2,33 @@ async function(config, acquireToken, readResponse) {
     if (!["https://outlook.office.com", "https://outlook.cloud.microsoft", "https://outlook.live.com"].includes(location.origin)) {
         throw new Error("Moff requires an HTTPS Outlook tab");
     }
-    const allowed = ["FindFolder", "GetFolder", "FindItem", "FindConversation", "GetItem", "GetConversationItems",
+    const allowed = ["FindFolder", "GetFolder", "FindItem", "FindConversation", "GetItem", "GetAttachment", "GetConversationItems",
         "GetCalendarFolders", "GetCalendarFoldersV2", "GetCalendarView"];
     const authOnly = config.action === "__MoffAuthStatus" && config.mutation !== true;
     if (authOnly && config.recovery_marker !== undefined
         && (!config.recovery_marker || sessionStorage.getItem("__moff_auth_recovery") !== config.recovery_marker)) {
         return {status: 409};
     }
-    const writes = ["CreateItem", "UpdateItem", "UpdateCalendarEvent", "DeleteItem", "MoveItem"];
+    const writes = ["CreateItem", "SendItem", "UpdateItem", "UpdateCalendarEvent", "DeleteItem", "MoveItem"];
+    const onlyKeys = (value, keys) => value && typeof value === "object"
+        && !Array.isArray(value) && Object.keys(value).every(key => keys.includes(key));
     if (config.mutation === true) {
         if (config.allow_mutation !== true || !writes.includes(config.action)) throw new Error("Unsupported write action");
         const body = config.body?.Body;
         if (!body || body.__type !== config.action + "Request:#Exchange") throw new Error("Invalid write envelope");
+        if (config.action === "SendItem") {
+            const id = body.ItemIds?.[0], folder = body.SavedItemFolderId;
+            if (!onlyKeys(body, ["__type", "SaveItemToFolder", "ItemIds", "SavedItemFolderId"])
+                || body.SaveItemToFolder !== true || !Array.isArray(body.ItemIds) || body.ItemIds.length !== 1
+                || !onlyKeys(id, ["__type", "Id", "ChangeKey"]) || id.__type !== "ItemId:#Exchange"
+                || typeof id.Id !== "string" || !id.Id.trim()
+                || typeof id.ChangeKey !== "string" || !id.ChangeKey.trim()
+                || !onlyKeys(folder, ["__type", "BaseFolderId"]) || folder.__type !== "TargetFolderId:#Exchange"
+                || !onlyKeys(folder.BaseFolderId, ["__type", "Id"])
+                || folder.BaseFolderId.__type !== "DistinguishedFolderId:#Exchange" || folder.BaseFolderId.Id !== "sentitems") {
+                throw new Error("Only one versioned attachment draft send saving to Sent Items is allowed");
+            }
+        }
         if (config.action === "MoveItem") {
             const folder = body.ToFolderId?.BaseFolderId;
             if (body.ReturnNewItemIds !== true || folder?.__type !== "FolderId:#Exchange"
@@ -51,9 +66,33 @@ async function(config, acquireToken, readResponse) {
                         || !Number.isFinite(proposalEnd) || proposalEnd <= proposalStart))) {
                     throw new Error("Invalid meeting response");
                 }
-            } else if (item.__type === "Message:#Exchange" && body.MessageDisposition === "SendAndSaveCopy") {
-                const onlyKeys = (value, keys) => value && typeof value === "object"
-                    && !Array.isArray(value) && Object.keys(value).every(key => keys.includes(key));
+            } else if (item.__type === "Message:#Exchange"
+                && (body.MessageDisposition === "SendAndSaveCopy" || item.Attachments !== undefined)) {
+                if (item.Attachments !== undefined) {
+                    let total = 0;
+                    const names = new Set();
+                    const files = item.Attachments;
+                    if (body.MessageDisposition !== "SaveOnly" || !Array.isArray(files) || !files.length || files.length > 5)
+                        throw new Error("Attachments require a bounded unsent draft");
+                    for (const file of files) {
+                        if (!onlyKeys(file, ["__type", "Name", "ContentType", "IsInline", "IsContactPhoto", "Content"])
+                            || file.__type !== "FileAttachment:#Exchange" || file.ContentType !== "application/octet-stream"
+                            || file.IsInline !== false || file.IsContactPhoto !== false
+                            || typeof file.Name !== "string" || !file.Name.trim() || [".", ".."].includes(file.Name)
+                            || /[\x00-\x1f\x7f-\x9f/\\\u2028\u2029]/.test(file.Name)
+                            || new TextEncoder().encode(file.Name).length > 255
+                            || names.has(file.Name.toLowerCase()) || typeof file.Content !== "string"
+                            || file.Content.length > 666668
+                            || file.Content.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(file.Content)) {
+                            throw new Error("Invalid bounded file attachment");
+                        }
+                        const bytes = atob(file.Content);
+                        if (btoa(bytes) !== file.Content) throw new Error("Noncanonical attachment base64");
+                        total += bytes.length;
+                        names.add(file.Name.toLowerCase());
+                    }
+                    if (total > 500000) throw new Error("Attachments exceed 500000 bytes combined");
+                }
                 const addressOK = address => {
                     if (typeof address !== "string" || address.length > 254 || !/^[\x21-\x7e]+$/.test(address)) return false;
                     const parts = address.split("@");
@@ -67,7 +106,7 @@ async function(config, acquireToken, readResponse) {
                 const recipients = lists.every(Array.isArray) ? lists.flat() : [];
                 const text = item.Body;
                 if (!onlyKeys(body, ["__type", "MessageDisposition", "Items"])
-                    || !onlyKeys(item, ["__type", "Subject", "Body", "ToRecipients", "CcRecipients", "BccRecipients"])
+                    || !onlyKeys(item, ["__type", "Subject", "Body", "ToRecipients", "CcRecipients", "BccRecipients", "Attachments"])
                     || !lists.every(Array.isArray) || !item.ToRecipients.length || recipients.length > 20
                     || recipients.some(recipient => !onlyKeys(recipient, ["__type", "EmailAddress", "RoutingType"])
                         || recipient.__type !== "EmailAddress:#Exchange" || recipient.RoutingType !== "SMTP"
@@ -79,7 +118,7 @@ async function(config, acquireToken, readResponse) {
                     || text.__type !== "BodyContentType:#Exchange" || text.BodyType !== "Text"
                     || typeof text.Value !== "string" || !text.Value.trim() || text.Value.includes("\0")
                     || new TextEncoder().encode(text.Value).length > 200000) {
-                    throw new Error("Only explicit-recipient plain-text mail sending is allowed; no attachments or sender override");
+                    throw new Error("Only explicit-recipient plain-text mail is allowed; no sender override");
                 }
             } else if (!["Message:#Exchange", "ReplyToItem:#Exchange", "ReplyAllToItem:#Exchange","Contact:#Exchange"].includes(item.__type)
                 || body.MessageDisposition !== "SaveOnly") throw new Error("Sending is prohibited");

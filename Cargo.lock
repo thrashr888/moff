@@ -750,8 +750,10 @@ dependencies = [
 name = "moff-outlook-owa"
 version = "0.5.0"
 dependencies = [
+ "base64",
  "chrono",
  "cider-cli",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

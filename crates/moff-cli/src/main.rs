@@ -10,7 +10,8 @@ use moff_outlook_owa::{
     DEFAULT_MAX_FILE_BYTES, DraftInput, EventInput, EventMoveInput, LoopWorkspaceRequest,
     MeetingResponseInput, OutlookWebError, OutlookWebSession, ProductWrite, ReplyInput,
     SendMailInput, WorkInput, WorkPlan, calendar_folders_request, calendar_view_request,
-    product_segment, validate_contact_input, validate_file_size, validate_read_action,
+    load_mail_attachments, product_segment, validate_contact_input, validate_file_size,
+    validate_read_action,
 };
 use serde_json::{Value, json};
 mod archive_mcp;
@@ -143,7 +144,7 @@ enum AuthCommand {
 enum MailCommand {
     /// Submit new plain-text mail from the selected Outlook account; acknowledgement is not delivery.
     #[command(
-        after_help = "Example: moff outlook --allow-mutation mail send --to recipient@example.com --subject 'Subject' --body 'Message' --confirm\nRequires host approval through moff_action. Repeat --to/--cc/--bcc for exact addresses (20 total max). No attachments, custom sender, HTML, draft sending or automatic retries."
+        after_help = "Example: moff outlook --allow-mutation mail send --to recipient@example.com --subject 'Subject' --body 'Message' --attachment /absolute/path/avatar.png --confirm\nRequires host approval through moff_action for exact files and recipients. Repeat --to/--cc/--bcc for exact addresses (20 total max). Repeat --attachment for up to 5 regular non-symlink files, 500000 bytes combined, subject to a 1000000-byte serialized browser script limit. Attachments create/verify a draft then send it; failures may leave a draft or uncertain submission. No custom sender, HTML, arbitrary draft sending or automatic retries."
     )]
     Send {
         #[arg(long, required = true)]
@@ -156,6 +157,9 @@ enum MailCommand {
         subject: String,
         #[arg(long)]
         body: String,
+        /// Local regular file to attach; repeat for up to 5 files (500000 bytes combined).
+        #[arg(long)]
+        attachment: Vec<PathBuf>,
         #[arg(long, required = true)]
         confirm: bool,
     },
@@ -693,10 +697,14 @@ fn schema() -> Value {
                 "workspace":{"list":true,"get":true,"create":true,"delete":true,"search":true,"update":false,"title":false,"id":"base64 ODSP PodId","delete_policy":"permanent; verified current-user Owner required","list_scope":"recent workspaces only"}},
             "service":{"read":true}},
         "mail_send":{"command":"moff outlook --allow-mutation mail send --to recipient@example.com --subject Subject --body Message --confirm",
-            "transport":"OWA CreateItem SendAndSaveCopy in selected authenticated Outlook tab",
+            "transport":"selected authenticated Outlook tab; text-only CreateItem SendAndSaveCopy; attachments CreateItem SaveOnly/read-back/SendItem",
             "requires":["explicit SMTP recipients","nonempty subject","nonempty plain-text body","--allow-mutation","--confirm","host approval for moff_action"],
             "recipient_flags":["--to","--cc","--bcc"],"max_recipients":20,"max_subject_bytes":998,"max_body_bytes":200_000,
-            "sender":"selected Outlook account; no override","attachments":false,"html":false,
+            "sender":"selected Outlook account; no override","attachments":true,"html":false,
+            "attachment_flag":"--attachment","max_attachments":5,"max_attachment_bytes_combined":500_000,
+            "attachment_source":"regular non-symlink local files; snapshotted before first write; duplicate names rejected",
+            "attachment_transport":"CreateItem SaveOnly with FileAttachments; verify draft/bytes; versioned SendItem to Sent Items",
+            "max_serialized_browser_script_bytes":1_000_000,"attachment_failure":"no retries/cleanup; draft ID and stage reported when known",
             "send_existing_draft":false,"reply_send":false,"automatic_retry":false,
             "verification":"single successful OWA response acknowledges submission only; delivery and sent copy are not verified",
             "live_send_validated":false},
@@ -1456,6 +1464,7 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
             bcc,
             subject,
             body,
+            attachment,
             confirm,
         } => {
             if !confirm {
@@ -1469,9 +1478,20 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
                 body,
             };
             input.validate().map_err(|error| error.to_string())?;
+            let files = if attachment.is_empty() {
+                Vec::new()
+            } else {
+                load_mail_attachments(&attachment).map_err(|error| error.to_string())?
+            };
             Ok((
                 "outlook.mail.send",
-                with_owa(args, |s| s.send_mail(&input))?,
+                with_owa(args, |s| {
+                    if files.is_empty() {
+                        s.send_mail(&input)
+                    } else {
+                        s.send_mail_with_attachments(&input, &files)
+                    }
+                })?,
             ))
         }
         MailCommand::Mark {

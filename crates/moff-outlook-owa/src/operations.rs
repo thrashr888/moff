@@ -717,30 +717,35 @@ pub fn calendar_item_request(id: &str) -> Value {
 impl OutlookWebSession {
     pub fn send_mail(&self, input: &SendMailInput) -> Result<Value, OutlookWebError> {
         let result = self.execute("CreateItem", &send_mail_request(input)?, true)?;
-        // SendAndSaveCopy need not return an item ID. Never invent delivery/read-back evidence.
-        let responses = result
-            .pointer("/Body/ResponseMessages/Items")
-            .and_then(Value::as_array)
-            .filter(|responses| responses.len() == 1)
-            .ok_or(OutlookWebError::OutcomeUnknown {
-                action: "CreateItem",
-            })?;
-        if responses[0]["ResponseCode"] != "NoError"
-            || responses[0]
-                .get("ResponseClass")
-                .is_some_and(|class| class != "Success")
-        {
-            return Err(OutlookWebError::OutcomeUnknown {
-                action: "CreateItem",
-            });
-        }
-        Ok(json!({
-            "status":"submission_acknowledged","acknowledged":true,
-            "delivery_verified":false,"sent_copy_verified":false,
-            "message_disposition":"SendAndSaveCopy"
-        }))
+        send_acknowledgement(&result, "CreateItem")
     }
+}
 
+pub(crate) fn send_acknowledgement(
+    result: &Value,
+    action: &'static str,
+) -> Result<Value, OutlookWebError> {
+    // SendAndSaveCopy need not return an item ID. Never invent delivery/read-back evidence.
+    let responses = result
+        .pointer("/Body/ResponseMessages/Items")
+        .and_then(Value::as_array)
+        .filter(|responses| responses.len() == 1)
+        .ok_or(OutlookWebError::OutcomeUnknown { action })?;
+    if responses[0]["ResponseCode"] != "NoError"
+        || responses[0]
+            .get("ResponseClass")
+            .is_some_and(|class| class != "Success")
+    {
+        return Err(OutlookWebError::OutcomeUnknown { action });
+    }
+    Ok(json!({
+        "status":"submission_acknowledged","acknowledged":true,
+        "delivery_verified":false,"sent_copy_verified":false,
+        "message_disposition":"SendAndSaveCopy"
+    }))
+}
+
+impl OutlookWebSession {
     pub fn get_batch(&self, ids: &[String], calendar: bool) -> Result<Value, OutlookWebError> {
         let response = self.call("GetItem", &batch_item_request(ids, calendar)?)?;
         let messages = response

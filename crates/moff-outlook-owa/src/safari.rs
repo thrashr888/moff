@@ -252,6 +252,16 @@ fn page_script(source: &str, config: &Value) -> String {
     )
 }
 
+pub(crate) fn request_script_bytes(action: &str, body: &Value) -> usize {
+    page_script(
+        include_str!("safari_read.js"),
+        &json!({
+            "action":action,"body":body,"mutation":true,"allow_mutation":true,"timeout_ms":25000
+        }),
+    )
+    .len()
+}
+
 fn transfer_options(total_bytes: u64) -> BinaryTransferOptions {
     BinaryTransferOptions {
         allow_eval: true,
@@ -659,6 +669,7 @@ impl SafariSession {
             if !self.allow_mutation
                 || ![
                     "CreateItem",
+                    "SendItem",
                     "UpdateItem",
                     "UpdateCalendarEvent",
                     "DeleteItem",

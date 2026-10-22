@@ -1,6 +1,8 @@
 //! Outlook Mail and Calendar operations through Safari and the Cider library.
 #![allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
 mod archive;
+mod mail_attachments;
+pub use mail_attachments::*;
 mod mail_actions;
 pub use mail_actions::{flag_request, mail_action_item_request, native_pin_state};
 mod contacts;
@@ -29,6 +31,11 @@ const EXCHANGE_HEADER: &str = "JsonRequestHeaders:#Exchange";
 
 #[derive(Debug)]
 pub enum OutlookWebError {
+    AttachmentSendFailed {
+        draft_id: String,
+        stage: &'static str,
+        source: Box<OutlookWebError>,
+    },
     InvalidAction,
     RequestRejected(u16),
     InvalidResponse,
@@ -94,6 +101,9 @@ pub enum ServiceCode {
 impl fmt::Display for OutlookWebError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::AttachmentSendFailed { draft_id, stage, source } => {
+                return write!(f, "attachment email stopped at {stage}; draft ID {draft_id}; {source}. No automatic retry or cleanup; inspect Drafts, Outbox and Sent Items before taking further action");
+            }
             Self::InvalidAction => "the requested Outlook action is not a supported read operation",
             Self::RequestRejected(status) => {
                 return write!(f, "Outlook Web rejected the request (HTTP {status})");
@@ -229,6 +239,7 @@ pub fn decode_response(text: &str) -> Result<Value, OutlookWebError> {
     serde_json::from_str(payload).map_err(|_| OutlookWebError::InvalidResponse)
 }
 const READ_ACTIONS: &[&str] = &[
+    "GetAttachment",
     "FindFolder",
     "GetFolder",
     "FindItem",

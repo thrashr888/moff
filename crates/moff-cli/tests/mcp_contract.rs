@@ -49,7 +49,7 @@ fn full_access_exposes_actions_while_retaining_read_only_discovery() {
     .unwrap();
     assert_eq!(schema["full_access_mcp"]["requires_host_approval"], true);
     assert_eq!(schema["commands"]["mail"]["send"], true);
-    assert_eq!(schema["mail_send"]["attachments"], false);
+    assert_eq!(schema["mail_send"]["attachments"], true);
     assert_eq!(schema["commands"]["onedrive"]["share"], true);
     assert_eq!(responses[3]["result"]["isError"], false);
     assert_eq!(responses[4]["result"]["isError"], true);
