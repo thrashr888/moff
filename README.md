@@ -441,9 +441,13 @@ automatically. There is no idempotency key or automatic retry.
 
 Custom From/Sender, HTML, arbitrary existing-draft sending and threaded reply
 sending are unsupported and rejected. `create`/`reply-draft` still only save
-drafts. File sharing notifications are not attachment email. This send path
-is contract-tested with synthetic responses, **not live-send validated**. Authorized
-attempts exposed private OWA contract differences; none established submission.
+drafts. File sharing notifications are not attachment email. The corrected
+attachment path has been **live-validated through a user-approved agent action**:
+one existing draft was submitted, then the same message was observed in Sent
+Items with the intended recipient/content and attachment, no longer a draft.
+The selected authenticated account was the sender. This is not recipient delivery
+verification or validation of every account configuration. Text-only direct
+sending remains synthetic-contract tested, not separately live-validated.
 OWA is a private adapter,
 so personal/work account or service-contract drift may require an update.
 The submission/empty-item acknowledgement follows Microsoft's
@@ -505,10 +509,12 @@ recreation or cleanup occurs; inspect the reported draft, Outbox and Sent Items
 before a separately authorized action. Successful results additionally report
 `attachment_count` and `attachment_bytes_verified:true`; this verifies bytes
 before submission, **not delivery or the final Sent Items copy**.
-The corrected complete verifier has also been exercised read-only against an
-existing failed draft, including exact local/remote attachment bytes; no new
-draft, send or cleanup was performed. This confirms read-back compatibility,
-not live submit acceptance or delivery.
+The corrected complete verifier was exercised read-only against an existing
+failed draft, including exact local/remote attachment bytes. A subsequent
+separately authorized agent action submitted a verified existing draft through
+the corrected UpdateItem route; native mail reads then confirmed that same
+message in Sent Items with its attachment and intended content. The failed
+diagnostic draft was not cleaned up, and no duplicate draft was created on resume.
 If sending itself fails, diagnostics retain a safe reason (network/timeout,
 HTTP status, invalid JSON or acknowledgement shape) without returning raw server
 content or credentials. Explicit HTTP/service rejection is labeled separately

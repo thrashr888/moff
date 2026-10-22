@@ -524,7 +524,14 @@ fn schema_is_honest_about_unavailable_products_and_safe_writes() {
         schema["mail_send"]["max_attachment_bytes_combined"],
         500_000
     );
-    assert_eq!(schema["mail_send"]["live_send_validated"], false);
+    assert_eq!(schema["mail_send"]["live_send_validated"], true);
+    assert_eq!(schema["mail_send"]["text_only_live_send_validated"], false);
+    assert!(
+        schema["mail_send"]["live_validation_scope"]
+            .as_str()
+            .unwrap()
+            .contains("delivery not verified")
+    );
     assert_eq!(schema["commands"]["calendar"]["respond"], true);
     assert_eq!(schema["commands"]["calendar"]["move"], true);
     assert_eq!(schema["commands"]["calendar"]["cancel"], true);

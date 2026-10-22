@@ -669,7 +669,6 @@ impl SafariSession {
             if !self.allow_mutation
                 || ![
                     "CreateItem",
-                    "SendItem",
                     "UpdateItem",
                     "UpdateCalendarEvent",
                     "DeleteItem",

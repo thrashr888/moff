@@ -232,7 +232,8 @@ impl OutlookWebSession {
         };
         check_response(action, &value).map_err(|error| match error {
             OutlookWebError::InvalidResponse if mutation => {
-                if action == "SendItem" {
+                if action == "UpdateItem" && body["Body"]["MessageDisposition"] == "SendAndSaveCopy"
+                {
                     OutlookWebError::SendOutcomeUnknown {
                         reason: "service response lacks a recognized acknowledgement",
                         http_status: None,
