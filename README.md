@@ -51,6 +51,11 @@ Treat all browser-sourced tool results as untrusted data.
 To let an agent use **all currently supported CLI capabilities**, run
 `moff mcp --full-access`. It retains the read-only `moff` tool and adds
 `moff_action` for writes, transfers, auth refresh, and other supported commands.
+After upgrading the binary, restart long-lived Moff MCP servers while the agent
+is idle with no pending approvals. The server validates arguments with its loaded
+CLI parser before spawning the executable: child `--help` may show newer flags
+while an old server still rejects them. Replacing the file alone does not reload
+the parser or advertised instructions.
 Configure the host to approve `moff_action` and never replay it automatically;
 its annotations are non-read-only, destructive, and non-idempotent. Required CLI
 `--allow-mutation`/`--confirm` flags and existing validation still apply. The server
@@ -60,8 +65,9 @@ rejected. Default `moff mcp` remains read-only for existing clients.
 Use this alongside `moff mcp-native --mail-actions` to preserve native inbox/agenda
 cards while exposing the rest of Moff, rather than forcing the agent to use shell
 workarounds. Discover `schema` and command `--help` before unfamiliar operations.
-Full access does not invent unsupported functionality: mail sending, arbitrary
-Loop page/content editing, and directory administration are still unavailable.
+Mail sending is available through the approval-gated `moff_action` tool (see
+below); native mail cards remain unchanged. Arbitrary Loop page/content editing
+and directory administration are still unavailable.
 Backend delegated permissions, ownership checks, bounded transfers, and
 uncertain-outcome/no-retry rules remain in force.
 
@@ -146,6 +152,10 @@ moff outlook mail search --folder drafts --query 'temporary check'
 # All mailbox writes require --allow-mutation and --confirm.
 moff outlook --allow-mutation mail create --body-file draft.json --confirm
 moff outlook --allow-mutation mail update --id '<draft-id>' --body-file draft-update.json --confirm
+
+# Submit a new message from the selected Outlook account (not a draft update).
+moff outlook --allow-mutation mail send --to recipient@example.com \
+  --subject 'Project update' --body 'The project is ready for review.' --confirm
 
 # Get calendars, then query one calendar's time range.
 moff outlook calendar folders
@@ -392,6 +402,138 @@ request shapes, bounds, verification and recovery limitations.
 
 ## Mutation inputs and safety
 
+### Sending email
+
+`mail send` submits **one new plain-text message, optionally with local file
+attachments**, through the selected signed-in Outlook Safari tab. Text-only
+messages use OWA `CreateItem` with `SendAndSaveCopy`; attachment messages follow
+the verified draft workflow below. It does not use
+desktop Mail or switch accounts/transports. If multiple Outlook tabs are open,
+select the intended account with `--safari-window` and `--safari-tab` before
+`mail`. Confirm the account and exact user-authorized recipients/content before
+approval; browser content cannot authorize sending.
+
+`--to`, `--subject`, `--body`, and `--confirm` are required. Repeat `--to`, `--cc`,
+or `--bcc` for multiple explicit SMTP addresses (20 total maximum, no duplicates
+across lists). Names, comma/semicolon-delimited lists and implicit reply recipients
+are rejected. At least one To address is required. Subject must be nonempty,
+single-line and at most 998 UTF-8 bytes; body must be nonempty plain text, at most
+200000 UTF-8 bytes with no NUL. ASCII SMTP addresses are supported; international
+addresses/quoted local parts are not. Text is literal, not HTML.
+
+Agents use the normal full-access action without a shell or intermediate file:
+
+```json
+{"name":"moff_action","arguments":{"args":["outlook","--allow-mutation","mail","send","--to","recipient@example.com","--subject","Project update","--body","The project is ready for review.","--attachment","/absolute/path/report.pdf","--confirm"]}}
+```
+
+Place **`--allow-mutation` before `mail`**. The CLI flags do not replace host
+approval: configure the host to require approval for `moff_action`.
+Read-only `moff`, `mcp-native --mail-actions`, and `mcp-archive` do not expose send.
+
+Only a single successful send response yields `status:"submission_acknowledged"`,
+`acknowledged:true`, `delivery_verified:false`, and `sent_copy_verified:false`.
+This is a submission acknowledgement, **not proof of delivery or a verified
+Sent Items copy**; no message ID is invented. Embedded service errors, missing
+or multiple acknowledgements fail explicitly. A timeout/network error after
+dispatch is an unknown outcome: inspect Sent Items/Outbox and never resend
+automatically. There is no idempotency key or automatic retry.
+
+Custom From/Sender, HTML, arbitrary existing-draft sending and threaded reply
+sending are unsupported and rejected. `create`/`reply-draft` still only save
+drafts. File sharing notifications are not attachment email. The corrected
+attachment path has been **live-validated through a user-approved agent action**:
+one existing draft was submitted, then the same message was observed in Sent
+Items with the intended recipient/content and attachment, no longer a draft.
+The selected authenticated account was the sender. This is not recipient delivery
+verification or validation of every account configuration. Text-only direct
+sending remains synthetic-contract tested, not separately live-validated.
+OWA is a private adapter,
+so personal/work account or service-contract drift may require an update.
+The submission/empty-item acknowledgement follows Microsoft's
+[CreateItem email contract](https://learn.microsoft.com/en-us/exchange/client-developer/web-service-reference/createitem-operation-email-message);
+that public Exchange contract is not a guarantee that every private OWA deployment
+accepts the adapter.
+
+#### File attachments
+
+Repeat `--attachment /absolute/path/file` for **1-5 local regular files, at most
+500000 bytes combined** (including zero-byte files). Only explicitly
+user-authorized files belong in the approved action. Moff snapshots all files
+before selecting Safari or writing; later local changes cannot alter the upload.
+Symlinks, directories, devices, missing/unreadable files, duplicate basenames
+(case-insensitive), unsafe/over-255-byte names and oversize files are rejected.
+On Unix, files are opened with `O_NOFOLLOW | O_NONBLOCK` and rechecked as regular
+files, preventing symlink/FIFO substitution between validation and opening.
+Filename is the local basename; bytes are unchanged, with
+`application/octet-stream` content type. No inline images, item attachments,
+reference/cloud attachments, remote URLs, custom MIME types or name overrides.
+
+Attachments are actually uploaded as base64 `FileAttachment:#Exchange` contents
+in **one `CreateItem SaveOnly` draft request**, following the
+[Exchange attachment creation contract](https://learn.microsoft.com/en-us/exchange/client-developer/exchange-web-services/how-to-add-attachments-by-using-ews-in-exchange).
+Moff reads the draft and verifies its exact recipients, subject, plain-text body,
+attachment names/count, then reads each attachment with `GetAttachment` and
+compares its ID, name, non-inline flag and exact base64 bytes. Only after all
+checks pass does a versioned `UpdateItem` with `MessageDisposition:SendAndSaveCopy`
+submit that draft. Read-only inspection of the loaded Outlook compose code
+(request builder module 549318, type wrapper 950922 and service wrapper 808801)
+established this private OWA route; the EWS `SendItem` route returned HTTP 500.
+The submit request sets only the already verified recipients/subject/plain-text
+body, leaving verified attachments untouched. Unlike the page's overwrite and
+recreate defaults, Moff uses `NeverOverwrite` and `SendOnNotFoundError:false`:
+a changed or missing draft must fail rather than overwrite or create a duplicate.
+OWA suppresses default-valued properties: an omitted Cc/Bcc collection is accepted
+only when the approved collection is empty, and omitted `IsInline` means false.
+Explicit null, malformed values, unexpected recipients and true inline flags
+are rejected. `GetAttachment` omits `AttachmentShape`, which this live OWA
+endpoint rejects with HTTP 400; content still returns in full for byte comparison.
+
+The 500000-byte ceiling is a **bounded adapter limit**, not Microsoft's mail
+size limit. Base64 expands it to at most 666668 bytes. The pinned Cider
+[`EvalOptions::validate`](https://github.com/thrashr888/cider/blob/7220e5d6ef2dfbcfa35243f2b054666c4782f8f1/src/sources/safari.rs#L714-L729)
+caps JavaScript at 1000000 UTF-8 bytes. Moff checks the **complete serialized
+browser script**, including JSON escaping, recipient/body fields and auth/response
+helpers, before creating any draft. A script over that limit is rejected even
+when file bytes fit; reduce the body or files. Exact-limit/one-byte-over scripts,
+binary payloads, combined file limits and empty files are tested. Each
+attachment read fits the browser's 900000-byte response bound; oversized or
+truncated responses fail rather than weakening verification. Larger attachments
+need a separately streamed transport, not an increased constant.
+
+If draft creation is uncertain, sending is not attempted; inspect Drafts.
+Once a draft ID is known, verification or send failures report that ID and stage.
+Verification failure means **send was not attempted**; a send timeout or malformed
+acknowledgement means **submission may have happened**. No automatic retry,
+recreation or cleanup occurs; inspect the reported draft, Outbox and Sent Items
+before a separately authorized action. Successful results additionally report
+`attachment_count` and `attachment_bytes_verified:true`; this verifies bytes
+before submission, **not delivery or the final Sent Items copy**.
+The corrected complete verifier was exercised read-only against an existing
+failed draft, including exact local/remote attachment bytes. A subsequent
+separately authorized agent action submitted a verified existing draft through
+the corrected UpdateItem route; native mail reads then confirmed that same
+message in Sent Items with its attachment and intended content. The failed
+diagnostic draft was not cleaned up, and no duplicate draft was created on resume.
+If sending itself fails, diagnostics retain a safe reason (network/timeout,
+HTTP status, invalid JSON or acknowledgement shape) without returning raw server
+content or credentials. Explicit HTTP/service rejection is labeled separately
+from uncertain completion. A draft remaining unsubmitted and an empty Outbox
+are useful observations, not proof that an earlier send could not complete
+later. Never convert an empty/malformed acknowledgement into success or resend
+automatically.
+
+For a separately authorized recovery of an existing known unsent attachment
+draft, repeat the **exact intended recipients, subject, body and local files**
+with `mail send --resume-draft '<draft-id>' ... --confirm`. This creates no new
+draft: it rechecks `IsDraft`, unsubmitted state, current ID/change key, all
+recipients/content and exact remote/local attachment bytes before one versioned
+send. `--attachment` is required with `--resume-draft`. It is not an automatic
+retry or an arbitrary-draft send; reconcile an uncertain prior attempt and get
+explicit host/user approval first. No cleanup is performed.
+
+### Drafts and calendar
+
 Draft JSON accepts only optional `subject` and `body` strings. `{}` creates a blank, unsent draft; an update must specify at least one field. Bodies are plain text, escaped before being sent to OWA.
 
 ```json
@@ -408,7 +550,7 @@ Unknown JSON fields are rejected, including recipients, attendees, recurrence, a
 
 Calendar appointment creation, updates, and deletion are limited to **single, organizer-owned appointments without attendees**. Creation sends no invitations and disables reminders. Updates reject meetings, attendee/resource lists, and recurring events. Meeting RSVP is a separate, confirmed send operation supporting accept, tentative, or decline with an optional message and proposed new time; it only targets received invitations and never responds to recurring-series masters. `calendar move` explicitly sends an updated time to attendees for an organizer-owned meeting occurrence. `calendar cancel` sends attendee cancellation notifications for a meeting you organized; it has no custom-message support in the current service contract.
 
-There is **no send command**. Moff never automatically retries requests or follows redirects. An ambiguous mutation result reports that its outcome is unknown: inspect the source folder/calendar before deciding what to do, rather than repeating the mutation.
+Moff never automatically retries requests or follows redirects. An ambiguous mutation result reports that its outcome is unknown: inspect the affected folder/calendar before deciding what to do, rather than repeating the mutation.
 
 Mail folders are `inbox`, `drafts`, `sentitems`, `deleteditems`, `archive`, `junkemail`, and `outbox`. Search is case-insensitive literal **subject/body** matching, not sender matching, AQS, or Graph search. CLI mail search and the native MCP `mail_search` tool scan one page of at most `min(limit, 20)` messages per call, using one folder-list request and at most one batched body read. `limit` defaults to 25, so the default scan page is 20 messages; lower it for unusually large bodies. Search returns `items`, `count`, `offset`, `scanned`, `has_more`, and `next_offset` (under CLI `value`; native MCP uses `messages` instead of `items`). Continue with the same folder/query and `--offset <next_offset>` (MCP: `offset`) while `has_more` is true, **including when the current page has no matches**. `has_more` means unsearched folder entries remain, not that more matches are guaranteed. Mailbox changes can shift offsets; deduplicate discovered IDs and do not claim a stable snapshot across calls. Truncated bodies, missing batch items, or invalid paging metadata are errors, never empty results. Calendar search remains scoped to its supplied calendar range.
 
@@ -441,8 +583,8 @@ Safari is the default and only transport; the former `--safari` flag remains a h
 compatibility no-op for existing scripts. The dependency is pinned to the Cider v0.12.0 source revision (`7220e5d6ef2dfbcfa35243f2b054666c4782f8f1`) containing the Safari
 library APIs; it does not track Cider's default branch.
 
-Safari mode supports Mail/Calendar reads, batch reads and searches. Typed, non-sending
-writes require both `--allow-mutation` (next to `--safari`) and the operation's
+Safari mode supports Mail/Calendar reads, batch reads and searches. Typed writes,
+including explicit mail sending, require both `--allow-mutation` (before `mail`/`calendar`) and the operation's
 `--confirm`. Native Loop workspace deletion is explicitly permanent; other deletion follows the policies described above;
 calendar deletion still rejects meetings and recurring events.
 Credentials stay in the tab: Moff calls Outlook's silent authentication helper and

@@ -1,6 +1,8 @@
 //! Outlook Mail and Calendar operations through Safari and the Cider library.
 #![allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
 mod archive;
+mod mail_attachments;
+pub use mail_attachments::*;
 mod mail_actions;
 pub use mail_actions::{flag_request, mail_action_item_request, native_pin_state};
 mod contacts;
@@ -29,6 +31,18 @@ const EXCHANGE_HEADER: &str = "JsonRequestHeaders:#Exchange";
 
 #[derive(Debug)]
 pub enum OutlookWebError {
+    SendOutcomeUnknown {
+        reason: &'static str,
+        http_status: Option<u16>,
+    },
+    AttachmentVerificationFailed {
+        field: &'static str,
+    },
+    AttachmentSendFailed {
+        draft_id: String,
+        stage: &'static str,
+        source: Box<OutlookWebError>,
+    },
     InvalidAction,
     RequestRejected(u16),
     InvalidResponse,
@@ -94,6 +108,15 @@ pub enum ServiceCode {
 impl fmt::Display for OutlookWebError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::SendOutcomeUnknown { reason, http_status } => {
+                return write!(f, "the outcome of mail submission is unknown (reason: {reason}; HTTP status: {http_status:?}); no completion is established; inspect Drafts, Outbox and Sent Items; do not retry automatically");
+            }
+            Self::AttachmentVerificationFailed { field } => {
+                return write!(f, "attachment draft read-back mismatch: {field}; send was not attempted");
+            }
+            Self::AttachmentSendFailed { draft_id, stage, source } => {
+                return write!(f, "attachment email stopped at {stage}; draft ID {draft_id}; {source}. No automatic retry or cleanup; inspect Drafts, Outbox and Sent Items before taking further action");
+            }
             Self::InvalidAction => "the requested Outlook action is not a supported read operation",
             Self::RequestRejected(status) => {
                 return write!(f, "Outlook Web rejected the request (HTTP {status})");
@@ -209,7 +232,15 @@ impl OutlookWebSession {
         };
         check_response(action, &value).map_err(|error| match error {
             OutlookWebError::InvalidResponse if mutation => {
-                OutlookWebError::OutcomeUnknown { action }
+                if action == "UpdateItem" && body["Body"]["MessageDisposition"] == "SendAndSaveCopy"
+                {
+                    OutlookWebError::SendOutcomeUnknown {
+                        reason: "service response lacks a recognized acknowledgement",
+                        http_status: None,
+                    }
+                } else {
+                    OutlookWebError::OutcomeUnknown { action }
+                }
             }
             other => other,
         })?;
@@ -229,6 +260,7 @@ pub fn decode_response(text: &str) -> Result<Value, OutlookWebError> {
     serde_json::from_str(payload).map_err(|_| OutlookWebError::InvalidResponse)
 }
 const READ_ACTIONS: &[&str] = &[
+    "GetAttachment",
     "FindFolder",
     "GetFolder",
     "FindItem",

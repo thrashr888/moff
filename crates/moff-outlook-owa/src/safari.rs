@@ -252,6 +252,16 @@ fn page_script(source: &str, config: &Value) -> String {
     )
 }
 
+pub(crate) fn request_script_bytes(action: &str, body: &Value) -> usize {
+    page_script(
+        include_str!("safari_read.js"),
+        &json!({
+            "action":action,"body":body,"mutation":true,"allow_mutation":true,"timeout_ms":25000
+        }),
+    )
+    .len()
+}
+
 fn transfer_options(total_bytes: u64) -> BinaryTransferOptions {
     BinaryTransferOptions {
         allow_eval: true,
@@ -701,19 +711,44 @@ impl SafariSession {
                     }
                 }
                 if mutation {
-                    OutlookWebError::OutcomeUnknown { action }
+                    uncertain_write(
+                        action,
+                        "Safari evaluation failed without phase evidence",
+                        None,
+                    )
                 } else {
                     OutlookWebError::SafariOperationFailed
                 }
             })?;
         if result.truncated {
             return Err(if mutation {
-                OutlookWebError::OutcomeUnknown { action }
+                uncertain_write(action, "Safari result was truncated", None)
             } else {
                 OutlookWebError::TruncatedSearch
             });
         }
-        decode_call_result(action, &result.value, mutation)
+        let diagnostic_action =
+            if action == "UpdateItem" && body["Body"]["MessageDisposition"] == "SendAndSaveCopy" {
+                "UpdateItem mail submission"
+            } else {
+                action
+            };
+        decode_call_result(diagnostic_action, &result.value, mutation)
+    }
+}
+
+fn uncertain_write(
+    action: &'static str,
+    reason: &'static str,
+    http_status: Option<u16>,
+) -> OutlookWebError {
+    if matches!(action, "SendItem" | "UpdateItem mail submission") {
+        OutlookWebError::SendOutcomeUnknown {
+            reason,
+            http_status,
+        }
+    } else {
+        OutlookWebError::OutcomeUnknown { action }
     }
 }
 
@@ -724,7 +759,16 @@ fn decode_call_result(
 ) -> Result<Value, OutlookWebError> {
     if let Some(failure) = value["failure"].as_str() {
         return Err(if mutation && value["dispatched"] != false {
-            OutlookWebError::OutcomeUnknown { action }
+            uncertain_write(
+                action,
+                match failure {
+                    "timeout" => "browser request timed out after dispatch",
+                    "network" => "browser network failed after dispatch",
+                    "response_too_large" => "browser response exceeded size limit after dispatch",
+                    _ => "unrecognized browser failure after dispatch",
+                },
+                None,
+            )
         } else {
             match failure {
                 "timeout" => OutlookWebError::ReadTimedOut { action },
@@ -738,7 +782,7 @@ fn decode_call_result(
         .as_u64()
         .and_then(|n| u16::try_from(n).ok())
         .ok_or(if mutation {
-            OutlookWebError::OutcomeUnknown { action }
+            uncertain_write(action, "browser result lacks a valid HTTP status", None)
         } else {
             OutlookWebError::InvalidResponse
         })?;
@@ -753,18 +797,30 @@ fn decode_call_result(
     }
     if !(200..300).contains(&status) {
         if mutation && status >= 500 {
-            return Err(OutlookWebError::OutcomeUnknown { action });
+            return Err(uncertain_write(
+                action,
+                "server returned an error after dispatch",
+                Some(status),
+            ));
         }
         return Err(OutlookWebError::RequestRejected(status));
     }
     decode_response(value["body"].as_str().ok_or(if mutation {
-        OutlookWebError::OutcomeUnknown { action }
+        uncertain_write(
+            action,
+            "successful HTTP response lacks a text body",
+            Some(status),
+        )
     } else {
         OutlookWebError::InvalidResponse
     })?)
     .map_err(|_| {
         if mutation {
-            OutlookWebError::OutcomeUnknown { action }
+            uncertain_write(
+                action,
+                "successful HTTP response body is not valid JSON",
+                Some(status),
+            )
         } else {
             OutlookWebError::InvalidResponse
         }
@@ -774,6 +830,64 @@ fn decode_call_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_uncertainty_preserves_safe_phase_reason_and_http_status_without_response_content() {
+        for (value, reason, status) in [
+            (
+                json!({"status":0,"failure":"network","dispatched":true}),
+                "network",
+                None,
+            ),
+            (
+                json!({"status":0,"failure":"timeout","dispatched":true}),
+                "timed out",
+                None,
+            ),
+            (
+                json!({"status":0,"failure":"response_too_large","dispatched":true}),
+                "size limit",
+                None,
+            ),
+            (json!({}), "HTTP status", None),
+            (
+                json!({"status":500,"body":"private body/token"}),
+                "server returned",
+                Some(500),
+            ),
+            (json!({"status":503}), "server returned", Some(503)),
+            (json!({"status":200}), "lacks a text body", Some(200)),
+            (
+                json!({"status":200,"body":"private body/token"}),
+                "not valid JSON",
+                Some(200),
+            ),
+            (json!({"status":204,"body":""}), "not valid JSON", Some(204)),
+        ] {
+            let error = decode_call_result("SendItem", &value, true).unwrap_err();
+            assert!(
+                matches!(&error, OutlookWebError::SendOutcomeUnknown { http_status, .. } if *http_status == status)
+            );
+            let text = error.to_string();
+            assert!(text.contains(reason), "{text}");
+            assert!(text.contains("do not retry"), "{text}");
+            assert!(!text.contains("private body/token"));
+        }
+        for status in [400, 403, 404, 409, 429] {
+            assert!(
+                matches!(decode_call_result("SendItem",&json!({"status":status}),true),
+                Err(OutlookWebError::RequestRejected(code)) if code == status)
+            );
+        }
+        assert!(matches!(
+            decode_call_result(
+                "SendItem",
+                &json!({"failure":"timeout","dispatched":false}),
+                true
+            ),
+            Err(OutlookWebError::ReadTimedOut { .. })
+        ));
+    }
 
     #[test]
     fn browser_diagnostics_preserve_auth_timeout_and_write_uncertainty() {
