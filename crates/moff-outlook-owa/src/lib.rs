@@ -234,6 +234,7 @@ const READ_ACTIONS: &[&str] = &[
     "FindItem",
     "FindConversation",
     "GetItem",
+    "GetAttachment",
     "GetConversationItems",
     "GetCalendarFolders",
     "GetCalendarFoldersV2",
@@ -315,6 +316,9 @@ pub fn find_item_request(limit: u16) -> Value {
 }
 pub fn get_item_request(id: &str) -> Value {
     json!({"Header":header(),"Body":{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"AllProperties","BodyType":"Text"},"ItemIds":[{"__type":"ItemId:#Exchange","Id":id}]}})
+}
+pub fn get_attachment_request(id: &str) -> Value {
+    json!({"Header":header(),"Body":{"__type":"GetAttachmentRequest:#Exchange","AttachmentShape":{"__type":"AttachmentResponseShape:#Exchange","BodyType":"Text"},"AttachmentIds":[{"__type":"AttachmentId:#Exchange","Id":id}]}})
 }
 pub fn calendar_folders_request() -> Value {
     json!({"ShouldReturnLinkedCalendarEntryV2":false,"IncludeOrganizationCalendars":false,"Header":header()})
