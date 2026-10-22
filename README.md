@@ -467,6 +467,11 @@ attachment names/count, then reads each attachment with `GetAttachment` and
 compares its ID, name, non-inline flag and exact base64 bytes. Only after all
 checks pass does a versioned `SendItem` with `SaveItemToFolder:true` submit that
 new draft to Sent Items. No public CLI command sends an arbitrary draft.
+OWA suppresses default-valued properties: an omitted Cc/Bcc collection is accepted
+only when the approved collection is empty, and omitted `IsInline` means false.
+Explicit null, malformed values, unexpected recipients and true inline flags
+are rejected. `GetAttachment` omits `AttachmentShape`, which this live OWA
+endpoint rejects with HTTP 400; content still returns in full for byte comparison.
 
 The 500000-byte ceiling is a **bounded adapter limit**, not Microsoft's mail
 size limit. Base64 expands it to at most 666668 bytes. The pinned Cider
@@ -488,6 +493,10 @@ recreation or cleanup occurs; inspect the reported draft, Outbox and Sent Items
 before a separately authorized action. Successful results additionally report
 `attachment_count` and `attachment_bytes_verified:true`; this verifies bytes
 before submission, **not delivery or the final Sent Items copy**.
+The corrected complete verifier has also been exercised read-only against an
+existing failed draft, including exact local/remote attachment bytes; no new
+draft, send or cleanup was performed. This confirms read-back compatibility,
+not live `SendItem` acceptance or delivery.
 
 ### Drafts and calendar
 

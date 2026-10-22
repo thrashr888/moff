@@ -124,9 +124,16 @@ pub fn attachment_draft_request(
 }
 
 pub fn attachment_read_request(id: &str) -> Value {
-    json!({"Header":header(),"Body":{"__type":"GetAttachmentRequest:#Exchange",
-        "AttachmentShape":{"__type":"AttachmentResponseShape:#Exchange"},
+    json!({"__type":"GetAttachmentJsonRequest:#Exchange","Header":header(),"Body":{"__type":"GetAttachmentRequest:#Exchange",
         "AttachmentIds":[{"__type":"AttachmentId:#Exchange","Id":id}]}})
+}
+
+fn verification(field: &'static str) -> OutlookWebError {
+    OutlookWebError::AttachmentVerificationFailed { field }
+}
+
+fn omitted_false(value: Option<&Value>) -> bool {
+    matches!(value, None | Some(Value::Bool(false)))
 }
 
 pub fn send_attachment_draft_request(id: &str, key: &str) -> Result<Value, OutlookWebError> {
@@ -186,38 +193,47 @@ impl OutlookWebSession {
         attachments: &[MailAttachment],
     ) -> Result<Value, OutlookWebError> {
         let response = self.mail_get(id)?;
-        let draft = single_item(&response)?;
+        let draft = single_item(&response).map_err(|_| verification("draft response shape"))?;
         if draft["__type"] != "Message:#Exchange"
             || draft["IsDraft"] != true
             || draft["ItemId"]["Id"] != id
-            || draft["Subject"] != input.subject
-            || draft["Body"]["Value"] != input.body
-            || draft["Body"]["BodyType"] != "Text"
         {
-            return Err(OutlookWebError::VerificationFailed);
+            return Err(verification("draft identity/type/state"));
+        }
+        if draft["Subject"] != input.subject {
+            return Err(verification("subject"));
+        }
+        if draft["Body"]["Value"] != input.body
+            || draft["Body"]["BodyType"] != "Text"
+            || !omitted_false(draft["Body"].get("IsTruncated"))
+        {
+            return Err(verification("plain-text body or truncation"));
         }
         for (key, expected) in [
             ("ToRecipients", &input.to),
             ("CcRecipients", &input.cc),
             ("BccRecipients", &input.bcc),
         ] {
-            let actual = draft[key]
-                .as_array()
-                .ok_or(OutlookWebError::VerificationFailed)?;
+            // OWA suppresses empty recipient collections, but null/invalid values are not empty.
+            let actual = match draft.get(key) {
+                None if expected.is_empty() => &[][..],
+                Some(Value::Array(values)) => values.as_slice(),
+                _ => return Err(verification(key)),
+            };
             if actual.len() != expected.len()
                 || actual
                     .iter()
                     .zip(expected)
                     .any(|(a, b)| a["EmailAddress"].as_str() != Some(b.as_str()))
             {
-                return Err(OutlookWebError::VerificationFailed);
+                return Err(verification(key));
             }
         }
         let actual = draft["Attachments"]
             .as_array()
-            .ok_or(OutlookWebError::VerificationFailed)?;
+            .ok_or(verification("draft attachment collection"))?;
         if actual.len() != attachments.len() {
-            return Err(OutlookWebError::VerificationFailed);
+            return Err(verification("attachment count"));
         }
         for expected in attachments {
             let matches: Vec<_> = actual
@@ -225,12 +241,12 @@ impl OutlookWebSession {
                 .filter(|a| a["Name"] == expected.name)
                 .collect();
             if matches.len() != 1 {
-                return Err(OutlookWebError::VerificationFailed);
+                return Err(verification("attachment name/uniqueness"));
             }
             let attachment_id = matches[0]["AttachmentId"]["Id"]
                 .as_str()
                 .filter(|id| !id.trim().is_empty())
-                .ok_or(OutlookWebError::VerificationFailed)?;
+                .ok_or(verification("attachment ID"))?;
             let response = self.call("GetAttachment", &attachment_read_request(attachment_id))?;
             let returned = response
                 .pointer("/Body/ResponseMessages/Items")
@@ -238,20 +254,22 @@ impl OutlookWebSession {
                 .filter(|a| a.len() == 1)
                 .and_then(|a| a[0]["Attachments"].as_array())
                 .filter(|a| a.len() == 1)
-                .ok_or(OutlookWebError::VerificationFailed)?;
+                .ok_or(verification("attachment response shape"))?;
             let a = &returned[0];
             if a["__type"] != "FileAttachment:#Exchange"
                 || a["Name"] != expected.name
                 || a["AttachmentId"]["Id"] != attachment_id
-                || a["IsInline"] != false
-                || a["Content"] != STANDARD.encode(&expected.bytes)
+                || !omitted_false(a.get("IsInline"))
             {
-                return Err(OutlookWebError::VerificationFailed);
+                return Err(verification("attachment identity/type/inline state"));
+            }
+            if a["Content"] != STANDARD.encode(&expected.bytes) {
+                return Err(verification("attachment bytes"));
             }
         }
         let key = draft["ItemId"]["ChangeKey"]
             .as_str()
-            .ok_or(OutlookWebError::VerificationFailed)?;
+            .ok_or(verification("draft change key"))?;
         send_attachment_draft_request(id, key)
     }
 }
@@ -317,6 +335,101 @@ mod tests {
                 }]}}}),
             ),
         ]
+    }
+
+    #[test]
+    fn live_owa_shape_omits_empty_recipients_and_false_inline_without_losing_byte_verification() {
+        let mut responses = replies();
+        let draft = &mut responses[1].1["Body"]["ResponseMessages"]["Items"][0]["Items"][0];
+        draft.as_object_mut().unwrap().remove("CcRecipients");
+        draft.as_object_mut().unwrap().remove("BccRecipients");
+        draft["Body"]["IsTruncated"] = json!(false);
+        for index in [2, 3] {
+            let a =
+                &mut responses[index].1["Body"]["ResponseMessages"]["Items"][0]["Attachments"][0];
+            a.as_object_mut().unwrap().remove("IsInline");
+            a.as_object_mut().unwrap().remove("IsContactPhoto");
+            a["AttachmentOriginalUrl"] = json!("");
+        }
+        let (session, requests, worker) = mock(responses);
+        assert_eq!(
+            session
+                .send_mail_with_attachments(&input(), &files())
+                .unwrap()["attachment_bytes_verified"],
+            true
+        );
+        worker.join().unwrap();
+        let requests = requests.lock().unwrap();
+        for request in &requests[2..4] {
+            assert_eq!(request["__type"], "GetAttachmentJsonRequest:#Exchange");
+            assert!(request["Body"].get("AttachmentShape").is_none());
+            assert_eq!(request["Body"]["__type"], "GetAttachmentRequest:#Exchange");
+        }
+    }
+
+    #[test]
+    fn omitted_defaults_never_accept_null_malformed_nonempty_or_inline_values() {
+        for key in ["ToRecipients", "CcRecipients", "BccRecipients"] {
+            for value in [
+                Value::Null,
+                json!({}),
+                json!(""),
+                json!([{"EmailAddress":"unexpected@example.com"}]),
+            ] {
+                let mut responses = replies();
+                responses[1].1["Body"]["ResponseMessages"]["Items"][0]["Items"][0][key] = value;
+                responses.truncate(2);
+                let (session, _, worker) = mock(responses);
+                let error = session
+                    .send_mail_with_attachments(&input(), &files())
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(key), "{error}");
+                worker.join().unwrap();
+            }
+        }
+        for value in [Value::Null, json!(true), json!("false"), json!(0)] {
+            let mut responses = replies();
+            responses[2].1["Body"]["ResponseMessages"]["Items"][0]["Attachments"][0]["IsInline"] =
+                value;
+            responses.truncate(3);
+            let (session, _, worker) = mock(responses);
+            let error = session
+                .send_mail_with_attachments(&input(), &files())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("inline state"), "{error}");
+            worker.join().unwrap();
+        }
+        let mut responses = replies();
+        let a = &mut responses[2].1["Body"]["ResponseMessages"]["Items"][0]["Attachments"][0];
+        a.as_object_mut().unwrap().remove("IsInline");
+        a["Content"] = json!("Y2hhbmdlZA==");
+        responses.truncate(3);
+        let (session, _, worker) = mock(responses);
+        let error = session
+            .send_mail_with_attachments(&input(), &files())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("attachment bytes"), "{error}");
+        worker.join().unwrap();
+        let mut expected = input();
+        expected.cc.push("cc@example.com".into());
+        let mut responses = replies();
+        responses[1].1["Body"]["ResponseMessages"]["Items"][0]["Items"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("CcRecipients");
+        responses.truncate(2);
+        let (session, _, worker) = mock(responses);
+        assert!(
+            session
+                .send_mail_with_attachments(&expected, &files())
+                .unwrap_err()
+                .to_string()
+                .contains("CcRecipients")
+        );
+        worker.join().unwrap();
     }
 
     #[test]

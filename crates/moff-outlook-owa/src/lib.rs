@@ -31,6 +31,9 @@ const EXCHANGE_HEADER: &str = "JsonRequestHeaders:#Exchange";
 
 #[derive(Debug)]
 pub enum OutlookWebError {
+    AttachmentVerificationFailed {
+        field: &'static str,
+    },
     AttachmentSendFailed {
         draft_id: String,
         stage: &'static str,
@@ -101,6 +104,9 @@ pub enum ServiceCode {
 impl fmt::Display for OutlookWebError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::AttachmentVerificationFailed { field } => {
+                return write!(f, "attachment draft read-back mismatch: {field}; send was not attempted");
+            }
             Self::AttachmentSendFailed { draft_id, stage, source } => {
                 return write!(f, "attachment email stopped at {stage}; draft ID {draft_id}; {source}. No automatic retry or cleanup; inspect Drafts, Outbox and Sent Items before taking further action");
             }
