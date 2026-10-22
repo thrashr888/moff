@@ -109,7 +109,7 @@ impl fmt::Display for OutlookWebError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::SendOutcomeUnknown { reason, http_status } => {
-                return write!(f, "the outcome of SendItem is unknown (reason: {reason}; HTTP status: {http_status:?}); no completion is established; inspect Drafts, Outbox and Sent Items; do not retry automatically");
+                return write!(f, "the outcome of mail submission is unknown (reason: {reason}; HTTP status: {http_status:?}); no completion is established; inspect Drafts, Outbox and Sent Items; do not retry automatically");
             }
             Self::AttachmentVerificationFailed { field } => {
                 return write!(f, "attachment draft read-back mismatch: {field}; send was not attempted");

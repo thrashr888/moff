@@ -9,24 +9,51 @@ async function(config, acquireToken, readResponse) {
         && (!config.recovery_marker || sessionStorage.getItem("__moff_auth_recovery") !== config.recovery_marker)) {
         return {status: 409};
     }
-    const writes = ["CreateItem", "SendItem", "UpdateItem", "UpdateCalendarEvent", "DeleteItem", "MoveItem"];
+    const writes = ["CreateItem", "UpdateItem", "UpdateCalendarEvent", "DeleteItem", "MoveItem"];
     const onlyKeys = (value, keys) => value && typeof value === "object"
         && !Array.isArray(value) && Object.keys(value).every(key => keys.includes(key));
     if (config.mutation === true) {
         if (config.allow_mutation !== true || !writes.includes(config.action)) throw new Error("Unsupported write action");
         const body = config.body?.Body;
         if (!body || body.__type !== config.action + "Request:#Exchange") throw new Error("Invalid write envelope");
-        if (config.action === "SendItem") {
-            const id = body.ItemIds?.[0], folder = body.SavedItemFolderId;
-            if (!onlyKeys(body, ["__type", "SaveItemToFolder", "ItemIds", "SavedItemFolderId"])
-                || body.SaveItemToFolder !== true || !Array.isArray(body.ItemIds) || body.ItemIds.length !== 1
+        const updateSend = config.action === "UpdateItem" && body.MessageDisposition === "SendAndSaveCopy";
+        let sendMessage;
+        if (updateSend) {
+            const change = body.ItemChanges?.[0], id = change?.ItemId, shape = body.ItemShape;
+            const fields = ["ToRecipients", "CcRecipients", "BccRecipients", "Subject", "Body"];
+            if (config.body.__type !== "UpdateItemJsonRequest:#Exchange"
+                || !onlyKeys(body, ["__type", "MessageDisposition", "ConflictResolution", "ClientSupportsIrm",
+                    "SendCalendarInvitationsOrCancellations", "SuppressReadReceipts", "ComposeOperation",
+                    "PromoteInlineAttachments", "SendOnNotFoundError", "ItemShape", "ItemChanges"])
+                || body.ConflictResolution !== "NeverOverwrite" || body.ClientSupportsIrm !== true
+                || body.SendCalendarInvitationsOrCancellations !== "SendToNone" || body.SuppressReadReceipts !== false
+                || body.ComposeOperation !== "newMail" || body.PromoteInlineAttachments !== false
+                || body.SendOnNotFoundError !== false
+                || !onlyKeys(shape, ["__type", "BaseShape", "AdditionalProperties"])
+                || shape.__type !== "ItemResponseShape:#Exchange" || shape.BaseShape !== "IdOnly"
+                || !Array.isArray(shape.AdditionalProperties) || shape.AdditionalProperties.length !== 1
+                || !onlyKeys(shape.AdditionalProperties[0], ["__type", "FieldURI"])
+                || shape.AdditionalProperties[0].__type !== "PropertyUri:#Exchange"
+                || shape.AdditionalProperties[0].FieldURI !== "ItemLastModifiedTime"
+                || !Array.isArray(body.ItemChanges) || body.ItemChanges.length !== 1
+                || !onlyKeys(change, ["__type", "ItemId", "Updates"]) || change.__type !== "ItemChange:#Exchange"
                 || !onlyKeys(id, ["__type", "Id", "ChangeKey"]) || id.__type !== "ItemId:#Exchange"
                 || typeof id.Id !== "string" || !id.Id.trim()
                 || typeof id.ChangeKey !== "string" || !id.ChangeKey.trim()
-                || !onlyKeys(folder, ["__type", "BaseFolderId"]) || folder.__type !== "TargetFolderId:#Exchange"
-                || !onlyKeys(folder.BaseFolderId, ["__type", "Id"])
-                || folder.BaseFolderId.__type !== "DistinguishedFolderId:#Exchange" || folder.BaseFolderId.Id !== "sentitems") {
-                throw new Error("Only one versioned attachment draft send saving to Sent Items is allowed");
+                || !Array.isArray(change.Updates) || change.Updates.length !== fields.length) {
+                throw new Error("Only one versioned verified draft submission is allowed");
+            }
+            sendMessage = {__type:"Message:#Exchange"};
+            for (const update of change.Updates) {
+                const field = update.Path?.FieldURI;
+                if (!fields.includes(field) || Object.hasOwn(sendMessage, field)
+                    || !onlyKeys(update, ["__type", "Path", "Item"]) || update.__type !== "SetItemField:#Exchange"
+                    || !onlyKeys(update.Path, ["__type", "FieldURI"]) || update.Path.__type !== "PropertyUri:#Exchange"
+                    || !onlyKeys(update.Item, ["__type", field]) || update.Item.__type !== "Message:#Exchange"
+                    || !Object.hasOwn(update.Item, field)) {
+                    throw new Error("Only exact recipient/content fields may be submitted");
+                }
+                sendMessage[field] = update.Item[field];
             }
         }
         if (config.action === "MoveItem") {
@@ -38,7 +65,10 @@ async function(config, acquireToken, readResponse) {
                 throw new Error("Only a single versioned move to an explicit folder is allowed");
             }
         }
-        if (config.action === "CreateItem") {
+        if (config.action === "CreateItem" || updateSend) {
+            const body = updateSend
+                ? {MessageDisposition:"SendAndSaveCopy",Items:[sendMessage]}
+                : config.body.Body;
             if (!Array.isArray(body.Items) || body.Items.length !== 1) throw new Error("Invalid item count");
             const item = body.Items[0];
             if (item.__type === "CalendarItem:#Exchange") {
@@ -125,7 +155,7 @@ async function(config, acquireToken, readResponse) {
             if (item.__type === "Contact:#Exchange" && body.SavedItemFolderId?.BaseFolderId?.Id !== "contacts")
                 throw new Error("Contacts must be created in the personal contacts folder");
         }
-        if (config.action === "UpdateItem" && body.MessageDisposition !== "SaveOnly") throw new Error("Sending is prohibited");
+        if (config.action === "UpdateItem" && !updateSend && body.MessageDisposition !== "SaveOnly") throw new Error("Sending is prohibited");
         if (config.action === "UpdateCalendarEvent") {
             if (body.ShouldSendUpdateToAttendees === true) {
                 const itemId = body.ItemChange?.ItemId;

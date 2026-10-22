@@ -728,7 +728,13 @@ impl SafariSession {
                 OutlookWebError::TruncatedSearch
             });
         }
-        decode_call_result(action, &result.value, mutation)
+        let diagnostic_action =
+            if action == "UpdateItem" && body["Body"]["MessageDisposition"] == "SendAndSaveCopy" {
+                "UpdateItem mail submission"
+            } else {
+                action
+            };
+        decode_call_result(diagnostic_action, &result.value, mutation)
     }
 }
 
@@ -737,7 +743,7 @@ fn uncertain_write(
     reason: &'static str,
     http_status: Option<u16>,
 ) -> OutlookWebError {
-    if action == "SendItem" {
+    if matches!(action, "SendItem" | "UpdateItem mail submission") {
         OutlookWebError::SendOutcomeUnknown {
             reason,
             http_status,

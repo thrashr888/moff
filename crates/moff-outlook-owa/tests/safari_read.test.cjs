@@ -63,12 +63,21 @@ function attachmentDraftConfig(contents = Buffer.from([0,255,1,128])) {
 }
 
 function attachmentSendConfig() {
-    return {action:"SendItem",mutation:true,allow_mutation:true,body:{
-        __type:"SendItemJsonRequest:#Exchange",Body:{
-            __type:"SendItemRequest:#Exchange",SaveItemToFolder:true,
-            ItemIds:[{__type:"ItemId:#Exchange",Id:"draft",ChangeKey:"verified-key"}],
-            SavedItemFolderId:{__type:"TargetFolderId:#Exchange",
-                BaseFolderId:{__type:"DistinguishedFolderId:#Exchange",Id:"sentitems"}}
+    const message = sendConfig().body.Body.Items[0];
+    return {action:"UpdateItem",mutation:true,allow_mutation:true,body:{
+        __type:"UpdateItemJsonRequest:#Exchange",Body:{
+            __type:"UpdateItemRequest:#Exchange",MessageDisposition:"SendAndSaveCopy",
+            ConflictResolution:"NeverOverwrite",ClientSupportsIrm:true,
+            SendCalendarInvitationsOrCancellations:"SendToNone",SuppressReadReceipts:false,
+            ComposeOperation:"newMail",PromoteInlineAttachments:false,SendOnNotFoundError:false,
+            ItemShape:{__type:"ItemResponseShape:#Exchange",BaseShape:"IdOnly",
+                AdditionalProperties:[{__type:"PropertyUri:#Exchange",FieldURI:"ItemLastModifiedTime"}]},
+            ItemChanges:[{__type:"ItemChange:#Exchange",
+                ItemId:{__type:"ItemId:#Exchange",Id:"draft",ChangeKey:"verified-key"},
+                Updates:["ToRecipients","CcRecipients","BccRecipients","Subject","Body"].map(field => ({
+                    __type:"SetItemField:#Exchange",Path:{__type:"PropertyUri:#Exchange",FieldURI:field},
+                    Item:{__type:"Message:#Exchange",[field]:message[field]}
+                }))}]
         }
     }};
 }
@@ -83,7 +92,7 @@ test("attachment draft transport preserves binary bytes at exact combined limit 
         assert.equal(Buffer.from(sent.Body.Items[0].Attachments[0].Content,"base64").length,500000);
         assert.equal((await f.call(attachmentSendConfig())).status,200);
         assert.equal(f.requests.length,2);
-        assert.equal(f.requests[1].url,"/owa/service.svc?action=SendItem&app=Mail");
+        assert.equal(f.requests[1].url,"/owa/service.svc?action=UpdateItem&app=Mail");
         assert.deepEqual(JSON.parse(f.requests[1].init.body),attachmentSendConfig().body);
         const empty = attachmentDraftConfig(Buffer.alloc(0));
         assert.equal((await f.call(empty)).status,200);
@@ -130,19 +139,26 @@ test("browser independently rejects unsafe attachment payloads before authentica
     }
 });
 
-test("SendItem browser gate forbids unversioned bulk alternate-folder or custom sends", async () => {
+test("OWA UpdateItem submission gate forbids unsafe versioning recreation fields and content", async () => {
     for (const change of [
         c => {c.mutation=false;},
         c => {c.allow_mutation=false;},
-        c => {c.body.Body.SaveItemToFolder=false;},
-        c => {c.body.Body.ItemIds=[];},
-        c => {c.body.Body.ItemIds.push(c.body.Body.ItemIds[0]);},
-        c => {delete c.body.Body.ItemIds[0].ChangeKey;},
-        c => {c.body.Body.ItemIds[0].Id="";},
-        c => {c.body.Body.ItemIds[0].ChangeKey="";},
-        c => {c.body.Body.ItemIds[0].__type="Other";},
-        c => {c.body.Body.SavedItemFolderId.BaseFolderId.Id="drafts";},
-        c => {c.body.Body.SavedItemFolderId.BaseFolderId.Other="value";},
+        c => {c.body.Body.SendOnNotFoundError=true;},
+        c => {c.body.Body.ConflictResolution="AlwaysOverwrite";},
+        c => {c.body.Body.ItemChanges=[];},
+        c => {c.body.Body.ItemChanges.push(c.body.Body.ItemChanges[0]);},
+        c => {delete c.body.Body.ItemChanges[0].ItemId.ChangeKey;},
+        c => {c.body.Body.ItemChanges[0].ItemId.Id="";},
+        c => {c.body.Body.ItemChanges[0].ItemId.ChangeKey="";},
+        c => {c.body.Body.ItemChanges[0].ItemId.__type="Other";},
+        c => {c.body.Body.ItemChanges[0].Updates.pop();},
+        c => {c.body.Body.ItemChanges[0].Updates[0].Path.FieldURI="From";},
+        c => {c.body.Body.ItemChanges[0].Updates[0].Item.ToRecipients=[];},
+        c => {c.body.Body.ItemChanges[0].Updates[4].Item.Body.BodyType="HTML";},
+        c => {c.body.Body.ItemChanges[0].Updates[3].Item.Subject="";},
+        c => {c.body.Body.ItemChanges[0].Updates[1]=c.body.Body.ItemChanges[0].Updates[0];},
+        c => {c.body.Body.ItemShape.AdditionalProperties[0].FieldURI="Body";},
+        c => {c.body.Body.SavedItemFolderId={};},
         c => {c.body.Body.From="spoof@example.com";},
         c => {c.body.Body.Items=[{}];},
     ]) {

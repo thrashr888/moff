@@ -442,8 +442,9 @@ automatically. There is no idempotency key or automatic retry.
 Custom From/Sender, HTML, arbitrary existing-draft sending and threaded reply
 sending are unsupported and rejected. `create`/`reply-draft` still only save
 drafts. File sharing notifications are not attachment email. This send path
-is contract-tested with synthetic responses, **not live-send validated**; no live
-message was authorized or sent during implementation. OWA is a private adapter,
+is contract-tested with synthetic responses, **not live-send validated**. Authorized
+attempts exposed private OWA contract differences; none established submission.
+OWA is a private adapter,
 so personal/work account or service-contract drift may require an update.
 The submission/empty-item acknowledgement follows Microsoft's
 [CreateItem email contract](https://learn.microsoft.com/en-us/exchange/client-developer/web-service-reference/createitem-operation-email-message);
@@ -470,8 +471,14 @@ in **one `CreateItem SaveOnly` draft request**, following the
 Moff reads the draft and verifies its exact recipients, subject, plain-text body,
 attachment names/count, then reads each attachment with `GetAttachment` and
 compares its ID, name, non-inline flag and exact base64 bytes. Only after all
-checks pass does a versioned `SendItem` with `SaveItemToFolder:true` submit that
-new draft to Sent Items.
+checks pass does a versioned `UpdateItem` with `MessageDisposition:SendAndSaveCopy`
+submit that draft. Read-only inspection of the loaded Outlook compose code
+(request builder module 549318, type wrapper 950922 and service wrapper 808801)
+established this private OWA route; the EWS `SendItem` route returned HTTP 500.
+The submit request sets only the already verified recipients/subject/plain-text
+body, leaving verified attachments untouched. Unlike the page's overwrite and
+recreate defaults, Moff uses `NeverOverwrite` and `SendOnNotFoundError:false`:
+a changed or missing draft must fail rather than overwrite or create a duplicate.
 OWA suppresses default-valued properties: an omitted Cc/Bcc collection is accepted
 only when the approved collection is empty, and omitted `IsInline` means false.
 Explicit null, malformed values, unexpected recipients and true inline flags
@@ -501,7 +508,7 @@ before submission, **not delivery or the final Sent Items copy**.
 The corrected complete verifier has also been exercised read-only against an
 existing failed draft, including exact local/remote attachment bytes; no new
 draft, send or cleanup was performed. This confirms read-back compatibility,
-not live `SendItem` acceptance or delivery.
+not live submit acceptance or delivery.
 If sending itself fails, diagnostics retain a safe reason (network/timeout,
 HTTP status, invalid JSON or acknowledgement shape) without returning raw server
 content or credentials. Explicit HTTP/service rejection is labeled separately

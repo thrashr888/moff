@@ -428,7 +428,7 @@ fn envelope(kind: &str, body: Value) -> Value {
 fn item_id(id: &str) -> Value {
     json!({"__type":"ItemId:#Exchange","Id":id})
 }
-fn change(field: &str, value: Value, item_type: &str) -> Value {
+pub(crate) fn change(field: &str, value: Value, item_type: &str) -> Value {
     let mut item = json!({"__type":item_type});
     item[field] = value;
     let mut update = json!({"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":field}});
@@ -727,7 +727,7 @@ pub(crate) fn send_acknowledgement(
 ) -> Result<Value, OutlookWebError> {
     // SendAndSaveCopy need not return an item ID. Never invent delivery/read-back evidence.
     let unknown = |reason| {
-        if action == "SendItem" {
+        if matches!(action, "SendItem" | "UpdateItem") {
             OutlookWebError::SendOutcomeUnknown {
                 reason,
                 http_status: None,

@@ -136,18 +136,38 @@ fn omitted_false(value: Option<&Value>) -> bool {
     matches!(value, None | Some(Value::Bool(false)))
 }
 
-pub fn send_attachment_draft_request(id: &str, key: &str) -> Result<Value, OutlookWebError> {
+pub fn send_attachment_draft_request(
+    id: &str,
+    key: &str,
+    input: &SendMailInput,
+) -> Result<Value, OutlookWebError> {
     if id.trim().is_empty() || key.trim().is_empty() {
         return Err(OutlookWebError::InvalidInput(
             "sending attachment draft requires its ID and change key",
         ));
     }
+    let message = crate::operations::send_mail_request(input)?["Body"]["Items"][0].clone();
+    let updates: Vec<_> = [
+        "ToRecipients",
+        "CcRecipients",
+        "BccRecipients",
+        "Subject",
+        "Body",
+    ]
+    .iter()
+    .map(|field| crate::operations::change(field, message[field].clone(), "Message:#Exchange"))
+    .collect();
+    // OWA's loaded compose transport submits existing drafts with UpdateItem, not EWS SendItem.
     Ok(
-        json!({"__type":"SendItemJsonRequest:#Exchange","Header":header(),
-        "Body":{"__type":"SendItemRequest:#Exchange","SaveItemToFolder":true,
-            "ItemIds":[{"__type":"ItemId:#Exchange","Id":id,"ChangeKey":key}],
-            "SavedItemFolderId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":{
-                "__type":"DistinguishedFolderId:#Exchange","Id":"sentitems"}}}}),
+        json!({"__type":"UpdateItemJsonRequest:#Exchange","Header":header(),
+        "Body":{"__type":"UpdateItemRequest:#Exchange","MessageDisposition":"SendAndSaveCopy",
+            "ConflictResolution":"NeverOverwrite","ClientSupportsIrm":true,
+            "SendCalendarInvitationsOrCancellations":"SendToNone","SuppressReadReceipts":false,
+            "ComposeOperation":"newMail","PromoteInlineAttachments":false,"SendOnNotFoundError":false,
+            "ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"IdOnly",
+                "AdditionalProperties":[{"__type":"PropertyUri:#Exchange","FieldURI":"ItemLastModifiedTime"}]},
+            "ItemChanges":[{"__type":"ItemChange:#Exchange",
+                "ItemId":{"__type":"ItemId:#Exchange","Id":id,"ChangeKey":key},"Updates":updates}]}}),
     )
 }
 
@@ -192,8 +212,8 @@ impl OutlookWebSession {
             .verify_attachment_draft(id, input, attachments)
             .map_err(|error| partial("verification; send not attempted", error))?;
         let result = self
-            .execute("SendItem", &verified, true)
-            .and_then(|result| crate::operations::send_acknowledgement(&result, "SendItem"))
+            .execute("UpdateItem", &verified, true)
+            .and_then(|result| crate::operations::send_acknowledgement(&result, "UpdateItem"))
             .map_err(|error| {
                 let stage = match &error {
                     OutlookWebError::RequestRejected(_)
@@ -302,7 +322,7 @@ impl OutlookWebSession {
         let key = draft["ItemId"]["ChangeKey"]
             .as_str()
             .ok_or(verification("draft change key"))?;
-        send_attachment_draft_request(id, key)
+        send_attachment_draft_request(id, key, input)
     }
 }
 #[cfg(test)]
@@ -361,7 +381,7 @@ mod tests {
                 }]}}}),
             ),
             (
-                "SendItem",
+                "UpdateItem",
                 json!({"Body":{"ResponseMessages":{"Items":[{
                     "ResponseCode":"NoError","ResponseClass":"Success","Items":[]
                 }]}}}),
@@ -483,15 +503,23 @@ mod tests {
             STANDARD.encode((0..=255).collect::<Vec<u8>>())
         );
         assert_eq!(
-            requests[4]["Body"]["ItemIds"][0],
+            requests[4]["Body"]["ItemChanges"][0]["ItemId"],
             json!({
                 "__type":"ItemId:#Exchange","Id":"draft","ChangeKey":"verified-key"
             })
         );
-        assert_eq!(requests[4]["Body"]["SaveItemToFolder"], true);
-        assert_eq!(
-            requests[4]["Body"]["SavedItemFolderId"]["BaseFolderId"]["Id"],
-            "sentitems"
+        assert_eq!(requests[4]["__type"], "UpdateItemJsonRequest:#Exchange");
+        assert_eq!(requests[4]["Body"]["MessageDisposition"], "SendAndSaveCopy");
+        assert_eq!(requests[4]["Body"]["ConflictResolution"], "NeverOverwrite");
+        assert_eq!(requests[4]["Body"]["SendOnNotFoundError"], false);
+        let updates = requests[4]["Body"]["ItemChanges"][0]["Updates"]
+            .as_array()
+            .unwrap();
+        assert_eq!(updates.len(), 5);
+        assert!(
+            updates
+                .iter()
+                .all(|u| u["Item"].get("Attachments").is_none())
         );
     }
 
