@@ -41,7 +41,7 @@ test("product metadata uses a Graph token only inside the page", async () => {
 
 test("SharePoint library discovery and scoped drive search are read-only", async () => {
     for (const path of [
-        "/sites/ibm.sharepoint.com:/sites/PROJ-Meridian",
+        "/sites/example.sharepoint.com:/sites/PROJ-Example",
         "/sites/site-id/drives?$top=100",
         "/drives/drive-id/root/search(q='pipeline')?$top=10",
     ]) {

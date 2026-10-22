@@ -2320,7 +2320,7 @@ mod management_tests {
 
     #[test]
     fn library_search_uses_the_resolved_drive_and_preserves_scope_and_paging() {
-        let library = "https://ibm.sharepoint.com/sites/PROJ-Meridian/Shared%20Documents";
+        let library = "https://example.sharepoint.com/sites/PROJ-Example/Shared%20Documents";
         let mut paths = Vec::new();
         let result = library_search_with(library, "pipeline", 1, |path| {
             paths.push(path.to_owned());
@@ -2333,7 +2333,7 @@ mod management_tests {
         }).unwrap();
         assert_eq!(
             paths[0],
-            "/v1.0/sites/ibm.sharepoint.com:/sites/PROJ-Meridian"
+            "/v1.0/sites/example.sharepoint.com:/sites/PROJ-Example"
         );
         assert_eq!(paths[1], "/v1.0/sites/site-id/drives?$top=100");
         assert_eq!(
@@ -2348,7 +2348,7 @@ mod management_tests {
 
     #[test]
     fn library_search_never_falls_back_when_library_resolution_fails() {
-        let library = "https://ibm.sharepoint.com/sites/PROJ-Meridian/Shared%20Documents";
+        let library = "https://example.sharepoint.com/sites/PROJ-Example/Shared%20Documents";
         for drives in [
             json!([]),
             json!([{"id":"a","webUrl":library},{"id":"b","webUrl":library}]),

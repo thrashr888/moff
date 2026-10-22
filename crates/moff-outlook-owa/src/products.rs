@@ -672,20 +672,20 @@ mod tests {
     #[test]
     fn sharepoint_library_links_resolve_to_the_named_site_not_personal_onedrive() {
         let expected = (
-            "/v1.0/sites/ibm.sharepoint.com:/sites/PROJ-Meridian".to_owned(),
-            "https://ibm.sharepoint.com/sites/PROJ-Meridian/Shared%20Documents".to_owned(),
+            "/v1.0/sites/example.sharepoint.com:/sites/PROJ-Example".to_owned(),
+            "https://example.sharepoint.com/sites/PROJ-Example/Shared%20Documents".to_owned(),
         );
         assert_eq!(sharepoint_library_location(&expected.1).unwrap(), expected);
-        assert_eq!(sharepoint_library_location("https://ibm-my.sharepoint.com/shared?id=%2Fsites%2FPROJ%2DMeridian%2FShared%20Documents&listurl=https%3A%2F%2Fibm%2Esharepoint%2Ecom%2Fsites%2FPROJ%2DMeridian%2FShared%20Documents").unwrap().0,
-            "/v1.0/sites/ibm.sharepoint.com:/sites/PROJ-Meridian");
+        assert_eq!(sharepoint_library_location("https://example-my.sharepoint.com/shared?id=%2Fsites%2FPROJ%2DExample%2FShared%20Documents&listurl=https%3A%2F%2Fexample%2Esharepoint%2Ecom%2Fsites%2FPROJ%2DExample%2FShared%20Documents").unwrap().0,
+            "/v1.0/sites/example.sharepoint.com:/sites/PROJ-Example");
         for input in [
-            "http://ibm.sharepoint.com/sites/Project/Documents",
+            "http://example.sharepoint.com/sites/Project/Documents",
             "https://evil.example/sites/Project/Documents",
-            "https://user@ibm.sharepoint.com/sites/Project/Documents",
-            "https://ibm-my.sharepoint.com/shared?listurl=https://other.sharepoint.com/sites/P/Docs",
-            "https://ibm.sharepoint.com/sites/P/Docs/file.pdf",
-            "https://ibm.sharepoint.com/sites/P/Docs?anything=yes",
-            "https://ibm-my.sharepoint.com/shared",
+            "https://user@example.sharepoint.com/sites/Project/Documents",
+            "https://example-my.sharepoint.com/shared?listurl=https://other.sharepoint.com/sites/P/Docs",
+            "https://example.sharepoint.com/sites/P/Docs/file.pdf",
+            "https://example.sharepoint.com/sites/P/Docs?anything=yes",
+            "https://example-my.sharepoint.com/shared",
         ] {
             assert!(sharepoint_library_location(input).is_err(), "{input}");
         }
@@ -695,7 +695,7 @@ mod tests {
     fn only_bounded_product_metadata_routes_are_allowed() {
         for path in [
             "/v1.0/me/people?$top=5",
-            "/v1.0/sites/ibm.sharepoint.com:/sites/PROJ-Meridian",
+            "/v1.0/sites/example.sharepoint.com:/sites/PROJ-Example",
             "/v1.0/sites/site-id/drives?$top=100",
             "/v1.0/drives/drive-id/root/search(q='comparison')?$top=20",
             "/v1.0/me/contacts?$top=5&$skip=5",
