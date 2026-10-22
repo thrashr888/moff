@@ -39,6 +39,22 @@ test("product metadata uses a Graph token only inside the page", async () => {
     assert.ok(!JSON.stringify(result).includes("test-secret"));
 });
 
+test("SharePoint library discovery and scoped drive search are read-only", async () => {
+    for (const path of [
+        "/sites/example.sharepoint.com:/sites/PROJ-Example",
+        "/sites/site-id/drives?$top=100",
+        "/drives/drive-id/root/search(q='pipeline')?$top=10",
+    ]) {
+        const f = fixture();
+        await f.call("https://graph.microsoft.com/v1.0"+path);
+        assert.equal(f.requests[0].init.method,"GET");
+        const invalid = fixture();
+        await assert.rejects(invalid.call("https://graph.microsoft.com/v1.0"+path,
+            {method:"POST",body:{},allow_mutation:true}));
+        assert.equal(invalid.requests.length,0);
+    }
+});
+
 test("typed contact, folder and group writes stay in-page and handle bodyless success", async () => {
     for (const [suffix, method, body, etag] of [
         ["/me/contacts","POST",{givenName:"Synthetic"}],
@@ -86,6 +102,48 @@ test("preauthenticated download URLs never leave the browser response", async ()
     const result = await f.call("https://graph.microsoft.com/v1.0/me/drive/root/children");
     assert.ok(!result.body.includes("downloadUrl"));
     assert.ok(!result.body.includes("secret"));
+});
+
+test("named file sharing has an explicit gate and never creates broad links", async () => {
+    const body = {recipients:[{email:"sarah@example.com"}],roles:["read"],
+        requireSignIn:true,sendInvitation:true,retainInheritedPermissions:true};
+    for (const base of ["/me/drive/items/file","/drives/drive/items/file"]) {
+        const f = fixture({body:JSON.stringify({value:[{id:"p1",roles:["read"]}]})});
+        await f.call("https://graph.microsoft.com/v1.0"+base+"/invite",
+            {method:"POST",body,allow_mutation:true});
+        assert.equal(f.requests.length,1);
+        assert.deepEqual(JSON.parse(f.requests[0].init.body),body);
+        for (const suffix of ["", "/permissions", "/permissions/p1"]) {
+            const read = fixture();
+            await read.call("https://graph.microsoft.com/v1.0"+base+suffix);
+            assert.equal(read.requests[0].init.method,"GET");
+        }
+        for (const config of [
+            {method:"POST",body},
+            {method:"GET"},
+            {method:"DELETE",allow_mutation:true},
+            ...[
+                {...body,roles:["write"]},
+                {...body,requireSignIn:false},
+                {...body,retainInheritedPermissions:false},
+                {...body,sendInvitation:"yes"},
+                {...body,recipients:[{email:"a@example.com"},{email:"b@example.com"}]},
+                {...body,recipients:[{email:"Sarah <sarah@example.com>"}]},
+                {...body,recipients:[{email:"sarah@example.com\n"}]},
+                {...body,recipients:[{objectId:"user"}]},
+                {...body,scope:"anonymous"},
+            ].map(body=>({method:"POST",body,allow_mutation:true})),
+        ]) {
+            const invalid = fixture();
+            await assert.rejects(invalid.call("https://graph.microsoft.com/v1.0"+base+"/invite",config));
+            assert.equal(invalid.requests.length,0);
+            assert.equal(invalid.resources.length,0);
+        }
+    }
+    const denied = fixture({status:403});
+    assert.equal((await denied.call("https://graph.microsoft.com/v1.0/me/drive/items/file/invite",
+        {method:"POST",body,allow_mutation:true})).status,403);
+    assert.equal(denied.requests.length,1);
 });
 
 test("single-shot transfers are refused in favor of the streamed adapter", async () => {

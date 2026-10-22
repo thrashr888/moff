@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Cipher, Gloom Stalker Ranger</title>
+  <desc id="desc">An obsidian shadow panther in a midnight-blue ranger cloak, with amber eyes and spectral markings.</desc>
+  <defs>
+    <radialGradient id="night"><stop stop-color="#34346B"/><stop offset="1" stop-color="#10102D"/></radialGradient>
+    <linearGradient id="cloak" x2="1" y2="1"><stop stop-color="#333366"/><stop offset="1" stop-color="#191970"/></linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#night)"/>
+  <circle cx="256" cy="234" r="178" fill="none" stroke="#7777A8" stroke-width="2" opacity=".4"/>
+  <path d="M76 474Q88 344 156 306L356 306Q424 344 436 474Z" fill="url(#cloak)" stroke="#656593" stroke-width="5"/>
+  <path d="M129 195 118 78Q168 79 207 126L305 126Q344 79 394 78L383 195Q403 293 330 345L256 379 182 345Q109 293 129 195Z" fill="#12141F" stroke="#8585B0" stroke-width="5"/>
+  <path d="M138 106 150 176 181 143ZM374 106 362 176 331 143Z" fill="#44415E"/>
+  <path d="M140 202 213 211 232 235 164 232Z" fill="#E9AD46"/>
+  <path d="M372 202 299 211 280 235 348 232Z" fill="#E9AD46"/>
+  <g fill="#171521"><ellipse cx="196" cy="219" rx="5" ry="18"/><ellipse cx="316" cy="219" rx="5" ry="18"/></g>
+  <path d="M197 277Q256 252 315 277L300 326 256 348 212 326Z" fill="#252736"/>
+  <path d="M235 279H277L256 299Z" fill="#696477"/>
+  <path d="M256 299V316M226 321 256 316 286 321" fill="none" stroke="#9C98AD" stroke-width="4" stroke-linecap="round"/>
+  <g fill="none" stroke="#8D8DC7" stroke-width="4" stroke-linecap="round" opacity=".75">
+    <path d="M241 148 256 176 271 148M256 128V144M158 255 180 266M354 255 332 266M158 280 180 286M354 280 332 286"/>
+    <path d="M112 430Q144 392 169 374M400 430Q368 392 343 374"/>
+  </g>
+  <path d="M198 388 256 415 314 388M256 415V474" fill="none" stroke="#7777A8" stroke-width="5"/>
+  <path d="M256 399 269 416 256 433 243 416Z" fill="#E9AD46"/>
+</svg>

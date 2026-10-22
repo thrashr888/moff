@@ -1,43 +1,211 @@
 <!doctype html>
 <html><head><meta charset="utf-8">
 <style>/*STYLE*/
-.head { margin-bottom: 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-.msg { display: grid; grid-template-columns: 8px 1fr auto; gap: 4px 10px; padding: 8px 0; border-bottom: 1px solid var(--line); }
-.msg:last-child { border-bottom: 0; }
-.unread { width: 8px; height: 8px; margin-top: 5px; border-radius: 50%; background: var(--accent); }
-.from { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.read .from { font-weight: 400; }
-.when { font-size: 12px; font-variant-numeric: tabular-nums; }
-.subject, .preview { grid-column: 2 / 4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.read .subject { color: var(--muted); }
-.tag { font-size: 11px; padding: 0 6px; border-radius: 8px; background: var(--card); margin-left: 6px; }
+.inbox-head { display:flex; flex-wrap:wrap; align-items:baseline; justify-content:space-between; gap:6px 16px; margin-bottom:12px; }
+.inbox-head h2 { font-size:18px; margin:0; }
+.scope, .when, .count, .actions, .notice { font-size:12px; }
+.thread { border-top:1px solid var(--line); padding:12px 0; }
+.thread:last-child { padding-bottom:0; }
+summary { cursor:pointer; display:grid; grid-template-columns:12px minmax(0,1fr) auto; gap:4px 10px; list-style:none; }
+summary::-webkit-details-marker { display:none; }
+.chevron { color:var(--muted); transition:transform .15s ease-out; }
+details[open] .chevron { transform:rotate(90deg); }
+.sender { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.subject, .preview { grid-column:2 / 4; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.preview, .when, .count { color:var(--muted); }
+.unread .subject { font-weight:600; }
+.unread .sender::before { content:""; display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--accent); margin-right:6px; }
+.actions { display:flex; flex-wrap:wrap; gap:6px; margin:9px 0 0 22px; }
+button { font:inherit; color:var(--fg); background:var(--card); border:1px solid var(--line); border-radius:5px; padding:5px 9px; min-height:30px; cursor:pointer; }
+button:hover:not(:disabled) { border-color:var(--muted); }
+button:disabled { cursor:not-allowed; opacity:.6; }
+button[aria-pressed="true"] { color:var(--accent); border-color:var(--accent); }
+button.icon-button { display:inline-flex; align-items:center; justify-content:center; width:32px; height:32px; padding:7px; }
+.icon-button svg { display:block; width:16px; height:16px; pointer-events:none; }
+button:focus-visible, summary:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+.thread-content { margin:12px 0 0 22px; }
+.message { padding:10px 0; border-top:1px solid var(--line); }
+.message-head { display:flex; flex-wrap:wrap; gap:6px 12px; align-items:baseline; }
+.body { white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; max-height:340px; overflow:auto; margin:8px 0; }
+.notice { margin:10px 0; white-space:pre-wrap; overflow-wrap:anywhere; }
+.archive-preview { margin-top:10px; padding:10px 0; border-top:1px solid var(--line); }
+.archive-preview ul { padding-left:20px; }
+.footer { margin-top:14px; display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; }
+@media (max-width:420px) { body { padding:12px; } .when { font-size:11px; } .actions { margin-left:0; } }
+@media (prefers-reduced-motion:reduce) { .chevron { transition:none; } }
 </style></head>
-<body><div id="app" class="muted">Loading mail…</div>
+<body><div id="app" class="muted">Loading inbox…</div>
 <script>/*BRIDGE*/</script>
 <script>
-const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
-function when(iso, locale) {
-  if (!iso) return "";
-  const d = new Date(iso), now = new Date();
-  if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString(locale, { hour: "numeric", minute: "2-digit" });
-  const days = (now - d) / 864e5;
-  return d.toLocaleDateString(locale, days < 6 ? { weekday: "short" } : { month: "short", day: "numeric" });
+const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+let data = null, host = {}, busy = false, notice = "", archivePlan = null, pagingStale = false, actionsStale = false;
+const expanded = new Set(), bodies = new Map();
+function groupMessages(messages) {
+  const groups = new Map(), ids = new Set();
+  for (const [index, m] of messages.entries()) {
+    if (m.id && ids.has(m.id)) continue;
+    if (m.id) ids.add(m.id);
+    const key = m.conversation_id ? `conversation:${m.conversation_id}` : `message:${m.id || index}`;
+    if (!groups.has(key)) groups.set(key, {key, messages:[]});
+    groups.get(key).messages.push(m);
+  }
+  for (const group of groups.values()) {
+    group.messages.sort((a,b) => (Date.parse(b.received) || 0) - (Date.parse(a.received) || 0));
+    group.latest = group.messages[0];
+  }
+  return [...groups.values()].sort((a,b) => (Date.parse(b.latest.received) || 0) - (Date.parse(a.latest.received) || 0));
 }
-function render(result, host) {
+function when(iso) {
+  const date = new Date(iso);
+  if (!iso || Number.isNaN(date.getTime())) return "Time unavailable";
+  return date.toLocaleString(host.locale, {month:"short", day:"numeric", hour:"numeric", minute:"2-digit"});
+}
+function sender(m) { return m.from?.name || m.from?.address || "Sender unavailable"; }
+const actionIcons = {
+  flag:'<path d="M4 21V3m0 1c5-4 11 4 16 0v11c-5 4-11-4-16 0"/>',
+  pin:'<path d="m16 3 5 5-4 1-3 3 1 4-2 2-7-7 2-2 4 1 3-3 1-4ZM9 15l-6 6"/>',
+  archive:'<rect x="3" y="3" width="18" height="4" rx="1"/><path d="M5 7v13h14V7M10 11h4"/>',
+};
+function button(action, key, label, disabled = false, pressed) {
+  const icon = actionIcons[action];
+  const content = icon ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${icon}</svg>` : esc(label);
+  return `<button type="button" data-action="${action}" data-key="${esc(key)}"${icon ? ` class="icon-button" title="${esc(label)}" aria-label="${esc(label)}"` : ""}${busy || disabled ? " disabled" : ""}${typeof pressed === "boolean" ? ` aria-pressed="${pressed}"` : ""}>${content}</button>`;
+}
+function bodyHtml(m) {
+  const loaded = bodies.get(m.id);
+  return loaded ? `<div class="body">${esc(loaded.body)}</div>${loaded.body_truncated ? '<div class="notice">Message body truncated.</div>' : ""}`
+    : `<div class="preview">${esc(m.preview || "No preview available.")}</div>`;
+}
+function draw() {
   const app = document.getElementById("app");
-  const out = result.structuredContent ?? {};
-  if (!out.ok) { app.innerHTML = `<span class="error">${esc(out.error?.message || "No mail")}</span>`; return; }
-  const messages = out.data?.messages || [];
-  const title = out.data?.query ? `“${esc(out.data.query)}” in ${esc(out.data.folder)}` : esc(out.data?.folder || "inbox");
-  if (!messages.length) { app.textContent = out.data?.query ? "No matching mail." : "Nothing here."; return; }
-  const unread = messages.filter((m) => !m.is_read).length;
-  let html = `<div class="head muted">${title}${unread ? ` · ${unread} unread` : ""}</div>`;
-  html += messages.map((m) => `<div class="msg ${m.is_read ? "read" : ""}">
-    <div>${m.is_read ? "" : `<div class="unread"></div>`}</div>
-    <div class="from">${esc(m.from?.name || m.from?.address || "(no sender)")}${m.importance === "High" ? `<span class="tag">!</span>` : ""}${m.has_attachments ? `<span class="tag">📎</span>` : ""}</div>
-    <div class="when muted">${esc(when(m.received, host.locale))}</div>
-    <div class="subject">${esc(m.subject || "(no subject)")}</div>
-    ${m.preview ? `<div class="preview muted">${esc(m.preview)}</div>` : ""}</div>`).join("");
-  app.className = ""; app.innerHTML = html;
+  const focus = document.activeElement;
+  const focusAction = focus?.dataset?.action, focusKey = focus?.dataset?.key;
+  const focusThread = focus?.closest?.("details[data-thread]")?.dataset.thread;
+  const groups = groupMessages(data.messages);
+  const scope = data.query
+    ? `Scanned ${data.scanned ?? 0} messages in this page.${data.has_more ? ` Search incomplete; continue at offset ${data.next_offset}.` : " Reached end of folder."}`
+    : `${data.messages.length} messages loaded${data.has_more ? "; more available" : ""}. Counts below cover loaded messages only.`;
+  let html = `<header class="inbox-head"><h2>${esc(data.query ? `Search: ${data.query}` : data.folder || "Inbox")}</h2><span class="scope muted">${groups.length} conversations</span></header><div class="scope muted">${esc(scope)}</div>`;
+  if (notice) html += `<div class="notice" role="status">${esc(notice)}</div>`;
+  if (!groups.length) html += `<p>${data.query ? "No matches in this page." : "No messages loaded."}</p>`;
+  for (const group of groups) {
+    const m = group.latest, key = group.key, canAct = data.mail_actions_enabled && !actionsStale && m.id && m.change_key && m.is_draft === false;
+    html += `<section class="thread"><details data-thread="${esc(key)}"${expanded.has(key) ? " open" : ""}>
+      <summary class="${group.messages.some(m => m.is_read === false) ? "unread" : ""}" aria-label="${esc(`${sender(m)}: ${m.subject || "No subject"}, ${group.messages.length} loaded messages`)}">
+        <span class="chevron" aria-hidden="true">›</span><span class="sender">${esc(sender(m))}</span><time class="when">${esc(when(m.received))}</time>
+        <span class="subject">${esc(m.subject || "(no subject)")}</span>
+        <span class="preview">${esc(m.preview || "No preview available.")} <span class="count">· ${group.messages.length} loaded${m.flagged ? " · Flagged" : ""}${m.pinned ? " · Pinned" : ""}</span></span>
+      </summary><div class="thread-content"><div class="scope muted">Latest loaded message first. Opening does not mark mail read.</div>
+      ${group.messages.map((item,index) => `<article class="message"><div class="message-head"><strong>${esc(sender(item))}</strong><span class="when">${esc(when(item.received))}</span>${index===0 ? '<span class="count">Latest loaded</span>' : ""}</div>${bodyHtml(item)}
+        ${!bodies.has(item.id) && item.id ? button("read",item.id,"Read message") : ""}</article>`).join("")}
+      </div></details><div class="actions" aria-label="Conversation actions">
+      ${button("flag",key,m.flagged ? "Unflag latest" : "Flag latest",!canAct || typeof m.flagged !== "boolean",m.flagged)}
+      ${button("pin",key,m.pinned ? "Unpin latest" : "Pin latest",!canAct || typeof m.pinned !== "boolean",m.pinned)}
+      ${button("archive",key,`Archive ${group.messages.length} loaded`,!data.mail_actions_enabled || actionsStale || data.folder!=="inbox" || group.messages.length>20 || group.messages.some(m=>!m.id || m.is_draft!==false))}
+      </div>${!data.mail_actions_enabled ? '<div class="scope muted">Mailbox actions are not enabled for this server.</div>' : ""}
+      ${data.mail_actions_enabled && (!m.change_key || m.is_draft!==false || typeof m.flagged!=="boolean" || typeof m.pinned!=="boolean") ? '<div class="scope muted">Some actions are unavailable: current non-draft mail and verified state are required.</div>' : ""}
+      </section>`;
+  }
+  if (archivePlan) {
+    html += `<section class="archive-preview" aria-label="Archive preview"><strong>Archive ${archivePlan.messages.length} loaded Inbox messages?</strong>
+      <p>Only these messages will move to Archive. Unloaded replies are not included.</p>
+      <ul>${archivePlan.messages.map(m=>`<li>${esc(m.subject || "(no subject)")}</li>`).join("")}</ul>
+      ${button("confirm-archive","","Continue to approval")}${button("cancel-archive","","Cancel")}</section>`;
+  }
+  html += `<footer class="footer">${button("refresh","","Refresh")}${data.has_more ? button("more","",data.query ? "Search next page" : "Load more",pagingStale) : ""}<span class="scope muted">${pagingStale ? "Inbox changed. Refresh before loading more." : "Flag and pin affect the latest loaded message only."}</span></footer>`;
+  app.className = "";
+  app.innerHTML = html;
+  if (focusAction) {
+    [...app.querySelectorAll("button[data-action]")].find(el=>el.dataset.action===focusAction && el.dataset.key===focusKey)?.focus();
+  } else if (focusThread) {
+    [...app.querySelectorAll("details[data-thread]")].find(el=>el.dataset.thread===focusThread)?.querySelector("summary")?.focus();
+  }
 }
+function render(result, context) {
+  host = context || host;
+  const out = result.structuredContent;
+  if (!out?.ok) {
+    document.getElementById("app").textContent = out?.error?.message || "Inbox data unavailable; this is not an empty mailbox.";
+    return;
+  }
+  if (!Array.isArray(out.data?.messages)) return;
+  data = out.data;
+  archivePlan = null;
+  pagingStale = false;
+  actionsStale = false;
+  draw();
+}
+async function call(name,args) {
+  const result = await window.moff.callTool(name,args);
+  const out = result?.structuredContent;
+  if (result?.isError || out?.ok !== true) throw new Error(out?.error?.message || "The host did not confirm success. Inspect the mailbox before retrying.");
+  return out.data;
+}
+async function act(action,key) {
+  if (busy || !data) return;
+  const group = groupMessages(data.messages).find(g=>g.key===key);
+  busy=true; notice="Waiting for host approval or result…"; draw();
+  try {
+    if (action==="cancel-archive") { archivePlan=null; notice="Archive cancelled. No messages moved."; }
+    else if (action==="flag" || action==="pin") {
+      if (actionsStale) throw new Error("Refresh before another mailbox action.");
+      if (!group) throw new Error("Conversation is no longer loaded; refresh first.");
+      const m = group.latest, field=action==="flag" ? "flagged" : "pinned";
+      const result = await call(action==="flag" ? "mail_set_flag" : "mail_set_pin",{id:m.id,change_key:m.change_key,value:!m[field]});
+      if (result.verified!==true) throw new Error("The action was not verified; inspect Outlook before retrying.");
+      m[field]=result.value; m.change_key=result.change_key; notice=action==="flag" ? "Follow-up flag updated in Outlook." : "Pin updated in Outlook.";
+    } else if (action==="archive") {
+      if (actionsStale) throw new Error("Refresh before another mailbox action.");
+      if (!group) throw new Error("Conversation is no longer loaded; refresh first.");
+      archivePlan=await call("mail_archive_preview",{ids:group.messages.map(m=>m.id)});
+      notice="Review the exact messages below. Nothing has moved yet.";
+    } else if (action==="confirm-archive") {
+      if (actionsStale) throw new Error("Refresh before another mailbox action.");
+      if (!archivePlan) throw new Error("Archive preview is no longer available.");
+      const ids = new Set(archivePlan.messages.map(m=>m.id));
+      const result=await call("mail_archive",{plan:archivePlan});
+      if (result.ok!==true) throw new Error("Archive outcome is uncertain. Inspect Outlook; do not retry.");
+      data.messages=data.messages.filter(m=>!ids.has(m.id)); archivePlan=null; pagingStale=true;
+      notice=`Archived ${ids.size} loaded messages. Refresh before continuing pagination.`;
+    } else if (action==="read") {
+      const m=await call("mail_get",{id:key}); bodies.set(key,m); notice="Message loaded without marking it read.";
+    } else if (action==="more" || action==="refresh") {
+      if (action==="more" && pagingStale) throw new Error("Refresh before continuing; archiving changed the folder offsets.");
+      const offset=action==="refresh" ? 0 : data.next_offset;
+      if (!Number.isInteger(offset)) throw new Error("No valid continuation offset. Refresh the inbox.");
+      const args={folder:data.folder,offset,limit:20};
+      if (data.query) args.query=data.query;
+      const next=await call(data.query ? "mail_search" : "mail_list",args);
+      if (!Array.isArray(next.messages)) throw new Error("The next page has invalid data.");
+      if (action==="more") {
+        const ids=new Set(data.messages.map(m=>m.id));
+        next.messages=[...data.messages,...next.messages.filter(m=>!ids.has(m.id))];
+      }
+      data=next; pagingStale=false; archivePlan=null;
+      if (action==="refresh") actionsStale=false;
+      notice=actionsStale ? "Refresh before another mailbox action." : "";
+    }
+  } catch (error) {
+    notice=error.message || "Action failed. No successful result was confirmed.";
+    if (action==="flag" || action==="pin" || action==="confirm-archive") {
+      actionsStale=true;
+      notice+=" Refresh before another mailbox action; uncertain writes are never retried automatically.";
+    }
+    if (action==="confirm-archive") { archivePlan=null; pagingStale=true; }
+  } finally { busy=false; draw(); }
+}
+document.addEventListener("click",event=>{
+  const target=event.target.closest?.("button[data-action]");
+  if (target && !target.disabled) void act(target.dataset.action,target.dataset.key);
+});
+document.addEventListener("toggle",event=>{
+  const key=event.target.dataset?.thread;
+  if (!key) return;
+  if (event.target.open) {
+    const wasOpen=expanded.has(key);
+    expanded.add(key);
+    const latest=data && groupMessages(data.messages).find(g=>g.key===key)?.latest;
+    if (!wasOpen && latest?.id && !bodies.has(latest.id)) void act("read",latest.id);
+  } else expanded.delete(key);
+},true);
 </script></body></html>

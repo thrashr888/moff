@@ -23,9 +23,11 @@ function fixture(options = {}) {
             getItem: () => options.marker || null,
             removeItem: () => {},
         },
-        AbortController, setTimeout, clearTimeout, TextDecoder,
+        AbortController, setTimeout: options.setTimeout || setTimeout, clearTimeout, TextDecoder,
         fetch: async (url, init) => {
             requests.push({url, init});
+            if (options.networkFailure) throw new TypeError("synthetic network failure");
+            if (options.hangFetch) return new Promise(() => {});
             return new Response(options.oversized ? "x".repeat(900001) : '{"Body":{"ResponseCode":"NoError"}}',
                 {status: options.status || 200});
         },
@@ -33,8 +35,31 @@ function fixture(options = {}) {
     const read = vm.runInNewContext(`(${source})`, context);
     const auth = vm.runInNewContext(`(${authSource})`, context);
     const response = vm.runInNewContext(`(${responseSource})`, context);
-    return {call: config => read(config, auth, response), auth, requests, chunks};
+    return {call: config => read(config, options.acquireToken || auth, response), auth, requests, chunks};
 }
+
+test("archive move requires opt-in and exactly one versioned explicit-folder move", async () => {
+    const body = {
+        __type:"MoveItemRequest:#Exchange",
+        ToFolderId:{__type:"TargetFolderId:#Exchange",BaseFolderId:{__type:"FolderId:#Exchange",Id:"archive-id"}},
+        ItemIds:[{__type:"ItemId:#Exchange",Id:"message-id",ChangeKey:"key"}],
+        ReturnNewItemIds:true,
+    };
+    const f = fixture();
+    await f.call({action:"MoveItem",mutation:true,allow_mutation:true,body:{Body:body}});
+    assert.equal(f.requests.length,1);
+    for (const config of [
+        {action:"MoveItem",body:{Body:body}},
+        {action:"MoveItem",mutation:true,body:{Body:body}},
+        {action:"MoveItem",mutation:true,allow_mutation:true,body:{Body:{...body,ItemIds:[]}}},
+        {action:"MoveItem",mutation:true,allow_mutation:true,body:{Body:{...body,ItemIds:[{Id:"message-id"}]}}},
+        {action:"MoveItem",mutation:true,allow_mutation:true,body:{Body:{...body,ToFolderId:{BaseFolderId:{__type:"DistinguishedFolderId:#Exchange",Id:"deleteditems"}}}}},
+    ]) {
+        const blocked = fixture();
+        await assert.rejects(blocked.call(config));
+        assert.equal(blocked.requests.length,0);
+    }
+});
 
 test("authentication allowlist adds only the exact Substrate resource", async () => {
     const f = fixture();
@@ -115,8 +140,48 @@ test("expired sessions do not attempt a mailbox request", async () => {
     assert.equal(f.requests.length, 0);
 });
 test("contract drift and oversized data fail explicitly", async () => {
-    await assert.rejects(fixture({changed: true}).call({action: "FindItem", body: {}}), /contract changed/);
-    await assert.rejects(fixture({oversized: true}).call({action: "FindItem", body: {}}), /exceeds/);
+    const drift = await fixture({changed: true}).call({action: "FindItem", body: {}});
+    assert.equal(drift.status, 422);
+    assert.equal(drift.stage, "authentication");
+    const oversized = await fixture({oversized: true}).call({action: "FindItem", body: {}});
+    assert.equal(oversized.failure, "response_too_large");
+});
+test("unloaded Outlook is distinct from expiry and adapter drift", async () => {
+    const result = await fixture({unloaded:true}).call({action:"FindItem",body:{}});
+    assert.equal(result.status,425);
+    assert.equal(result.stage,"authentication");
+});
+test("network failure is not labelled session expiry and is never retried", async () => {
+    const f = fixture({networkFailure:true});
+    const result = await f.call({action:"FindItem",body:{}});
+    assert.equal(result.failure,"network");
+    assert.equal(result.dispatched,true);
+    assert.equal(f.requests.length,1);
+});
+test("deadline covers stuck token acquisition and prevents a late mailbox dispatch", async () => {
+    let finishAuth;
+    const f = fixture({acquireToken:() => new Promise(resolve => {finishAuth=resolve;})});
+    const result = await f.call({action:"FindItem",body:{},timeout_ms:1});
+    assert.equal(result.failure,"timeout");
+    assert.equal(result.dispatched,false);
+    finishAuth({status:200,accessToken:"synthetic"});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.requests.length,0);
+});
+test("request deadline aborts stalled reads and records dispatched writes as uncertain", async () => {
+    for (const config of [
+        {action:"FindItem",body:{}},
+        {action:"CreateItem",mutation:true,allow_mutation:true,
+            body:{Body:{__type:"CreateItemRequest:#Exchange",MessageDisposition:"SaveOnly",
+                Items:[{__type:"Message:#Exchange"}]}}},
+    ]) {
+        const f = fixture({hangFetch:true});
+        const result = await f.call({...config,timeout_ms:1});
+        assert.equal(result.failure,"timeout");
+        assert.equal(result.dispatched,true);
+        assert.equal(f.requests.length,1);
+        assert.equal(f.requests[0].init.signal.aborted,true);
+    }
 });
 test("typed writes require gate, save-only disposition and supported actions", async () => {
     for (const config of [

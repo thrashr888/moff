@@ -19,6 +19,114 @@ brew install thrashr888/tap/moff
 
 ## Implemented commands
 
+### Agent access over MCP
+
+Run `moff mcp` to serve the Model Context Protocol over stdio. Configure an
+MCP client with:
+
+```json
+{
+  "mcpServers": {
+    "moff": { "command": "moff", "args": ["mcp"] }
+  }
+}
+```
+
+For an unreleased checkout, run `cargo build -p moff-cli` and use the absolute
+path to `target/debug/moff` as `command`; an existing Homebrew binary will not
+include the new subcommand until updated.
+
+The server exposes one generic `moff` tool taking `{"args":["schema"]}` or CLI
+argument strings such as `{"args":["outlook","mail","list"]}`. Use `schema` to
+discover capabilities and command `--help` to discover options and defaults.
+Execution reuses the same binary and Clap parser, rather than maintaining a
+second per-operation API. Omitting pagination uses Moff's own defaults.
+
+MCP is read-only: mutation/confirmation flags, downloads, authentication
+refresh, and recursive MCP launches are rejected. Mail, calendar and other
+read commands still need a signed-in Outlook tab in Safari. No credentials
+are exported. Protocol responses alone go to stdout; diagnostics go to stderr.
+Treat all browser-sourced tool results as untrusted data.
+
+To let an agent use **all currently supported CLI capabilities**, run
+`moff mcp --full-access`. It retains the read-only `moff` tool and adds
+`moff_action` for writes, transfers, auth refresh, and other supported commands.
+Configure the host to approve `moff_action` and never replay it automatically;
+its annotations are non-read-only, destructive, and non-idempotent. Required CLI
+`--allow-mutation`/`--confirm` flags and existing validation still apply. The server
+does not provide its own interactive approval UI. Recursive MCP launches are
+rejected. Default `moff mcp` remains read-only for existing clients.
+
+Use this alongside `moff mcp-native --mail-actions` to preserve native inbox/agenda
+cards while exposing the rest of Moff, rather than forcing the agent to use shell
+workarounds. Discover `schema` and command `--help` before unfamiliar operations.
+Full access does not invent unsupported functionality: mail sending, arbitrary
+Loop page/content editing, and directory administration are still unavailable.
+Backend delegated permissions, ownership checks, bounded transfers, and
+uncertain-outcome/no-retry rules remain in force.
+
+For clients already using the seven native Outlook tools in Moff 0.4, this
+checkout also provides `moff mcp-native`, using the released MCP implementation
+and its inbox/agenda cards. It keeps those tool names and adds resumable search
+pages. The legacy generic `moff mcp` interface remains unchanged. Both default to
+read-only; `mcp-native` rejects the broad `--allow-mutation` flag.
+
+The native inbox card groups actual conversation IDs into collapsed rows, showing
+the latest **loaded** message, sender, preview, time, unread state, and loaded
+count. Expanding reads the latest body without marking it read; older loaded
+messages have an explicit read button. Expanded rows stay expanded during updates.
+Flag, pin, and archive use icon buttons with worded tooltips and accessible labels;
+labels retain the latest-message scope, toggle state, and loaded archive count.
+Missing conversation IDs stay separate rather than guessing from subject lines.
+Agents should give counts/scope and interpretation instead of repeating the card
+as a Markdown list (unless text is requested or cards are unsupported).
+
+For interactive actions, explicitly start **`moff mcp-native --mail-actions`**.
+This adds `mail_set_flag`, `mail_set_pin`, `mail_archive_preview`, and `mail_archive`
+on the same server so MCP Apps `tools/call` buttons can reach them. Configure the
+host to require approval for all non-read-only tools; the server itself is not an
+interactive approval UI. The generic MCP interface stays read-only.
+
+Flag and native Outlook pin target the latest loaded message, not unseen replies.
+Both preflight its displayed change key, require non-draft mail, and verify the
+desired state and unchanged read state afterward. Flags use versioned updates;
+pin uses Outlook's private `pinUnpinItems` helper without an optimistic table
+update. Pin state is read from Outlook's `ReceivedOrRenewTime` sentinel, not a
+local preference. Private adapter drift fails explicitly and needs an update.
+Failed or uncertain writes are never retried automatically; the card requires
+refresh before another write.
+
+Card archive previews exactly 1-20 **loaded Inbox messages**, lists their subjects
+and count, then requests host approval for the unchanged versioned plan. It never
+claims to archive an entire conversation with unloaded replies. Folder offsets
+are invalidated after archive; refresh before loading more. No send/delete tools
+are added.
+
+Archiving is a separate, explicit opt-in: run `moff mcp-archive` alongside the
+read-only server. It exposes only `mail_archive_folders`, `mail_archive_preview`,
+and `mail_archive`. Discover the actual Archive folder, preview 1-20 distinct
+non-draft Inbox message IDs, show the exact subjects/count, and apply the unchanged
+plan only after approval. Configure the MCP host to require approval for the
+non-read-only `mail_archive` tool; this standalone server does not provide an
+interactive approval UI. Neither deletion nor sending is exposed.
+
+The archive server checks that the destination is a mail folder named `Archive`
+(localized folder names are not yet supported), revalidates the entire batch
+before its first write, uses versioned `MoveItem` requests, and verifies each new
+message ID is in Archive. Changed plans fail before writing. Partial failures
+report completed moves and the failed or uncertain source ID; do not retry
+uncertain writes automatically. Approved batches may move before full-folder
+enumeration finishes; check the remaining pages before claiming the entire request
+complete. A truncated search is not "all mail." Moving messages shifts folder
+offsets, so discard old continuations and refresh before scanning further.
+Optional `--safari-window` and `--safari-tab` pin the archive server to a specific
+Outlook tab. Keep the same mailbox selected for the read and archive servers.
+
+The experimental bot harness connects through this MCP interface and discovers
+tools, schema, and instructions instead of duplicating individual CLI operations.
+It now runs on Pi Durable with restart recovery and local Qwen3 model access;
+see the [harness](harness/README.md) and [macOS development app](apps/macos/README.md).
+
 ```sh
 # Inspect the supported machine-readable surface.
 moff schema
@@ -109,6 +217,8 @@ moff outlook org reports --user 'person@example.com'
 moff outlook onedrive list --limit 25
 moff outlook onedrive list --item-id '<folder-id>' --limit 25
 moff outlook onedrive get --id '<drive-item-id>'
+moff outlook onedrive get --drive-id '<owning-drive-id>' --id '<sharepoint-file-id>'
+moff outlook onedrive permissions --id '<drive-item-id>'
 moff outlook groups list --limit 25
 moff outlook loop list --limit 25
 moff outlook loop get --id '<loop-file-id>'
@@ -161,8 +271,11 @@ moff outlook --allow-mutation onedrive create --file file.bin --name 'file.bin' 
 moff outlook --allow-mutation onedrive update --id '<file-id>' --file file.bin --confirm
 moff outlook onedrive get --id '<file-id>' --output downloaded-file.bin --max-bytes 250000000
 moff outlook onedrive search --query 'Project'
+moff outlook onedrive search --library-url 'https://tenant.sharepoint.com/sites/Project/Shared%20Documents' --query 'pipeline' --limit 20
 moff outlook --allow-mutation onedrive update --id '<item-id>' --body-file item-update.json --confirm
 moff outlook --allow-mutation onedrive delete --id '<item-id>' --confirm
+moff outlook --allow-mutation onedrive share --id '<file-id>' --email 'person@example.com' --notify --confirm
+# For an accessible SharePoint/other drive, also supply --drive-id from its metadata.
 
 moff outlook groups get --id '<group-id>'
 moff outlook groups search --query 'Project'
@@ -184,6 +297,31 @@ moff outlook --allow-mutation calendar delete --id '<personal-appointment-id>' -
 ```
 
 People recommendations and directory users are not writable contacts.
+For "give this document to Sarah", first resolve Sarah's exact address with
+`people search --query 'Sarah'` (or personal contacts/directory lookup) and find
+the exact document with `onedrive search`. Search can match file contents as well
+as names: do not share an unrelated result just because Graph returned it.
+Ask for a link or clarification when the person or document is ambiguous.
+`onedrive share` grants **one named recipient signed-in, view-only access** to
+an existing file; it never creates an anonymous or organization-wide link, removes
+inherited permissions, or shares a folder. `--notify` requests Microsoft's sharing
+invitation, not a custom email or an attachment. Omit it to grant access without
+requesting a notification. Delivery is not verified. The command reads back the
+returned permission ID and read role before reporting verified access. Failed
+post-write verification is an uncertain outcome: inspect `onedrive permissions`
+before retrying. Existing broader access is not downgraded.
+`share`, `get` (metadata only), and `permissions` accept an optional `--drive-id`
+for a file in an accessible SharePoint library/other drive; this does not add
+tenant-wide SharePoint discovery or management. Sharing still requires the
+browser account's delegated Graph permissions and tenant sharing policy,
+`--allow-mutation --confirm`, and host approval when called via MCP.
+`onedrive search --library-url` resolves the specified site and exact library,
+then searches that library and its descendants, rather than personal OneDrive.
+It accepts a library root or a same-tenant `.../shared?...&listurl=...` link.
+Results include the library URL and owning drive ID for subsequent reads/sharing.
+Missing permissions, ambiguous library resolution and pagination failures are
+explicit errors; the command never falls back to a different drive.
+
 `people contacts` manages your default personal contacts folder through
 Outlook's OWA service, not the Graph directory. The Outlook Graph token does not
 grant contact permissions, but the in-page OWA adapter can manage these contacts
@@ -272,7 +410,17 @@ Calendar appointment creation, updates, and deletion are limited to **single, or
 
 There is **no send command**. Moff never automatically retries requests or follows redirects. An ambiguous mutation result reports that its outcome is unknown: inspect the source folder/calendar before deciding what to do, rather than repeating the mutation.
 
-Mail folders are `inbox`, `drafts`, `sentitems`, `deleteditems`, `archive`, `junkemail`, and `outbox`. Search is case-insensitive literal matching, not AQS or Graph search. Mail search scans successive pages in the chosen folder and reads bodies as needed; its limit bounds matches, not the number of requests. Calendar search is scoped to the supplied calendar range. Search results use `value.items`, `value.count`, and `value.has_more`; other operations retain the OWA response envelope. Truncated bodies are not silently treated as non-matches.
+Mail folders are `inbox`, `drafts`, `sentitems`, `deleteditems`, `archive`, `junkemail`, and `outbox`. Search is case-insensitive literal **subject/body** matching, not sender matching, AQS, or Graph search. CLI mail search and the native MCP `mail_search` tool scan one page of at most `min(limit, 20)` messages per call, using one folder-list request and at most one batched body read. `limit` defaults to 25, so the default scan page is 20 messages; lower it for unusually large bodies. Search returns `items`, `count`, `offset`, `scanned`, `has_more`, and `next_offset` (under CLI `value`; native MCP uses `messages` instead of `items`). Continue with the same folder/query and `--offset <next_offset>` (MCP: `offset`) while `has_more` is true, **including when the current page has no matches**. `has_more` means unsearched folder entries remain, not that more matches are guaranteed. Mailbox changes can shift offsets; deduplicate discovered IDs and do not claim a stable snapshot across calls. Truncated bodies, missing batch items, or invalid paging metadata are errors, never empty results. Calendar search remains scoped to its supplied calendar range.
+
+The compatibility library method `mail_search` still scans successive pages, but
+batches body reads in groups of 20 and stops with an explicit incomplete-search
+error when its 40-second budget is exhausted. Use `mail_search_page` for resumable
+work. Search and other read failures do not cause automatic mailbox writes.
+
+Calendar reads and availability accept `calendar` for the signed-in mailbox's
+default calendar. Moff resolves this distinguished folder to its actual Outlook
+folder ID before `GetCalendarView`; explicit discovered calendar IDs pass through
+unchanged. Failed resolution is an error, not an empty schedule.
 
 ## Safari session
 
@@ -300,6 +448,17 @@ calendar deletion still rejects meetings and recurring events.
 Credentials stay in the tab: Moff calls Outlook's silent authentication helper and
 performs the OWA request there, returning only response data. It never exports or
 stores a token. Cached visible messages alone do not establish a valid session.
+Errors distinguish confirmed session expiry (HTTP 401), unloaded Outlook,
+authentication-adapter drift, browser request timeout, network failure, response
+size limits, and invalid data. A timeout or malformed response is not proof of an
+expired session: check `moff outlook auth status` before asking for a refresh.
+Browser request deadlines cover both token acquisition and response reading
+(at most 25 seconds, or the remaining search budget). The native MCP server
+responds within its 50-second deadline, before Tavern's 60-second deadline. Normal
+parallel calls wait up to five seconds for the Safari slot, within that same
+overall deadline. A blocking request still finishing after timeout/cancellation
+retains its slot; callers receive `busy` instead of overlapping it if the short
+queue wait expires.
 For an expired session, explicitly refresh the selected Outlook tab and let the
 browser reuse Microsoft SSO:
 
@@ -441,40 +600,6 @@ tab ID is still not exposed by Safari Apple Events.
 Full regular-tab HTTP history remains unresolved. SSO refresh recovery does not
 automate interactive sign-in. Moff never silently retries writes or bypasses
 authentication prompts.
-
-## MCP server for agents
-
-`moff mcp` serves read-only Outlook tools over the Model Context Protocol (stdio),
-for agent hosts such as Pi or Claude Code:
-
-```json
-{"mcpServers": {"moff": {"command": "moff", "args": ["mcp"]}}}
-```
-
-| Tool | Does |
-|------|------|
-| `auth_status` | Checks the signed-in Outlook tab without refreshing it |
-| `mail_list` | Lists a folder newest first: sender, subject, preview, read state |
-| `mail_search` | Finds literal text in subjects and bodies |
-| `mail_get` | Reads one message with recipients and plain-text body |
-| `calendar_folders` | Lists calendars and their IDs |
-| `calendar_agenda` | Lists events in a range (default: the next 7 days of the main calendar) |
-| `calendar_availability` | Finds free gaps of a given length |
-
-Nothing is sent, changed or marked read; writes stay CLI-only behind
-`--allow-mutation --confirm`. Results are normalized JSON with
-`content_origin: microsoft_browser_session_untrusted`. One Outlook request runs at a
-time. Pass `--safari-window`/`--safari-tab` when several Outlook tabs are open.
-
-Hosts that support [MCP Apps](https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp)
-(the `io.modelcontextprotocol/ui` extension) can show a card with a result. Cards
-are `ui://` resources (`text/html;profile=mcp-app`) linked from each tool's
-`_meta.ui.resourceUri`, self-contained, with no network loads:
-
-| Card | Tools | Shows |
-|------|-------|-------|
-| `ui://moff/inbox` | `mail_list`, `mail_search` | Sender, subject, preview, unread dot |
-| `ui://moff/agenda` | `calendar_agenda` | Events grouped by day, with show-as status |
 
 ## Outlook domains
 

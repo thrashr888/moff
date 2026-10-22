@@ -38,6 +38,17 @@ fn product_commands_remain_discoverable_without_browser_access() {
         vec!["org", "reports"],
         vec!["onedrive", "list"],
         vec!["onedrive", "get", "--id", "fake"],
+        vec!["onedrive", "get", "--id", "fake", "--drive-id", "drive"],
+        vec!["onedrive", "permissions", "--id", "fake"],
+        vec!["onedrive", "share"],
+        vec![
+            "onedrive",
+            "search",
+            "--library-url",
+            "https://tenant.sharepoint.com/sites/Project/Documents",
+            "--query",
+            "pipeline",
+        ],
         vec!["groups", "list"],
         vec!["loop", "list"],
         vec!["loop", "get", "--id", "fake"],
@@ -49,6 +60,100 @@ fn product_commands_remain_discoverable_without_browser_access() {
             .assert()
             .success();
     }
+}
+
+#[test]
+fn file_sharing_requires_explicit_recipient_opt_in_and_confirmation() {
+    let args = [
+        "onedrive",
+        "share",
+        "--id",
+        "file",
+        "--email",
+        "sarah@example.com",
+    ];
+    moff()
+        .arg("outlook")
+        .args(args)
+        .arg("--confirm")
+        .assert()
+        .failure()
+        .stderr(contains("--allow-mutation"));
+    moff()
+        .args(["outlook", "--allow-mutation"])
+        .args(args)
+        .assert()
+        .failure()
+        .stderr(contains("--confirm"));
+    moff()
+        .args([
+            "outlook",
+            "--allow-mutation",
+            "onedrive",
+            "share",
+            "--id",
+            "file",
+            "--email",
+            "not-an-email",
+            "--confirm",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("explicit recipient email"));
+    moff()
+        .args([
+            "outlook",
+            "onedrive",
+            "get",
+            "--id",
+            "file",
+            "--drive-id",
+            "drive",
+            "--output",
+            "/not/write",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("cannot be used with"));
+    let output = moff().arg("schema").output().unwrap();
+    let schema: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(schema["commands"]["onedrive"]["share"], true);
+    assert_eq!(schema["commands"]["onedrive"]["permissions"], true);
+    assert_eq!(
+        schema["product_writes"]["onedrive_sharing"]["roles"],
+        serde_json::json!(["read"])
+    );
+}
+
+#[test]
+fn scoped_library_search_rejects_invalid_urls_before_browser_access() {
+    moff()
+        .args([
+            "outlook",
+            "onedrive",
+            "search",
+            "--query",
+            "pipeline",
+            "--library-url",
+            "https://evil.example/sites/Project/Documents",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("HTTPS SharePoint library"));
+    moff()
+        .args([
+            "outlook",
+            "people",
+            "contacts",
+            "search",
+            "--query",
+            "Sarah",
+            "--library-url",
+            "https://tenant.sharepoint.com/sites/Project/Documents",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("only supported for OneDrive"));
 }
 
 #[test]
