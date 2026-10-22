@@ -1,5 +1,5 @@
 async function(config, acquireToken, readResponse) {
-    if (!["https://outlook.office.com", "https://outlook.cloud.microsoft"].includes(location.origin)) {
+    if (!["https://outlook.office.com", "https://outlook.cloud.microsoft", "https://outlook.live.com"].includes(location.origin)) {
         throw new Error("Moff requires an HTTPS Outlook tab");
     }
     const allowed = ["FindFolder", "GetFolder", "FindItem", "FindConversation", "GetItem", "GetConversationItems",
@@ -109,7 +109,7 @@ async function(config, acquireToken, readResponse) {
             const response = await fetch("/owa/service.svc?action=" + config.action + "&app=Mail", {
                 method: "POST", mode: "same-origin", credentials: "same-origin", redirect: "error",
                 headers: {"content-type": "application/json", action: config.action,
-                    authorization: "Bearer " + token.accessToken},
+                    authorization: token.authorization},
                 body: JSON.stringify(config.body), signal: controller.signal
             });
             token = null;

@@ -601,6 +601,14 @@ Full regular-tab HTTP history remains unresolved. SSO refresh recovery does not
 automate interactive sign-in. Moff never silently retries writes or bypasses
 authentication prompts.
 
+## Outlook domains
+
+Moff works in a signed-in Outlook tab on `outlook.office.com` or
+`outlook.cloud.microsoft` (work and school accounts) and `outlook.live.com`
+(personal Microsoft accounts). On personal accounts, Mail and Calendar
+requests use Outlook's own MSA service token (`MSAuth1.0`); Graph-backed commands (people, org, groups, Loop)
+apply only to work and school accounts.
+
 ## Request-contract sources
 
 - **Outlook Web mail and calendar:** browser Network captures and live in-tab requests, with read request construction in [`lib.rs`](crates/moff-outlook-owa/src/lib.rs) and typed mutation builders in [`operations.rs`](crates/moff-outlook-owa/src/operations.rs). Reads use `FindItem`, `GetItem`, `GetCalendarFoldersV2`, and `GetCalendarView`. Draft/message writes use `CreateItem` and `UpdateItem`; appointment writes use `CreateItem` and `UpdateCalendarEvent`. Creation omits read-only timezone-ID and organizer properties rejected by the live API. These are browser OWA contracts, not Graph payloads.

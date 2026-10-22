@@ -25,7 +25,7 @@ fn outlook_url(value: &str) -> bool {
             && url.port().is_none()
             && matches!(
                 url.host_str(),
-                Some("outlook.office.com" | "outlook.cloud.microsoft")
+                Some("outlook.office.com" | "outlook.cloud.microsoft" | "outlook.live.com")
             )
             && (url.path().starts_with("/mail/")
                 || url.path().starts_with("/calendar/")
@@ -838,12 +838,16 @@ mod tests {
             "https://outlook.office.com/mail/",
             "https://outlook.cloud.microsoft/calendar/view/week",
             "https://outlook.cloud.microsoft/host/4a6520d6-94a8-4730-9184-24997b9b3401/auth",
+            "https://outlook.live.com/mail/",
+            "https://outlook.live.com/calendar/0/view/week",
         ] {
             assert!(outlook_url(url));
         }
         for url in [
             "http://outlook.office.com/mail/",
             "https://outlook.office.com.evil/mail/",
+            "https://outlook.live.com.evil/mail/",
+            "https://outlook.live.com/owa/",
             "https://outlook.office.com/",
             "https://user@outlook.office.com/mail/",
             "https://outlook.cloud.microsoft/host/invalid/auth",

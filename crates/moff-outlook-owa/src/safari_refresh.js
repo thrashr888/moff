@@ -1,5 +1,5 @@
 function(marker) {
-    if (!["https://outlook.office.com", "https://outlook.cloud.microsoft"].includes(location.origin)) {
+    if (!["https://outlook.office.com", "https://outlook.cloud.microsoft", "https://outlook.live.com"].includes(location.origin)) {
         throw new Error("Moff refresh requires an HTTPS Outlook document");
     }
     sessionStorage.setItem("__moff_auth_recovery", marker);
