@@ -51,6 +51,36 @@ async function(config, acquireToken, readResponse) {
                         || !Number.isFinite(proposalEnd) || proposalEnd <= proposalStart))) {
                     throw new Error("Invalid meeting response");
                 }
+            } else if (item.__type === "Message:#Exchange" && body.MessageDisposition === "SendAndSaveCopy") {
+                const onlyKeys = (value, keys) => value && typeof value === "object"
+                    && !Array.isArray(value) && Object.keys(value).every(key => keys.includes(key));
+                const addressOK = address => {
+                    if (typeof address !== "string" || address.length > 254 || !/^[\x21-\x7e]+$/.test(address)) return false;
+                    const parts = address.split("@");
+                    return parts.length === 2 && parts[0].length <= 64
+                        && /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$/.test(parts[0])
+                        && !parts[0].startsWith(".") && !parts[0].endsWith(".") && !parts[0].includes("..")
+                        && parts[1].includes(".") && parts[1].split(".").every(label =>
+                            label.length <= 63 && /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label));
+                };
+                const lists = [item.ToRecipients, item.CcRecipients, item.BccRecipients];
+                const recipients = lists.every(Array.isArray) ? lists.flat() : [];
+                const text = item.Body;
+                if (!onlyKeys(body, ["__type", "MessageDisposition", "Items"])
+                    || !onlyKeys(item, ["__type", "Subject", "Body", "ToRecipients", "CcRecipients", "BccRecipients"])
+                    || !lists.every(Array.isArray) || !item.ToRecipients.length || recipients.length > 20
+                    || recipients.some(recipient => !onlyKeys(recipient, ["__type", "EmailAddress", "RoutingType"])
+                        || recipient.__type !== "EmailAddress:#Exchange" || recipient.RoutingType !== "SMTP"
+                        || !addressOK(recipient.EmailAddress))
+                    || new Set(recipients.map(recipient => recipient.EmailAddress.toLowerCase())).size !== recipients.length
+                    || typeof item.Subject !== "string" || !item.Subject.trim()
+                    || /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(item.Subject) || new TextEncoder().encode(item.Subject).length > 998
+                    || !onlyKeys(text, ["__type", "BodyType", "Value"])
+                    || text.__type !== "BodyContentType:#Exchange" || text.BodyType !== "Text"
+                    || typeof text.Value !== "string" || !text.Value.trim() || text.Value.includes("\0")
+                    || new TextEncoder().encode(text.Value).length > 200000) {
+                    throw new Error("Only explicit-recipient plain-text mail sending is allowed; no attachments or sender override");
+                }
             } else if (!["Message:#Exchange", "ReplyToItem:#Exchange", "ReplyAllToItem:#Exchange","Contact:#Exchange"].includes(item.__type)
                 || body.MessageDisposition !== "SaveOnly") throw new Error("Sending is prohibited");
             if (item.__type === "Contact:#Exchange" && body.SavedItemFolderId?.BaseFolderId?.Id !== "contacts")

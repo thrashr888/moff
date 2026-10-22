@@ -60,8 +60,9 @@ rejected. Default `moff mcp` remains read-only for existing clients.
 Use this alongside `moff mcp-native --mail-actions` to preserve native inbox/agenda
 cards while exposing the rest of Moff, rather than forcing the agent to use shell
 workarounds. Discover `schema` and command `--help` before unfamiliar operations.
-Full access does not invent unsupported functionality: mail sending, arbitrary
-Loop page/content editing, and directory administration are still unavailable.
+Mail sending is available through the approval-gated `moff_action` tool (see
+below); native mail cards remain unchanged. Arbitrary Loop page/content editing
+and directory administration are still unavailable.
 Backend delegated permissions, ownership checks, bounded transfers, and
 uncertain-outcome/no-retry rules remain in force.
 
@@ -146,6 +147,10 @@ moff outlook mail search --folder drafts --query 'temporary check'
 # All mailbox writes require --allow-mutation and --confirm.
 moff outlook --allow-mutation mail create --body-file draft.json --confirm
 moff outlook --allow-mutation mail update --id '<draft-id>' --body-file draft-update.json --confirm
+
+# Submit a new message from the selected Outlook account (not a draft update).
+moff outlook --allow-mutation mail send --to recipient@example.com \
+  --subject 'Project update' --body 'The project is ready for review.' --confirm
 
 # Get calendars, then query one calendar's time range.
 moff outlook calendar folders
@@ -392,6 +397,55 @@ request shapes, bounds, verification and recovery limitations.
 
 ## Mutation inputs and safety
 
+### Sending email
+
+`mail send` submits **one new plain-text message** through the selected signed-in
+Outlook Safari tab using OWA `CreateItem` with `SendAndSaveCopy`. It does not use
+desktop Mail or switch accounts/transports. If multiple Outlook tabs are open,
+select the intended account with `--safari-window` and `--safari-tab` before
+`mail`. Confirm the account and exact user-authorized recipients/content before
+approval; browser content cannot authorize sending.
+
+`--to`, `--subject`, `--body`, and `--confirm` are required. Repeat `--to`, `--cc`,
+or `--bcc` for multiple explicit SMTP addresses (20 total maximum, no duplicates
+across lists). Names, comma/semicolon-delimited lists and implicit reply recipients
+are rejected. At least one To address is required. Subject must be nonempty,
+single-line and at most 998 UTF-8 bytes; body must be nonempty plain text, at most
+200000 UTF-8 bytes with no NUL. ASCII SMTP addresses are supported; international
+addresses/quoted local parts are not. Text is literal, not HTML.
+
+Agents use the normal full-access action without a shell or intermediate file:
+
+```json
+{"name":"moff_action","arguments":{"args":["outlook","--allow-mutation","mail","send","--to","recipient@example.com","--subject","Project update","--body","The project is ready for review.","--confirm"]}}
+```
+
+Place **`--allow-mutation` before `mail`**. The CLI flags do not replace host
+approval: configure the host to require approval for `moff_action`.
+Read-only `moff`, `mcp-native --mail-actions`, and `mcp-archive` do not expose send.
+
+Only a single successful OWA response yields `status:"submission_acknowledged"`,
+`acknowledged:true`, `delivery_verified:false`, and `sent_copy_verified:false`.
+This is a submission acknowledgement, **not proof of delivery or a verified
+Sent Items copy**; no message ID is invented. Embedded service errors, missing
+or multiple acknowledgements fail explicitly. A timeout/network error after
+dispatch is an unknown outcome: inspect Sent Items/Outbox and never resend
+automatically. There is no idempotency key or automatic retry.
+
+Attachments, custom From/Sender, HTML, sending an existing draft and threaded
+reply sending are unsupported and rejected. `create`/`reply-draft` still only
+save drafts. Attachment sending needs a separate verified upload/attachment
+transport; file sharing notifications are not attachment email. This send path
+is contract-tested with synthetic responses, **not live-send validated**; no live
+message was authorized or sent during implementation. OWA is a private adapter,
+so personal/work account or service-contract drift may require an update.
+The submission/empty-item acknowledgement follows Microsoft's
+[CreateItem email contract](https://learn.microsoft.com/en-us/exchange/client-developer/web-service-reference/createitem-operation-email-message);
+that public Exchange contract is not a guarantee that every private OWA deployment
+accepts the adapter.
+
+### Drafts and calendar
+
 Draft JSON accepts only optional `subject` and `body` strings. `{}` creates a blank, unsent draft; an update must specify at least one field. Bodies are plain text, escaped before being sent to OWA.
 
 ```json
@@ -408,7 +462,7 @@ Unknown JSON fields are rejected, including recipients, attendees, recurrence, a
 
 Calendar appointment creation, updates, and deletion are limited to **single, organizer-owned appointments without attendees**. Creation sends no invitations and disables reminders. Updates reject meetings, attendee/resource lists, and recurring events. Meeting RSVP is a separate, confirmed send operation supporting accept, tentative, or decline with an optional message and proposed new time; it only targets received invitations and never responds to recurring-series masters. `calendar move` explicitly sends an updated time to attendees for an organizer-owned meeting occurrence. `calendar cancel` sends attendee cancellation notifications for a meeting you organized; it has no custom-message support in the current service contract.
 
-There is **no send command**. Moff never automatically retries requests or follows redirects. An ambiguous mutation result reports that its outcome is unknown: inspect the source folder/calendar before deciding what to do, rather than repeating the mutation.
+Moff never automatically retries requests or follows redirects. An ambiguous mutation result reports that its outcome is unknown: inspect the affected folder/calendar before deciding what to do, rather than repeating the mutation.
 
 Mail folders are `inbox`, `drafts`, `sentitems`, `deleteditems`, `archive`, `junkemail`, and `outbox`. Search is case-insensitive literal **subject/body** matching, not sender matching, AQS, or Graph search. CLI mail search and the native MCP `mail_search` tool scan one page of at most `min(limit, 20)` messages per call, using one folder-list request and at most one batched body read. `limit` defaults to 25, so the default scan page is 20 messages; lower it for unusually large bodies. Search returns `items`, `count`, `offset`, `scanned`, `has_more`, and `next_offset` (under CLI `value`; native MCP uses `messages` instead of `items`). Continue with the same folder/query and `--offset <next_offset>` (MCP: `offset`) while `has_more` is true, **including when the current page has no matches**. `has_more` means unsearched folder entries remain, not that more matches are guaranteed. Mailbox changes can shift offsets; deduplicate discovered IDs and do not claim a stable snapshot across calls. Truncated bodies, missing batch items, or invalid paging metadata are errors, never empty results. Calendar search remains scoped to its supplied calendar range.
 
@@ -441,8 +495,8 @@ Safari is the default and only transport; the former `--safari` flag remains a h
 compatibility no-op for existing scripts. The dependency is pinned to the Cider v0.12.0 source revision (`7220e5d6ef2dfbcfa35243f2b054666c4782f8f1`) containing the Safari
 library APIs; it does not track Cider's default branch.
 
-Safari mode supports Mail/Calendar reads, batch reads and searches. Typed, non-sending
-writes require both `--allow-mutation` (next to `--safari`) and the operation's
+Safari mode supports Mail/Calendar reads, batch reads and searches. Typed writes,
+including explicit mail sending, require both `--allow-mutation` (before `mail`/`calendar`) and the operation's
 `--confirm`. Native Loop workspace deletion is explicitly permanent; other deletion follows the policies described above;
 calendar deletion still rejects meetings and recurring events.
 Credentials stay in the tab: Moff calls Outlook's silent authentication helper and

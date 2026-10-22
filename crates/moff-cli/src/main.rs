@@ -8,9 +8,9 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use moff_outlook_owa::{
     DEFAULT_MAX_FILE_BYTES, DraftInput, EventInput, EventMoveInput, LoopWorkspaceRequest,
-    MeetingResponseInput, OutlookWebError, OutlookWebSession, ProductWrite, ReplyInput, WorkInput,
-    WorkPlan, calendar_folders_request, calendar_view_request, product_segment,
-    validate_contact_input, validate_file_size, validate_read_action,
+    MeetingResponseInput, OutlookWebError, OutlookWebSession, ProductWrite, ReplyInput,
+    SendMailInput, WorkInput, WorkPlan, calendar_folders_request, calendar_view_request,
+    product_segment, validate_contact_input, validate_file_size, validate_read_action,
 };
 use serde_json::{Value, json};
 mod archive_mcp;
@@ -77,7 +77,7 @@ struct SessionArgs {
     _safari: bool,
     #[arg(
         long,
-        help = "Permit typed non-sending Safari writes; each write also requires --confirm"
+        help = "Permit typed Safari writes, including explicit mail sending; each write also requires --confirm"
     )]
     allow_mutation: bool,
     #[arg(long, requires = "safari_tab", value_parser = clap::value_parser!(u32).range(1..))]
@@ -141,6 +141,24 @@ enum AuthCommand {
 
 #[derive(Debug, Subcommand)]
 enum MailCommand {
+    /// Submit new plain-text mail from the selected Outlook account; acknowledgement is not delivery.
+    #[command(
+        after_help = "Example: moff outlook --allow-mutation mail send --to recipient@example.com --subject 'Subject' --body 'Message' --confirm\nRequires host approval through moff_action. Repeat --to/--cc/--bcc for exact addresses (20 total max). No attachments, custom sender, HTML, draft sending or automatic retries."
+    )]
+    Send {
+        #[arg(long, required = true)]
+        to: Vec<String>,
+        #[arg(long)]
+        cc: Vec<String>,
+        #[arg(long)]
+        bcc: Vec<String>,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        body: String,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
     /// Set read state explicitly; reply drafts restore Outlook's automatic read side effect.
     Mark {
         #[arg(long)]
@@ -665,7 +683,7 @@ fn schema() -> Value {
             "auth_recovery":{"refresh":true,"status":true,"interactive_sign_in":false,"confirmation":"--confirm","wait_seconds_max":120}}},
         "commands":{
             "auth":{"refresh":true,"status":true},
-            "mail":{"list":true,"search":true,"get":true,"get-batch":true,"categories":true,"reply-draft":true,"reply_all_draft":true,"mark":true,"create":true,"update":true,"delete":true,"send":false},
+            "mail":{"list":true,"search":true,"get":true,"get-batch":true,"categories":true,"reply-draft":true,"reply_all_draft":true,"mark":true,"create":true,"update":true,"delete":true,"send":true},
             "calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"get-batch":true,"availability":true,"work-blocks":{"plan":true,"apply":true},"create":true,"update":true,"delete":true,"respond":true,"move":true,"cancel":true},
             "people":{"list":true,"search":true,"get":true,"contacts":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true}},
             "org":{"list":true,"get":true,"search":true,"manager":true,"reports":true,"create":false,"update":false,"delete":false},
@@ -674,6 +692,14 @@ fn schema() -> Value {
             "loop":{"create":false,"get":true,"update":true,"delete":true,"list":true,"search":true,"content_editing":false,
                 "workspace":{"list":true,"get":true,"create":true,"delete":true,"search":true,"update":false,"title":false,"id":"base64 ODSP PodId","delete_policy":"permanent; verified current-user Owner required","list_scope":"recent workspaces only"}},
             "service":{"read":true}},
+        "mail_send":{"command":"moff outlook --allow-mutation mail send --to recipient@example.com --subject Subject --body Message --confirm",
+            "transport":"OWA CreateItem SendAndSaveCopy in selected authenticated Outlook tab",
+            "requires":["explicit SMTP recipients","nonempty subject","nonempty plain-text body","--allow-mutation","--confirm","host approval for moff_action"],
+            "recipient_flags":["--to","--cc","--bcc"],"max_recipients":20,"max_subject_bytes":998,"max_body_bytes":200_000,
+            "sender":"selected Outlook account; no override","attachments":false,"html":false,
+            "send_existing_draft":false,"reply_send":false,"automatic_retry":false,
+            "verification":"single successful OWA response acknowledges submission only; delivery and sent copy are not verified",
+            "live_send_validated":false},
         "unimplemented_products":[],
         "full_product_management":false,
         "product_reads":{"methods":["GET"],"max_page_size":100,"follow_next_links":"metadata search only, maximum 100 pages",
@@ -1415,6 +1441,7 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
         matches!(
             command,
             MailCommand::Create { .. }
+                | MailCommand::Send { .. }
                 | MailCommand::Update { .. }
                 | MailCommand::Delete { .. }
                 | MailCommand::Categories { .. }
@@ -1423,6 +1450,30 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
         ),
     )?;
     match command {
+        MailCommand::Send {
+            to,
+            cc,
+            bcc,
+            subject,
+            body,
+            confirm,
+        } => {
+            if !confirm {
+                return Err("mutations require --confirm".into());
+            }
+            let input = SendMailInput {
+                to,
+                cc,
+                bcc,
+                subject,
+                body,
+            };
+            input.validate().map_err(|error| error.to_string())?;
+            Ok((
+                "outlook.mail.send",
+                with_owa(args, |s| s.send_mail(&input))?,
+            ))
+        }
         MailCommand::Mark {
             id,
             read,

@@ -48,12 +48,88 @@ fn full_access_exposes_actions_while_retaining_read_only_discovery() {
     )
     .unwrap();
     assert_eq!(schema["full_access_mcp"]["requires_host_approval"], true);
-    assert_eq!(schema["commands"]["mail"]["send"], false);
+    assert_eq!(schema["commands"]["mail"]["send"], true);
+    assert_eq!(schema["mail_send"]["attachments"], false);
     assert_eq!(schema["commands"]["onedrive"]["share"], true);
     assert_eq!(responses[3]["result"]["isError"], false);
     assert_eq!(responses[4]["result"]["isError"], true);
     assert_eq!(responses[5]["result"]["isError"], true);
     assert_eq!(responses[6]["result"]["isError"], false);
+}
+
+#[test]
+fn send_is_discoverable_and_approval_gated_through_actions_without_browser_access() {
+    for full_access in [false, true] {
+        let send = json!([
+            "outlook",
+            "mail",
+            "send",
+            "--to",
+            "recipient@example.com",
+            "--subject",
+            "Synthetic",
+            "--body",
+            "Text",
+            "--confirm"
+        ]);
+        let requests = [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"moff","arguments":{"args":send}}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"moff_action","arguments":{"args":send}}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"moff_action","arguments":{"args":["outlook","mail","send","--help"]}}}),
+            json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"moff_action","arguments":{"args":["outlook","--allow-mutation","mail","send","--to","not-an-email","--subject","Synthetic","--body","Text","--confirm"]}}}),
+        ];
+        let mut command = Command::cargo_bin("moff").unwrap();
+        command.arg("mcp");
+        if full_access {
+            command.arg("--full-access");
+        }
+        let output = command
+            .write_stdin(
+                requests
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n",
+            )
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let responses: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(responses[2]["result"]["isError"], true);
+        assert_eq!(responses[3]["result"]["isError"], true);
+        assert_eq!(responses[4]["result"]["isError"], !full_access);
+        assert_eq!(responses[5]["result"]["isError"], true);
+        if full_access {
+            let tool = &responses[1]["result"]["tools"][1];
+            assert!(
+                tool["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("mail sending")
+            );
+            assert_eq!(tool["annotations"]["readOnlyHint"], false);
+            assert_eq!(tool["annotations"]["idempotentHint"], false);
+            assert!(
+                responses[3]["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("--allow-mutation")
+            );
+            assert!(
+                responses[5]["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unique explicit SMTP")
+            );
+        }
+    }
 }
 
 #[test]

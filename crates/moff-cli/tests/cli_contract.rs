@@ -8,6 +8,109 @@ fn moff() -> Command {
 }
 
 #[test]
+fn send_requires_explicit_content_opt_in_and_confirmation_without_browser_access() {
+    let send = [
+        "mail",
+        "send",
+        "--to",
+        "recipient@example.com",
+        "--subject",
+        "Synthetic",
+        "--body",
+        "Text",
+    ];
+    moff()
+        .arg("outlook")
+        .args(send)
+        .arg("--confirm")
+        .assert()
+        .failure()
+        .stderr(contains("--allow-mutation"));
+    moff()
+        .args(["outlook", "--allow-mutation"])
+        .args(send)
+        .assert()
+        .failure()
+        .stderr(contains("--confirm"));
+    moff()
+        .args(["outlook", "mail", "send", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            contains("moff outlook --allow-mutation mail send").and(contains("No attachments")),
+        );
+    for missing in ["--to", "--subject", "--body"] {
+        let mut args = vec!["outlook", "--allow-mutation", "mail", "send", "--confirm"];
+        for (flag, value) in [
+            ("--to", "recipient@example.com"),
+            ("--subject", "Synthetic"),
+            ("--body", "Text"),
+        ] {
+            if flag != missing {
+                args.extend([flag, value]);
+            }
+        }
+        moff()
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(contains(missing));
+    }
+    for flag in [
+        "--attachments",
+        "--attachment",
+        "--from",
+        "--sender",
+        "--html",
+        "--id",
+    ] {
+        moff()
+            .args(["outlook", "--allow-mutation"])
+            .args(send)
+            .args(["--confirm", flag, "unsupported"])
+            .assert()
+            .failure()
+            .stderr(contains("unexpected argument"));
+    }
+    for (to, subject, body) in [
+        ("Sarah", "Synthetic", "Text"),
+        ("a@example.com,b@example.com", "Synthetic", "Text"),
+        ("recipient@example.com", "", "Text"),
+        (
+            "recipient@example.com",
+            "Subject\nBcc: other@example.com",
+            "Text",
+        ),
+        ("recipient@example.com", "Synthetic", ""),
+    ] {
+        moff()
+            .args([
+                "outlook",
+                "--allow-mutation",
+                "mail",
+                "send",
+                "--to",
+                to,
+                "--subject",
+                subject,
+                "--body",
+                body,
+                "--confirm",
+            ])
+            .assert()
+            .failure()
+            .stderr(contains("send requires"));
+    }
+    moff()
+        .args(["outlook", "--allow-mutation"])
+        .args(send)
+        .args(["--cc", "RECIPIENT@example.com", "--confirm"])
+        .assert()
+        .failure()
+        .stderr(contains("unique explicit SMTP"));
+}
+
+#[test]
 fn safari_is_the_only_transport_and_exports_are_not_accepted() {
     moff()
         .args(["outlook", "--session-curl", "/not/read", "mail", "list"])
@@ -330,7 +433,9 @@ fn schema_is_honest_about_unavailable_products_and_safe_writes() {
     assert_eq!(schema["commands"]["auth"]["status"], true);
     assert_eq!(schema["commands"]["mail"]["mark"], true);
     assert_eq!(schema["commands"]["mail"]["reply_all_draft"], true);
-    assert_eq!(schema["commands"]["mail"]["send"], false);
+    assert_eq!(schema["commands"]["mail"]["send"], true);
+    assert_eq!(schema["mail_send"]["attachments"], false);
+    assert_eq!(schema["mail_send"]["live_send_validated"], false);
     assert_eq!(schema["commands"]["calendar"]["respond"], true);
     assert_eq!(schema["commands"]["calendar"]["move"], true);
     assert_eq!(schema["commands"]["calendar"]["cancel"], true);
@@ -576,15 +681,16 @@ fn read_escape_hatch_and_inputs_are_validated_before_browser_access() {
         .assert()
         .failure()
         .stderr(contains("invalid value"));
-    for args in [
-        vec!["mail", "send", "--confirm"],
-        vec!["service", "write", "--action", "SendItem", "--confirm"],
-    ] {
-        moff()
-            .arg("outlook")
-            .args(args)
-            .assert()
-            .failure()
-            .stderr(contains("unrecognized subcommand"));
-    }
+    moff()
+        .args([
+            "outlook",
+            "service",
+            "write",
+            "--action",
+            "SendItem",
+            "--confirm",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("unrecognized subcommand"));
 }

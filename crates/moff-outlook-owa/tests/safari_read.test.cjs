@@ -9,7 +9,10 @@ const responseSource = fs.readFileSync(require("node:path").join(__dirname, "../
 function fixture(options = {}) {
     const requests = [];
     const cache = {
-        121455: {ij: async () => options.expired ? {TokenResultCode: 3} : {TokenResultCode: 0, AccessToken: "test-secret"}},
+        121455: {
+            ij: async () => options.expired ? {TokenResultCode: 3} : {TokenResultCode: 0, AccessToken: "test-secret"},
+            a9: async () => options.expired ? "" : "synthetic-personal-token",
+        },
         429896: {A: () => ({})},
     };
     const runtime = id => cache[id];
@@ -23,7 +26,7 @@ function fixture(options = {}) {
             getItem: () => options.marker || null,
             removeItem: () => {},
         },
-        AbortController, setTimeout: options.setTimeout || setTimeout, clearTimeout, TextDecoder,
+        AbortController, setTimeout: options.setTimeout || setTimeout, clearTimeout, TextDecoder, TextEncoder,
         fetch: async (url, init) => {
             requests.push({url, init});
             if (options.networkFailure) throw new TypeError("synthetic network failure");
@@ -37,6 +40,91 @@ function fixture(options = {}) {
     const response = vm.runInNewContext(`(${responseSource})`, context);
     return {call: config => read(config, options.acquireToken || auth, response), auth, requests, chunks};
 }
+
+function sendConfig() {
+    const mailbox = address => ({__type:"EmailAddress:#Exchange",EmailAddress:address,RoutingType:"SMTP"});
+    return {action:"CreateItem",mutation:true,allow_mutation:true,body:{
+        Body:{__type:"CreateItemRequest:#Exchange",MessageDisposition:"SendAndSaveCopy",
+            Items:[{__type:"Message:#Exchange",Subject:"Synthetic",
+                Body:{__type:"BodyContentType:#Exchange",BodyType:"Text",Value:"<literal>\nText"},
+                ToRecipients:[mailbox("to@example.com")],CcRecipients:[mailbox("cc@example.com")],
+                BccRecipients:[mailbox("bcc@example.com")]}]}
+    }};
+}
+
+test("typed explicit-recipient sending uses one same-origin request on work and personal Outlook", async () => {
+    for (const origin of ["https://outlook.office.com","https://outlook.cloud.microsoft","https://outlook.live.com"]) {
+        const f = fixture({origin});
+        assert.equal((await f.call(sendConfig())).status,200);
+        assert.equal(f.requests.length,1);
+        assert.equal(f.requests[0].url,"/owa/service.svc?action=CreateItem&app=Mail");
+        assert.equal(f.requests[0].init.redirect,"error");
+        assert.deepEqual(JSON.parse(f.requests[0].init.body),sendConfig().body);
+    }
+});
+
+test("browser send gate rejects implicit scope, spoofing, attachments and invalid content before auth or fetch", async () => {
+    const changes = [
+        config => {config.mutation=false;},
+        config => {config.allow_mutation=false;},
+        config => {config.action="SendItem";},
+        config => {config.body.Body.MessageDisposition="SendOnly";},
+        config => {config.body.Body.From={EmailAddress:"spoof@example.com"};},
+        config => {config.body.Body.SavedItemFolderId={};},
+        config => {config.body.Body.Items.push(config.body.Body.Items[0]);},
+        ...["From","Sender","Attachments","ReferenceItemId","ItemId"].map(key =>
+            config => {config.body.Body.Items[0][key]={};}),
+        config => {config.body.Body.Items[0].ToRecipients=[];},
+        config => {config.body.Body.Items[0].CcRecipients=null;},
+        config => {delete config.body.Body.Items[0].BccRecipients;},
+        config => {config.body.Body.Items[0].ToRecipients[0].RoutingType="EX";},
+        config => {config.body.Body.Items[0].ToRecipients[0].Name="Hidden scope";},
+        config => {config.body.Body.Items[0].CcRecipients[0].EmailAddress="TO@example.com";},
+        ...["", "Sarah", "a@example.com,b@example.com", "a@example.com\r\nBcc:b@example.com",
+            "a@@example.com", "a@localhost", ".a@example.com", "a..b@example.com",
+            "a@-example.com", "a@example..com", " a@example.com", "ü@example.com"].map(address =>
+            config => {config.body.Body.Items[0].ToRecipients[0].EmailAddress=address;}),
+        config => {config.body.Body.Items[0].ToRecipients=Array.from({length:21},(_,i) =>
+            ({__type:"EmailAddress:#Exchange",EmailAddress:`p${i}@example.com`,RoutingType:"SMTP"}));},
+        ...["", " ", "Subject\nBcc: other@example.com", "Subject\u2028line", "Subject\u2029paragraph", "é".repeat(500)].map(subject =>
+            config => {config.body.Body.Items[0].Subject=subject;}),
+        ...["", " \n", "text\0", "é".repeat(100001)].map(body =>
+            config => {config.body.Body.Items[0].Body.Value=body;}),
+        config => {config.body.Body.Items[0].Body.BodyType="HTML";},
+        config => {config.body.Body.Items[0].Body.Content="unsupported";},
+        config => {config.body.Body.Items[0].__type="ReplyToItem:#Exchange";},
+    ];
+    for (const change of changes) {
+        const config = sendConfig();
+        change(config);
+        let authentications=0;
+        const f = fixture({acquireToken:async () => {authentications++; return {status:200};}});
+        await assert.rejects(f.call(config));
+        assert.equal(authentications,0);
+        assert.equal(f.requests.length,0);
+    }
+});
+
+test("send byte bounds permit the exact maximum and failures are never retried", async () => {
+    const config = sendConfig();
+    config.body.Body.Items[0].Subject="é".repeat(499);
+    config.body.Body.Items[0].Body.Value="é".repeat(100000);
+    config.body.Body.Items[0].ToRecipients=Array.from({length:18},(_,i) =>
+        ({__type:"EmailAddress:#Exchange",EmailAddress:`p${i}@example.com`,RoutingType:"SMTP"}));
+    assert.equal((await fixture().call(config)).status,200);
+    config.body.Body.Items[0].BccRecipients.push(
+        {__type:"EmailAddress:#Exchange",EmailAddress:"extra@example.com",RoutingType:"SMTP"});
+    await assert.rejects(fixture().call(config));
+    for (const options of [{networkFailure:true},{status:500},{hangFetch:true},{oversized:true}]) {
+        const f = fixture(options);
+        const result = await f.call({...sendConfig(),timeout_ms:5});
+        assert.ok(result.failure || result.status === 500);
+        assert.equal(f.requests.length,1);
+    }
+    const f = fixture({expired:true});
+    assert.equal((await f.call(sendConfig())).status,401);
+    assert.equal(f.requests.length,0);
+});
 
 test("archive move requires opt-in and exactly one versioned explicit-folder move", async () => {
     const body = {

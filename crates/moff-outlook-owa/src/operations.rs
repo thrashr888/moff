@@ -17,6 +17,101 @@ pub struct DraftInput {
     pub body: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SendMailInput {
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub cc: Vec<String>,
+    #[serde(default)]
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+}
+
+impl SendMailInput {
+    pub fn validate(&self) -> Result<(), OutlookWebError> {
+        let recipients: Vec<_> = self.to.iter().chain(&self.cc).chain(&self.bcc).collect();
+        if self.to.is_empty() || recipients.len() > 20 {
+            return Err(OutlookWebError::InvalidInput(
+                "send requires at least one To recipient and at most 20 total recipients",
+            ));
+        }
+        let mut seen = HashSet::new();
+        for address in recipients {
+            let valid = address.is_ascii()
+                && address.len() <= 254
+                && !address
+                    .bytes()
+                    .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+                && address.split_once('@').is_some_and(|(local, domain)| {
+                    !local.is_empty()
+                        && local.len() <= 64
+                        && !local.starts_with('.')
+                        && !local.ends_with('.')
+                        && !local.contains("..")
+                        && local.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || b".!#$%&'*+-/=?^_`{|}~".contains(&b)
+                        })
+                        && domain.contains('.')
+                        && domain.split('.').all(|label| {
+                            !label.is_empty()
+                                && label.len() <= 63
+                                && !label.starts_with('-')
+                                && !label.ends_with('-')
+                                && label
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                        })
+                });
+            if !valid || !seen.insert(address.to_ascii_lowercase()) {
+                return Err(OutlookWebError::InvalidInput(
+                    "send requires unique explicit SMTP addresses, not names, lists or duplicates",
+                ));
+            }
+        }
+        if self.subject.trim().is_empty()
+            || self.subject.len() > 998
+            || self
+                .subject
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+            || self.body.trim().is_empty()
+            || self.body.len() > 200_000
+            || self.body.contains('\0')
+        {
+            return Err(OutlookWebError::InvalidInput(
+                "send requires a nonempty single-line subject (max 998 bytes) and plain-text body (max 200000 bytes, no NUL)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn send_mail_request(input: &SendMailInput) -> Result<Value, OutlookWebError> {
+    input.validate()?;
+    let recipients = |addresses: &[String]| {
+        addresses
+            .iter()
+            .map(|address| {
+                json!({"__type":"EmailAddress:#Exchange","EmailAddress":address,"RoutingType":"SMTP"})
+            })
+            .collect::<Vec<_>>()
+    };
+    Ok(envelope(
+        "CreateItem",
+        json!({
+            "__type":"CreateItemRequest:#Exchange","MessageDisposition":"SendAndSaveCopy",
+            "Items":[{
+                "__type":"Message:#Exchange","Subject":input.subject,
+                "Body":{"__type":"BodyContentType:#Exchange","BodyType":"Text","Value":input.body},
+                "ToRecipients":recipients(&input.to),"CcRecipients":recipients(&input.cc),
+                "BccRecipients":recipients(&input.bcc)
+            }]
+        }),
+    ))
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventInput {
@@ -620,6 +715,32 @@ pub fn calendar_item_request(id: &str) -> Value {
 }
 
 impl OutlookWebSession {
+    pub fn send_mail(&self, input: &SendMailInput) -> Result<Value, OutlookWebError> {
+        let result = self.execute("CreateItem", &send_mail_request(input)?, true)?;
+        // SendAndSaveCopy need not return an item ID. Never invent delivery/read-back evidence.
+        let responses = result
+            .pointer("/Body/ResponseMessages/Items")
+            .and_then(Value::as_array)
+            .filter(|responses| responses.len() == 1)
+            .ok_or(OutlookWebError::OutcomeUnknown {
+                action: "CreateItem",
+            })?;
+        if responses[0]["ResponseCode"] != "NoError"
+            || responses[0]
+                .get("ResponseClass")
+                .is_some_and(|class| class != "Success")
+        {
+            return Err(OutlookWebError::OutcomeUnknown {
+                action: "CreateItem",
+            });
+        }
+        Ok(json!({
+            "status":"submission_acknowledged","acknowledged":true,
+            "delivery_verified":false,"sent_copy_verified":false,
+            "message_disposition":"SendAndSaveCopy"
+        }))
+    }
+
     pub fn get_batch(&self, ids: &[String], calendar: bool) -> Result<Value, OutlookWebError> {
         let response = self.call("GetItem", &batch_item_request(ids, calendar)?)?;
         let messages = response
@@ -1241,6 +1362,60 @@ impl OutlookWebSession {
 mod tests {
     use super::*;
     use crate::test_support::{message, mock};
+
+    fn send_input() -> SendMailInput {
+        SendMailInput {
+            to: vec!["recipient@example.com".into()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Synthetic".into(),
+            body: "Message".into(),
+        }
+    }
+
+    #[test]
+    fn send_acknowledges_submission_without_inventing_delivery_or_item_id() {
+        let (session, requests, worker) = mock(vec![(
+            "CreateItem",
+            json!({
+                "Body":{"ResponseMessages":{"Items":[{"ResponseCode":"NoError","ResponseClass":"Success","Items":[]}]}}
+            }),
+        )]);
+        let result = session.send_mail(&send_input()).unwrap();
+        assert_eq!(result["status"], "submission_acknowledged");
+        assert_eq!(result["acknowledged"], true);
+        assert_eq!(result["delivery_verified"], false);
+        assert_eq!(result["sent_copy_verified"], false);
+        assert!(result.get("sent").is_none());
+        worker.join().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn send_errors_and_partial_or_missing_acknowledgements_never_succeed_or_retry() {
+        for response in [
+            json!({}),
+            json!({"Body":{"ResponseCode":"NoError"}}),
+            json!({"WasSuccessful":true,"ErrorCode":0}),
+            json!({"Body":{"ResponseMessages":{"Items":[]}}}),
+            json!({"Body":{"ResponseMessages":{"Items":[{"ResponseCode":"ErrorAccessDenied","ResponseClass":"Error"}]}}}),
+            json!({"Body":{"ResponseMessages":{"Items":[{"ResponseCode":"NoError","ResponseClass":"Error"}]}}}),
+            json!({"Body":{"ResponseMessages":{"Items":[{"ResponseCode":"NoError"},{"ResponseCode":"ErrorInvalidRecipients"}]}}}),
+            json!({"Body":{"ResponseMessages":{"Items":[{"ResponseCode":"NoError"},{"ResponseCode":"NoError"}]}}}),
+            json!({"FaultMessage":"synthetic fault"}),
+        ] {
+            let (session, requests, worker) = mock(vec![("CreateItem", response)]);
+            assert!(session.send_mail(&send_input()).is_err());
+            worker.join().unwrap();
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+        let (session, requests, worker) = mock(vec![]);
+        let mut input = send_input();
+        input.to.clear();
+        assert!(session.send_mail(&input).is_err());
+        assert!(requests.lock().unwrap().is_empty());
+        worker.join().unwrap();
+    }
 
     #[test]
     fn default_calendar_is_resolved_before_view_and_explicit_ids_are_preserved() {
