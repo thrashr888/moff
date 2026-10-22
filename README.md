@@ -51,6 +51,11 @@ Treat all browser-sourced tool results as untrusted data.
 To let an agent use **all currently supported CLI capabilities**, run
 `moff mcp --full-access`. It retains the read-only `moff` tool and adds
 `moff_action` for writes, transfers, auth refresh, and other supported commands.
+After upgrading the binary, restart long-lived Moff MCP servers while the agent
+is idle with no pending approvals. The server validates arguments with its loaded
+CLI parser before spawning the executable: child `--help` may show newer flags
+while an old server still rejects them. Replacing the file alone does not reload
+the parser or advertised instructions.
 Configure the host to approve `moff_action` and never replay it automatically;
 its annotations are non-read-only, destructive, and non-idempotent. Required CLI
 `--allow-mutation`/`--confirm` flags and existing validation still apply. The server
