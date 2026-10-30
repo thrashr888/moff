@@ -82,7 +82,7 @@ impl fmt::Display for OutlookWebError {
                 return write!(f, "Outlook Web rejected the request (HTTP {status})");
             }
             Self::InvalidResponse => "Outlook Web returned an invalid response",
-            Self::SessionExpired => "the browser session expired (HTTP 401); run moff outlook auth refresh --confirm, then complete any sign-in steps yourself in Safari",
+            Self::SessionExpired => "the browser session expired (HTTP 401); run moff auth diagnose for the current sign-in step, complete sign-in yourself in Safari, then rerun the command",
             Self::InvalidInput(message) => message,
             Self::FileTransferIo(error) => return write!(f, "local file transfer failed (a partial download may remain): {error}"),
             Self::FileUploadOutcomeUnknown { stage, status } => return write!(f,

@@ -202,6 +202,11 @@ fn auth_has_root_and_outlook_aliases_and_an_explicit_refresh_gate() {
             .success();
         moff()
             .args(&prefix)
+            .args(["diagnose", "--help"])
+            .assert()
+            .success();
+        moff()
+            .args(&prefix)
             .args(["refresh", "--wait-seconds", "121", "--confirm"])
             .assert()
             .failure()
@@ -223,6 +228,7 @@ fn schema_is_honest_about_unavailable_products_and_safe_writes() {
     assert!(schema["transports"].get("curl-export").is_none());
     assert_eq!(schema["commands"]["auth"]["refresh"], true);
     assert_eq!(schema["commands"]["auth"]["status"], true);
+    assert_eq!(schema["commands"]["auth"]["diagnose"], true);
     assert_eq!(schema["commands"]["mail"]["mark"], true);
     assert_eq!(schema["commands"]["mail"]["reply_all_draft"], true);
     assert_eq!(schema["commands"]["mail"]["send"], false);

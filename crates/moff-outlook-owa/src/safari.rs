@@ -39,6 +39,26 @@ fn hosted_outlook(url: &Url) -> bool {
         if id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
 }
 
+fn sign_in_url(value: &str) -> bool {
+    Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && matches!(
+                url.host_str(),
+                Some(
+                    "login.microsoftonline.com"
+                        | "login.microsoft.com"
+                        | "login.live.com"
+                        | "login.w3.ibm.com"
+                        | "login.ibm.com"
+                        | "w3id.ibm.com"
+                )
+            )
+    })
+}
+
 async fn verify_host_runtime(
     tab: &safari::OpenTab,
     target: &DocumentTarget,
@@ -58,42 +78,139 @@ async fn verify_host_runtime(
     Ok(())
 }
 
+async fn diagnose_auth_tab(tab: &safari::OpenTab) -> Result<Value, OutlookWebError> {
+    let window = u32::try_from(tab.window).map_err(|_| OutlookWebError::SafariUnavailable)?;
+    let position = u32::try_from(tab.tab).map_err(|_| OutlookWebError::SafariUnavailable)?;
+    let host = Url::parse(&tab.url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_default();
+    let mut page = if outlook_url(&tab.url) {
+        match auth_status_for_tab(tab).await {
+            Ok(status) => {
+                let state = match status["status"].as_u64() {
+                    Some(200) => "authenticated",
+                    Some(401) => "outlook_session_expired",
+                    Some(422) => "outlook_auth_adapter_unavailable",
+                    Some(425) => "outlook_loading",
+                    _ => return Err(OutlookWebError::InvalidResponse),
+                };
+                json!({"state":state})
+            }
+            Err(_) => json!({
+                "state":"outlook_status_unavailable",
+                "next_step":"Inspect the Outlook tab and retry moff auth diagnose."
+            }),
+        }
+    } else {
+        match safari::document_target(tab_target(tab)?).await {
+            Ok(document) => {
+                let result = safari::eval_document(
+                    &format!("({})()", include_str!("safari_auth_diagnose.js")),
+                    &document,
+                    &eval_options(10),
+                )
+                .await;
+                match result {
+                    Ok(result) if !result.truncated => json!({
+                        "state":"sign_in_required",
+                        "step":result.value["step"]
+                    }),
+                    _ => json!({
+                        "state":"sign_in_inspection_unavailable",
+                        "next_step":"Review this sign-in page in Safari and complete its prompts yourself."
+                    }),
+                }
+            }
+            Err(_) => json!({
+                "state":"sign_in_inspection_unavailable",
+                "next_step":"Review this sign-in page in Safari and complete its prompts yourself."
+            }),
+        }
+    };
+    page["window"] = json!(window);
+    page["tab"] = json!(position);
+    page["host"] = json!(host);
+    Ok(page)
+}
+
 impl OutlookWebSession {
     /// Check browser authentication without refreshing or invoking interactive login.
     pub fn safari_auth_status(target: Option<(u32, u32)>) -> Result<Value, OutlookWebError> {
-        let session = Self::from_safari(target)?;
-        #[cfg(not(test))]
-        let SessionTransport::Safari(safari) = &session.transport;
-        #[cfg(test)]
-        let SessionTransport::Safari(safari) = &session.transport else {
-            return Err(OutlookWebError::SafariUnavailable);
-        };
-        let script = format!(
-            "(async function(){{const result=await {};return {{status:result.status,recovery_marker_present:sessionStorage.getItem('__moff_auth_recovery')!==null}};}})()",
-            page_script(
-                include_str!("safari_read.js"),
-                &json!({"action":"__MoffAuthStatus"})
-            )
-        );
-        let result = safari
-            .runtime
-            .block_on(safari::eval_document(
-                &script,
-                &safari.target,
-                &eval_options(30),
-            ))
-            .map_err(|_| OutlookWebError::SafariAuthRecoveryFailed("silent token acquisition"))?;
-        if result.truncated {
-            return Err(OutlookWebError::InvalidResponse);
-        }
-        match result.value["status"].as_u64() {
-            Some(200 | 401 | 422 | 425) => {
-                Ok(json!({"authenticated":result.value["status"] == 200,
-                "status":result.value["status"],"recovery_marker_present":result.value["recovery_marker_present"],
-                "credential_export":false}))
+        let runtime =
+            tokio::runtime::Runtime::new().map_err(|_| OutlookWebError::SafariOperationFailed)?;
+        runtime.block_on(async {
+            let tabs = safari::tabs()
+                .await
+                .map_err(|_| OutlookWebError::SafariOperationFailed)?;
+            let tab = selected_tab(&tabs, target)?;
+            auth_status_for_tab(tab).await
+        })
+    }
+
+    /// Inspect allowlisted sign-in pages without reading page text or form values.
+    pub fn safari_auth_diagnose(target: Option<(u32, u32)>) -> Result<Value, OutlookWebError> {
+        let runtime =
+            tokio::runtime::Runtime::new().map_err(|_| OutlookWebError::SafariOperationFailed)?;
+        runtime.block_on(async {
+            let tabs = safari::tabs()
+                .await
+                .map_err(|_| OutlookWebError::SafariOperationFailed)?;
+            let candidates: Vec<_> = tabs
+                .iter()
+                .filter(|tab| {
+                    (outlook_url(&tab.url) || sign_in_url(&tab.url))
+                        && target.is_none_or(|(window, position)| {
+                            tab.window == i64::from(window) && tab.tab == i64::from(position)
+                        })
+                })
+                .collect();
+            if candidates.is_empty() {
+                return Ok(json!({
+                    "state":"no_sign_in_tab",
+                    "next_step":"Open Outlook in Safari; if it redirects to sign-in, run moff auth diagnose again.",
+                    "credential_export":false,
+                    "page_content_read":false
+                }));
             }
-            _ => Err(OutlookWebError::InvalidResponse),
-        }
+
+            let mut pages = Vec::with_capacity(candidates.len());
+            for tab in candidates {
+                pages.push(diagnose_auth_tab(tab).await?);
+            }
+
+            let state = if pages.iter().any(|page| page["state"] == "authenticated") {
+                "authenticated"
+            } else if pages.iter().any(|page| page["state"] == "sign_in_required") {
+                "sign_in_required"
+            } else if pages.iter().any(|page| {
+                matches!(
+                    page["state"].as_str(),
+                    Some("outlook_session_expired" | "outlook_loading")
+                )
+            }) {
+                "needs_user_action"
+            } else {
+                "diagnosis_incomplete"
+            };
+            let next_step = match state {
+                "authenticated" => "Silent authentication is working; retry your Outlook command.",
+                "sign_in_required" => {
+                    "Complete the sign-in prompts yourself in Safari, then rerun moff auth status."
+                }
+                "needs_user_action" => {
+                    "Wait for Outlook to finish loading or complete any sign-in prompts yourself in Safari, then rerun moff auth status."
+                }
+                _ => "Inspect the Safari tabs and retry moff auth diagnose.",
+            };
+            Ok(json!({
+                "state":state,
+                "pages":pages,
+                "next_step":next_step,
+                "credential_export":false,
+                "page_content_read":false
+            }))
+        })
     }
 
     /// Explicitly reload Outlook and let browser SSO recover; never interact with login UI.
@@ -178,6 +295,35 @@ impl OutlookWebSession {
     /// Use a loaded Outlook tab without exporting browser credentials.
     pub fn from_safari(target: Option<(u32, u32)>) -> Result<Self, OutlookWebError> {
         Self::from_safari_with_mutations(target, false)
+    }
+}
+
+async fn auth_status_for_tab(tab: &safari::OpenTab) -> Result<Value, OutlookWebError> {
+    let target = safari::document_target(tab_target(tab)?)
+        .await
+        .map_err(|_| OutlookWebError::SafariBeforeDispatch)?;
+    verify_host_runtime(tab, &target).await?;
+    let script = format!(
+        "(async function(){{const result=await {};return {{status:result.status,recovery_marker_present:sessionStorage.getItem('__moff_auth_recovery')!==null}};}})()",
+        page_script(
+            include_str!("safari_read.js"),
+            &json!({"action":"__MoffAuthStatus"})
+        )
+    );
+    let result = safari::eval_document(&script, &target, &eval_options(30))
+        .await
+        .map_err(|_| OutlookWebError::SafariAuthRecoveryFailed("silent token acquisition"))?;
+    if result.truncated {
+        return Err(OutlookWebError::InvalidResponse);
+    }
+    match result.value["status"].as_u64() {
+        Some(200 | 401 | 422 | 425) => Ok(json!({
+            "authenticated":result.value["status"] == 200,
+            "status":result.value["status"],
+            "recovery_marker_present":result.value["recovery_marker_present"],
+            "credential_export":false
+        })),
+        _ => Err(OutlookWebError::InvalidResponse),
     }
 }
 
@@ -710,6 +856,26 @@ mod tests {
             "https://outlook.cloud.microsoft/host/4a6520d6-94a8-4730-9184-24997b9b3401/auth/other",
         ] {
             assert!(!outlook_url(url));
+        }
+    }
+
+    #[test]
+    fn sign_in_diagnosis_is_limited_to_known_https_identity_hosts() {
+        for url in [
+            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            "https://login.w3.ibm.com/authsvc/mtfim/sps/authsvc",
+            "https://w3id.ibm.com/",
+        ] {
+            assert!(sign_in_url(url));
+        }
+        for url in [
+            "http://login.microsoftonline.com/",
+            "https://login.microsoftonline.com.evil.example/",
+            "https://user@login.microsoftonline.com/",
+            "https://login.w3.ibm.com:8443/",
+            "https://attacker.example/",
+        ] {
+            assert!(!sign_in_url(url));
         }
     }
 

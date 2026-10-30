@@ -23,6 +23,7 @@ brew install thrashr888/tap/moff
 # Inspect the supported machine-readable surface.
 moff schema
 moff auth status
+moff auth diagnose
 moff auth refresh --confirm
 
 # List Inbox messages (the result includes opaque item IDs for `mail get`).
@@ -304,19 +305,28 @@ For an expired session, explicitly refresh the selected Outlook tab and let the
 browser reuse Microsoft SSO:
 
 ```sh
+moff auth diagnose
 moff auth refresh --confirm --wait-seconds 60
 moff auth status
 ```
 
-This reloads Outlook once, then checks silent authentication without reading mail.
+`moff auth diagnose` inspects existing Outlook and allowlisted Microsoft/IBM
+sign-in tabs. It reports a coarse step such as account selection, username,
+password, verification, or consent review, without returning page text, entered
+values, or credentials. Use it when Outlook redirects Safari away from Outlook
+and refresh/status cannot select the sign-in page.
+
+`moff auth refresh` reloads Outlook once, then checks silent authentication
+without reading mail.
 Complete any account-selection, password, consent, or 2FA steps yourself in Safari.
 It never clicks sign-in controls, approves MFA, or stores credentials. It returns
 `state: authenticated` only after silent token acquisition succeeds; otherwise
 `complete: false` and exit 2 mean recovery was not verified within the wait period.
 No failed mailbox operation is retried. Finish sign-in before rerunning it.
 Do not invoke refresh while entering credentials or editing an unsaved draft.
-Selection requires a loaded Outlook Mail/Calendar tab; a tab already on Microsoft's
-login page needs your intervention first. A non-secret, tab-scoped sessionStorage
+Refresh requires a loaded Outlook Mail/Calendar tab; if Safari is already on a
+sign-in page, use `moff auth diagnose` to inspect its safe, coarse-grained step.
+A non-secret, tab-scoped sessionStorage
 marker identifies the refreshed document across redirects/reordering in its original
 window; moving/closing the tab or clearing browser storage prevents verification.
 The marker is removed on success and otherwise expires when the tab closes.

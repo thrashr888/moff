@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const source = fs.readFileSync(require("node:path").join(__dirname, "../src/safari_read.js"), "utf8");
 const authSource = fs.readFileSync(require("node:path").join(__dirname, "../src/safari_auth.js"), "utf8");
+const authDiagnoseSource = fs.readFileSync(require("node:path").join(__dirname, "../src/safari_auth_diagnose.js"), "utf8");
 const responseSource = fs.readFileSync(require("node:path").join(__dirname, "../src/safari_response.js"), "utf8");
 
 function fixture(options = {}) {
@@ -71,6 +72,40 @@ test("SSO probe requires the recovery marker and exports only status, never cred
     }
     const f = fixture({marker:"recovery",changed:true});
     assert.equal((await f.call({action:"__MoffAuthStatus",recovery_marker:"recovery"})).status, 422);
+});
+
+test("sign-in diagnosis returns only an allowlisted step and never reads field values or page text", () => {
+    for (const [selectors, step] of [
+        [["#acceptButton"], "consent_review"],
+        [["#idDiv_SAOTCS_Proofs"], "verification_choice"],
+        [['input[autocomplete="one-time-code"], #idTxtBx_SAOTCC_OTC'], "verification_code"],
+        [['input[type="password"]'], "password"],
+        [["#tilesHolder .tile-container, #otherTile, [data-testid='account-tile']"], "account_selection"],
+        [['#i0116, input[name="loginfmt"], input[autocomplete="username"], input[type="email"]'], "username"],
+        [[], "sign_in_page"],
+    ]) {
+        const context = {
+            location: {origin:"https://login.microsoftonline.com"},
+            document: {
+                querySelectorAll: selector => selectors.includes(selector)
+                    ? [{
+                        hidden:false,
+                        getAttribute:() => null,
+                        getBoundingClientRect:() => ({width:100,height:20}),
+                        get value() { throw new Error("must not read field values"); },
+                        get textContent() { throw new Error("must not read page text"); },
+                    }]
+                    : [],
+            },
+        };
+        const diagnose = vm.runInNewContext(`(${authDiagnoseSource})`, context);
+        assert.deepEqual(JSON.parse(JSON.stringify(diagnose())), {step});
+    }
+    const unsupported = vm.runInNewContext(`(${authDiagnoseSource})`, {
+        location: {origin:"https://evil.example"},
+        document: {querySelectorAll:() => { throw new Error("must not inspect"); }},
+    });
+    assert.deepEqual(JSON.parse(JSON.stringify(unsupported())), {step:"unsupported_sign_in_page"});
 });
 
 test("standalone auth status is silent and failed mailbox requests are not retried", async () => {
