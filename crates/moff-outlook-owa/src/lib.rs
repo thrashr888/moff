@@ -1,13 +1,20 @@
 //! Outlook Mail and Calendar operations through Safari and the Cider library.
 #![allow(clippy::missing_errors_doc, clippy::must_use_candidate)]
+mod archive;
+mod mail_attachments;
+pub use mail_attachments::*;
+mod mail_actions;
+pub use mail_actions::{flag_request, mail_action_item_request, native_pin_state};
 mod contacts;
+pub use archive::*;
 mod operations;
 pub use contacts::validate_contact_input;
 mod loop_workspaces;
 mod products;
 pub use loop_workspaces::LoopWorkspaceRequest;
 pub use products::{
-    DEFAULT_MAX_FILE_BYTES, MAX_FILE_BYTES, ProductWrite, product_segment, validate_file_size,
+    DEFAULT_MAX_FILE_BYTES, MAX_FILE_BYTES, ProductWrite, drive_item_path, product_segment,
+    sharepoint_library_location, validate_file_size,
 };
 mod safari;
 mod scheduling;
@@ -24,10 +31,34 @@ const EXCHANGE_HEADER: &str = "JsonRequestHeaders:#Exchange";
 
 #[derive(Debug)]
 pub enum OutlookWebError {
+    SendOutcomeUnknown {
+        reason: &'static str,
+        http_status: Option<u16>,
+    },
+    AttachmentVerificationFailed {
+        field: &'static str,
+    },
+    AttachmentSendFailed {
+        draft_id: String,
+        stage: &'static str,
+        source: Box<OutlookWebError>,
+    },
     InvalidAction,
     RequestRejected(u16),
     InvalidResponse,
     SessionExpired,
+    OutlookNotReady,
+    AuthenticationAdapterChanged,
+    ReadTimedOut {
+        action: &'static str,
+    },
+    ReadNetworkFailed {
+        action: &'static str,
+    },
+    ResponseTooLarge,
+    SearchTimedOut {
+        scanned: usize,
+    },
     InvalidInput(&'static str),
     FileTransferIo(std::io::Error),
     FileUploadOutcomeUnknown {
@@ -77,12 +108,27 @@ pub enum ServiceCode {
 impl fmt::Display for OutlookWebError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::SendOutcomeUnknown { reason, http_status } => {
+                return write!(f, "the outcome of mail submission is unknown (reason: {reason}; HTTP status: {http_status:?}); no completion is established; inspect Drafts, Outbox and Sent Items; do not retry automatically");
+            }
+            Self::AttachmentVerificationFailed { field } => {
+                return write!(f, "attachment draft read-back mismatch: {field}; send was not attempted");
+            }
+            Self::AttachmentSendFailed { draft_id, stage, source } => {
+                return write!(f, "attachment email stopped at {stage}; draft ID {draft_id}; {source}. No automatic retry or cleanup; inspect Drafts, Outbox and Sent Items before taking further action");
+            }
             Self::InvalidAction => "the requested Outlook action is not a supported read operation",
             Self::RequestRejected(status) => {
                 return write!(f, "Outlook Web rejected the request (HTTP {status})");
             }
-            Self::InvalidResponse => "Outlook Web returned an invalid response",
-            Self::SessionExpired => "the browser session expired (HTTP 401); run moff auth diagnose for the current sign-in step, complete sign-in yourself in Safari, then rerun the command",
+            Self::InvalidResponse => "Outlook Web returned missing or invalid data; this is not an empty result, and does not establish that the session expired; check moff outlook auth status before refreshing",
+            Self::SessionExpired => "the browser session expired (HTTP 401); run moff outlook auth refresh --confirm, then complete any sign-in steps yourself in Safari",
+            Self::OutlookNotReady => "Outlook is not loaded; open the selected Safari tab, finish sign-in if prompted, and wait for Mail before retrying",
+            Self::AuthenticationAdapterChanged => "Outlook's authentication adapter no longer matches the page; Moff needs an adapter update, not repeated session refreshes",
+            Self::ReadTimedOut { action } => return write!(f, "Outlook {action} exceeded its browser request deadline; no complete data was read. A timeout does not establish that the session expired; check moff outlook auth status before refreshing"),
+            Self::ReadNetworkFailed { action } => return write!(f, "Outlook {action} failed at the network layer; no complete data was read. Check connectivity and moff outlook auth status; a network failure does not establish that the session expired"),
+            Self::ResponseTooLarge => "Outlook's response exceeded Moff's browser size limit; no complete data was read; reduce the batch size or narrow the range, rather than refreshing the session",
+            Self::SearchTimedOut { scanned } => return write!(f, "mail search exhausted its 40-second scan budget after checking {scanned} messages; the folder search is incomplete, not empty. No mailbox changes were made. Use mail list with --offset and bounded get-batch calls to continue; refreshing the session will not make a full-folder scan smaller"),
             Self::InvalidInput(message) => message,
             Self::FileTransferIo(error) => return write!(f, "local file transfer failed (a partial download may remain): {error}"),
             Self::FileUploadOutcomeUnknown { stage, status } => return write!(f,
@@ -140,6 +186,31 @@ impl fmt::Debug for OutlookWebSession {
 }
 
 impl OutlookWebSession {
+    fn search_call(
+        &self,
+        action: &'static str,
+        body: &Value,
+        deadline: std::time::Instant,
+        scanned: usize,
+    ) -> Result<Value, OutlookWebError> {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(OutlookWebError::SearchTimedOut { scanned });
+        }
+        let value = match &self.transport {
+            SessionTransport::Safari(session) => session.call_with_timeout(
+                action,
+                body,
+                false,
+                remaining.min(std::time::Duration::from_secs(25)),
+            ),
+            #[cfg(test)]
+            SessionTransport::Mock(session) => Ok(session.call(action, body)),
+        }?;
+        check_response(action, &value)?;
+        Ok(value)
+    }
+
     pub fn call(&self, action: &str, body: &Value) -> Result<Value, OutlookWebError> {
         let action = READ_ACTIONS
             .iter()
@@ -161,7 +232,15 @@ impl OutlookWebSession {
         };
         check_response(action, &value).map_err(|error| match error {
             OutlookWebError::InvalidResponse if mutation => {
-                OutlookWebError::OutcomeUnknown { action }
+                if action == "UpdateItem" && body["Body"]["MessageDisposition"] == "SendAndSaveCopy"
+                {
+                    OutlookWebError::SendOutcomeUnknown {
+                        reason: "service response lacks a recognized acknowledgement",
+                        http_status: None,
+                    }
+                } else {
+                    OutlookWebError::OutcomeUnknown { action }
+                }
             }
             other => other,
         })?;
@@ -181,9 +260,13 @@ pub fn decode_response(text: &str) -> Result<Value, OutlookWebError> {
     serde_json::from_str(payload).map_err(|_| OutlookWebError::InvalidResponse)
 }
 const READ_ACTIONS: &[&str] = &[
+    "GetAttachment",
+    "FindFolder",
+    "GetFolder",
     "FindItem",
     "FindConversation",
     "GetItem",
+    "GetAttachment",
     "GetConversationItems",
     "GetCalendarFolders",
     "GetCalendarFoldersV2",
@@ -253,16 +336,33 @@ fn header() -> Value {
     json!({"__type": EXCHANGE_HEADER, "RequestServerVersion":"V2018_01_08"})
 }
 pub fn find_item_request(limit: u16) -> Value {
-    json!({"Header":header(),"Body":{"__type":"FindItemRequest:#Exchange","Traversal":"Shallow","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"Default"},"ParentFolderIds":[{"__type":"DistinguishedFolderId:#Exchange","Id":"inbox"}],"Paging":{"__type":"IndexedPageView:#Exchange","BasePoint":"Beginning","Offset":0,"MaxEntriesReturned":limit}}})
+    json!({"Header":header(),"Body":{"__type":"FindItemRequest:#Exchange","Traversal":"Shallow","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"Default","AdditionalProperties":[
+        {"__type":"PropertyUri:#Exchange","FieldURI":"Flag"},
+        {"__type":"PropertyUri:#Exchange","FieldURI":"ConversationId"},
+        {"__type":"PropertyUri:#Exchange","FieldURI":"ReceivedOrRenewTime"},
+        {"__type":"PropertyUri:#Exchange","FieldURI":"DateTimeReceived"},
+        {"__type":"PropertyUri:#Exchange","FieldURI":"Preview"},
+        {"__type":"PropertyUri:#Exchange","FieldURI":"Sender"}
+        ,{"__type":"PropertyUri:#Exchange","FieldURI":"IsDraft"}
+    ]},"ParentFolderIds":[{"__type":"DistinguishedFolderId:#Exchange","Id":"inbox"}],"Paging":{"__type":"IndexedPageView:#Exchange","BasePoint":"Beginning","Offset":0,"MaxEntriesReturned":limit}}})
 }
 pub fn get_item_request(id: &str) -> Value {
     json!({"Header":header(),"Body":{"__type":"GetItemRequest:#Exchange","ItemShape":{"__type":"ItemResponseShape:#Exchange","BaseShape":"AllProperties","BodyType":"Text"},"ItemIds":[{"__type":"ItemId:#Exchange","Id":id}]}})
 }
+pub fn get_attachment_request(id: &str) -> Value {
+    json!({"Header":header(),"Body":{"__type":"GetAttachmentRequest:#Exchange","AttachmentShape":{"__type":"AttachmentResponseShape:#Exchange","BodyType":"Text"},"AttachmentIds":[{"__type":"AttachmentId:#Exchange","Id":id}]}})
+}
 pub fn calendar_folders_request() -> Value {
     json!({"ShouldReturnLinkedCalendarEntryV2":false,"IncludeOrganizationCalendars":false,"Header":header()})
 }
+/// `folder_id` is an opaque calendar folder ID, or `calendar` for the mailbox's default calendar.
 pub fn calendar_view_request(folder_id: &str, start: &str, end: &str) -> Value {
-    json!({"Header":header(),"Body":{"__type":"GetCalendarViewRequest:#Exchange","CalendarId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":{"__type":"FolderId:#Exchange","Id":folder_id}},"RangeStart":start,"RangeEnd":end}})
+    let folder = if folder_id == "calendar" {
+        json!({"__type":"DistinguishedFolderId:#Exchange","Id":"calendar"})
+    } else {
+        json!({"__type":"FolderId:#Exchange","Id":folder_id})
+    };
+    json!({"Header":header(),"Body":{"__type":"GetCalendarViewRequest:#Exchange","CalendarId":{"__type":"TargetFolderId:#Exchange","BaseFolderId":folder},"RangeStart":start,"RangeEnd":end}})
 }
 
 #[cfg(test)]

@@ -7,7 +7,11 @@ async function(response) {
             const part = await reader.read();
             if (part.done) break;
             bytes += part.value.length;
-            if (bytes > 900000) throw new Error("Response exceeds Moff's browser limit");
+            if (bytes > 900000) {
+                const error = new Error("Response exceeds Moff's browser limit");
+                error.code = "moff_response_too_large";
+                throw error;
+            }
             text += decoder.decode(part.value, {stream: true});
         }
         text += decoder.decode();

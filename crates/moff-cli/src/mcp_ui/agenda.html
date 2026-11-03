@@ -1,0 +1,49 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>/*STYLE*/
+h3 { margin: 10px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+h3:first-child { margin-top: 0; }
+.event { display: grid; grid-template-columns: 4px 72px 1fr; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--line); }
+.event:last-child { border-bottom: 0; }
+.bar { border-radius: 2px; background: var(--accent); }
+.bar.tentative { background: repeating-linear-gradient(180deg, var(--accent) 0 4px, transparent 4px 7px); }
+.bar.free { background: var(--line); }
+.when { font-variant-numeric: tabular-nums; }
+.title { font-weight: 600; }
+.cancelled .title { text-decoration: line-through; color: var(--muted); }
+</style></head>
+<body><div id="app" class="muted">Loading calendar…</div>
+<script>/*BRIDGE*/</script>
+<script>
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+function render(result, host) {
+  const app = document.getElementById("app");
+  const out = result.structuredContent ?? {};
+  if (!out.ok) { app.innerHTML = `<span class="error">${esc(out.error?.message || "No events")}</span>`; return; }
+  const events = (out.data?.events || []).filter((e) => e.start);
+  if (!events.length) { app.textContent = "Nothing on the calendar."; return; }
+  const today = new Date().toDateString();
+  const byDay = new Map();
+  for (const e of events) {
+    // All-day events carry midnight UTC; show them on their calendar date.
+    const d = e.is_all_day ? new Date(e.start.slice(0, 10) + "T12:00:00") : new Date(e.start);
+    const key = d.toDateString();
+    if (!byDay.has(key)) byDay.set(key, []);
+    byDay.get(key).push(e);
+  }
+  const fmt = (iso) => new Date(iso).toLocaleTimeString(host.locale, { hour: "numeric", minute: "2-digit" });
+  let html = "";
+  for (const [key, list] of byDay) {
+    const d = new Date(key);
+    html += `<h3>${key === today ? "Today" : d.toLocaleDateString(host.locale, { weekday: "long", month: "short", day: "numeric" })}</h3>`;
+    html += list.map((e) => {
+      const status = /free/i.test(e.show_as || "") ? "free" : /tentative/i.test(e.show_as || "") ? "tentative" : "";
+      return `<div class="event ${e.is_cancelled ? "cancelled" : ""}"><div class="bar ${status}"></div>
+      <div class="when muted">${e.is_all_day ? "All day" : fmt(e.start) + (e.end ? `<br>${fmt(e.end)}` : "")}</div>
+      <div><div class="title">${esc(e.subject || "(no title)")}</div>
+      <div class="muted">${esc([e.location, e.is_meeting && !e.is_organizer ? e.organizer : ""].filter(Boolean).join(" · "))}</div></div></div>`;
+    }).join("");
+  }
+  app.className = ""; app.innerHTML = html;
+}
+</script></body></html>

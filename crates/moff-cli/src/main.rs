@@ -8,11 +8,15 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use moff_outlook_owa::{
     DEFAULT_MAX_FILE_BYTES, DraftInput, EventInput, EventMoveInput, LoopWorkspaceRequest,
-    MeetingResponseInput, OutlookWebError, OutlookWebSession, ProductWrite, ReplyInput, WorkInput,
-    WorkPlan, calendar_folders_request, calendar_view_request, product_segment,
-    validate_contact_input, validate_file_size, validate_read_action,
+    MeetingResponseInput, OutlookWebError, OutlookWebSession, ProductWrite, ReplyInput,
+    SendMailInput, WorkInput, WorkPlan, calendar_folders_request, calendar_view_request,
+    load_mail_attachments, product_segment, validate_contact_input, validate_file_size,
+    validate_read_action,
 };
 use serde_json::{Value, json};
+mod archive_mcp;
+mod mcp;
+mod native_mcp;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -27,6 +31,25 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Serve CLI operations over MCP; read-only unless --full-access.
+    Mcp {
+        /// Add a separately approval-gated tool for every supported CLI operation.
+        #[arg(long)]
+        full_access: bool,
+    },
+    /// Serve native Outlook tools and MCP Apps cards; read-only unless --mail-actions.
+    McpNative {
+        #[command(flatten)]
+        session: SessionArgs,
+        /// Expose typed flag, native pin, and preview-gated archive actions to the host.
+        #[arg(long)]
+        mail_actions: bool,
+    },
+    /// Serve archive discovery, preview, and approval-gated archive tools (stdio).
+    McpArchive {
+        #[command(flatten)]
+        session: SessionArgs,
+    },
     /// Native Loop and drive-backed Loop file operations in the signed-in Outlook tab.
     Loop {
         #[command(flatten)]
@@ -55,7 +78,7 @@ struct SessionArgs {
     _safari: bool,
     #[arg(
         long,
-        help = "Permit typed non-sending Safari writes; each write also requires --confirm"
+        help = "Permit typed Safari writes, including explicit mail sending; each write also requires --confirm"
     )]
     allow_mutation: bool,
     #[arg(long, requires = "safari_tab", value_parser = clap::value_parser!(u32).range(1..))]
@@ -121,6 +144,30 @@ enum AuthCommand {
 
 #[derive(Debug, Subcommand)]
 enum MailCommand {
+    /// Submit new plain-text mail from the selected Outlook account; acknowledgement is not delivery.
+    #[command(
+        after_help = "Example: moff outlook --allow-mutation mail send --to recipient@example.com --subject 'Subject' --body 'Message' --attachment /absolute/path/avatar.png --confirm\nRequires host approval through moff_action for exact files and recipients. Repeat --to/--cc/--bcc for exact addresses (20 total max). Repeat --attachment for up to 5 regular non-symlink files, 500000 bytes combined, subject to a 1000000-byte serialized browser script limit. Attachments create/verify a draft then send it; failures may leave a draft or uncertain submission. To recover a separately authorized known unsent draft, add --resume-draft ID with all exact recipients/content/files: reverify before sending, no new draft. Reconcile prior uncertain sends before approval. No custom sender, HTML, arbitrary draft sending or automatic retries."
+    )]
+    Send {
+        #[arg(long, required = true)]
+        to: Vec<String>,
+        #[arg(long)]
+        cc: Vec<String>,
+        #[arg(long)]
+        bcc: Vec<String>,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        body: String,
+        /// Local regular file to attach; repeat for up to 5 files (500000 bytes combined).
+        #[arg(long)]
+        attachment: Vec<PathBuf>,
+        /// Reverify and submit this existing unsent attachment draft; creates no new draft.
+        #[arg(long, requires = "attachment")]
+        resume_draft: Option<String>,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
     /// Set read state explicitly; reply drafts restore Outlook's automatic read side effect.
     Mark {
         #[arg(long)]
@@ -177,6 +224,9 @@ enum MailCommand {
         limit: u16,
         #[arg(long, default_value = "inbox")]
         folder: String,
+        /// Continue from `next_offset` returned by the previous search page.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
     },
     /// Create an unsent draft from JSON containing optional subject and body strings.
     Create {
@@ -380,6 +430,29 @@ enum OrgCommand {
 
 #[derive(Debug, Subcommand)]
 enum OneDriveCommand {
+    /// Grant one named recipient signed-in, view-only access to an existing file.
+    Share {
+        #[arg(long)]
+        id: String,
+        /// Owning drive ID from file metadata; omit for your own `OneDrive`.
+        #[arg(long)]
+        drive_id: Option<String>,
+        /// Exact email address resolved from people/contacts; never guess.
+        #[arg(long)]
+        email: String,
+        /// Ask Microsoft to send its sharing invitation (delivery is not verified).
+        #[arg(long)]
+        notify: bool,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Inspect existing file permissions without changing access.
+    Permissions {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        drive_id: Option<String>,
+    },
     #[command(flatten)]
     Manage(ManagementCommand),
     List {
@@ -391,6 +464,9 @@ enum OneDriveCommand {
     Get {
         #[arg(long)]
         id: String,
+        /// Owning drive ID for a `SharePoint` or another accessible drive item.
+        #[arg(long, conflicts_with = "output")]
+        drive_id: Option<String>,
         /// Stream a file to a new local path; never overwrite an existing file.
         #[arg(long)]
         output: Option<PathBuf>,
@@ -558,6 +634,9 @@ enum ManagementCommand {
     Search {
         #[arg(long)]
         query: String,
+        /// Scope `OneDrive` search to this `SharePoint` library root or shared-library URL.
+        #[arg(long)]
+        library_url: Option<String>,
         #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
     },
@@ -597,6 +676,14 @@ fn print_json(value: &Value) {
 fn schema() -> Value {
     json!({
         "schema":moff_core::SCHEMA_VERSION,"provider":"browser-session","default_transport":"safari",
+        "mcp":{"command":"moff mcp","transport":"stdio","read_only":true,"tool":"moff"},
+        "full_access_mcp":{"command":"moff mcp --full-access","transport":"stdio",
+            "tools":["moff","moff_action"],"requires_host_approval":true,
+            "scope":"all supported CLI commands; no additional backend capabilities implied"},
+        "archive_mcp":{"command":"moff mcp-archive","transport":"stdio","requires_host_approval":true,
+            "tools":["mail_archive_folders","mail_archive_preview","mail_archive"],
+            "batch_max":20,"delete":false,"send":false},
+        "command_prefixes":{"auth":["auth"],"default":["outlook"]},
         "transports":{"safari":{"experimental":true,"mutations":true,"delete":true,
             "mutation_gate":"--allow-mutation and --confirm",
             "products":["mail","calendar","people","org","onedrive","groups","loop"],
@@ -607,22 +694,39 @@ fn schema() -> Value {
                 "confirmation":"--confirm","wait_seconds_max":120}}},
         "commands":{
             "auth":{"refresh":true,"status":true,"diagnose":true},
-            "mail":{"list":true,"search":true,"get":true,"get-batch":true,"categories":true,"reply-draft":true,"reply_all_draft":true,"mark":true,"create":true,"update":true,"delete":true,"send":false},
+            "mail":{"list":true,"search":true,"get":true,"get-batch":true,"categories":true,"reply-draft":true,"reply_all_draft":true,"mark":true,"create":true,"update":true,"delete":true,"send":true},
             "calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"get-batch":true,"availability":true,"work-blocks":{"plan":true,"apply":true},"create":true,"update":true,"delete":true,"respond":true,"move":true,"cancel":true},
             "people":{"list":true,"search":true,"get":true,"contacts":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true}},
             "org":{"list":true,"get":true,"search":true,"manager":true,"reports":true,"create":false,"update":false,"delete":false},
-            "onedrive":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true,"upload":true,"download":true},
+            "onedrive":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true,"upload":true,"download":true,"share":true,"permissions":true},
             "groups":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true,"members":true,"add-member":true,"remove-member":true},
             "loop":{"create":false,"get":true,"update":true,"delete":true,"list":true,"search":true,"content_editing":false,
                 "workspace":{"list":true,"get":true,"create":true,"delete":true,"search":true,"update":false,"title":false,"id":"base64 ODSP PodId","delete_policy":"permanent; verified current-user Owner required","list_scope":"recent workspaces only"}},
             "service":{"read":true}},
+        "mail_send":{"command":"moff outlook --allow-mutation mail send --to recipient@example.com --subject Subject --body Message --confirm",
+            "transport":"selected authenticated Outlook tab; text-only CreateItem SendAndSaveCopy; attachments CreateItem SaveOnly/read-back/UpdateItem SendAndSaveCopy",
+            "requires":["explicit SMTP recipients","nonempty subject","nonempty plain-text body","--allow-mutation","--confirm","host approval for moff_action"],
+            "recipient_flags":["--to","--cc","--bcc"],"max_recipients":20,"max_subject_bytes":998,"max_body_bytes":200_000,
+            "sender":"selected Outlook account; no override","attachments":true,"html":false,
+            "attachment_flag":"--attachment","max_attachments":5,"max_attachment_bytes_combined":500_000,
+            "attachment_source":"regular non-symlink local files; snapshotted before first write; duplicate names rejected",
+            "attachment_transport":"CreateItem SaveOnly with FileAttachments; verify draft/bytes; versioned UpdateItem SendAndSaveCopy; no overwrite/recreation",
+            "max_serialized_browser_script_bytes":1_000_000,"attachment_failure":"no retries/cleanup; draft ID and stage reported when known",
+            "send_existing_draft":"--resume-draft ID with exact recipients/subject/body/local attachments; reverify unsent state and bytes; explicit approval required",
+            "reply_send":false,"automatic_retry":false,
+            "verification":"single successful OWA response acknowledges submission only; delivery and sent copy are not verified",
+            "live_send_validated":true,
+            "live_validation_scope":"one user-authorized attachment submission via verified existing draft; same message/content/attachment observed in Sent Items; selected account sender; delivery not verified",
+            "text_only_live_send_validated":false},
         "unimplemented_products":[],
         "full_product_management":false,
         "product_reads":{"methods":["GET"],"max_page_size":100,"follow_next_links":"metadata search only, maximum 100 pages",
+            "onedrive_search_scope":"personal drive by default; --library-url resolves a SharePoint library and searches its descendants; use returned owning drive_id for reads/sharing",
             "loop_scope":"native workspace metadata through Substrate; legacy drive-backed .loop file metadata, rename and recycle","interactive_consent":false},
         "product_writes":{"methods":["POST","PATCH","DELETE","PUT"],"requires":"--allow-mutation and --confirm plus browser delegated permissions",
             "contacts_scope":"personal default contacts folder through OWA; supplied fields are read-back verified",
-            "onedrive_scope":"folder/file creation, bounded binary transfers, rename/description/move and recycle of existing items",
+            "onedrive_scope":"folder/file creation, bounded binary transfers, rename/description/move, recycle and named-recipient file sharing",
+            "onedrive_sharing":{"roles":["read"],"require_sign_in":true,"recipients_per_call":1,"public_links":false,"notification":"opt-in; delivery not verified","verification":"read back the returned permission ID and read role","drive_id":"optional owning drive for SharePoint files"},
             "max_file_bytes":250_000_000,"default_max_file_bytes":DEFAULT_MAX_FILE_BYTES,
             "transfer_chunk_bytes":128_000,"upload_service_chunk_bytes":3_276_800,"transfer_limit_flag":"--max-bytes",
             "groups_scope":"Microsoft 365 groups; update/delete require verified ownership",
@@ -824,6 +928,55 @@ fn search_pages_with(
     Err("product search exceeded 100 pages; narrow the query instead of treating incomplete data as empty".to_owned())
 }
 
+fn library_search_with(
+    library: &str,
+    query: &str,
+    limit: u16,
+    mut read: impl FnMut(&str) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let (site_path, library_url) =
+        moff_outlook_owa::sharepoint_library_location(library).map_err(|e| e.to_string())?;
+    let site = read(&site_path)?;
+    let site_id = product_segment(site["id"].as_str().ok_or("site returned no ID")?)
+        .map_err(|e| e.to_string())?;
+    let drives = search_pages_with(
+        &format!("/v1.0/sites/{site_id}/drives?$top=100"),
+        &library_url,
+        100,
+        false,
+        &mut read,
+    )?;
+    let candidates: Vec<_> = drives["value"]
+        .as_array()
+        .ok_or("invalid library list")?
+        .iter()
+        .filter(|drive| {
+            drive["webUrl"]
+                .as_str()
+                .is_some_and(|value| value.trim_end_matches('/') == library_url)
+        })
+        .collect();
+    if drives["search"]["has_more"] == true || candidates.len() != 1 {
+        return Err(
+            "could not resolve exactly one accessible library; no search performed".to_owned(),
+        );
+    }
+    let drive_id = candidates[0]["id"]
+        .as_str()
+        .ok_or("library returned no drive ID")?;
+    let path = format!(
+        "/v1.0/drives/{}/root/search(q='{}')?$top={limit}",
+        product_segment(drive_id).map_err(|e| e.to_string())?,
+        encode_segment(&query.replace('\'', "''"))
+    );
+    let mut value = search_pages_with(&path, query, limit, false, read)?;
+    value["search"]["library_url"] = json!(library_url);
+    value["search"]["drive_id"] = json!(drive_id);
+    value["search"]["scope"] =
+        json!("selected SharePoint library, including descendants; Graph filename/content search");
+    Ok(value)
+}
+
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 fn management_result(
     args: SessionArgs,
@@ -831,9 +984,25 @@ fn management_result(
     command: ManagementCommand,
 ) -> Result<(&'static str, Value), String> {
     let fail = |e: OutlookWebError| e.to_string();
-    if let ManagementCommand::Search { query, limit } = command {
+    if let ManagementCommand::Search {
+        query,
+        limit,
+        library_url,
+    } = command
+    {
         if query.trim().is_empty() {
             return Err("search query must not be empty".to_owned());
+        }
+        if let Some(library) = library_url {
+            if product != "onedrive" {
+                return Err("--library-url is only supported for OneDrive search".to_owned());
+            }
+            moff_outlook_owa::sharepoint_library_location(&library).map_err(|e| e.to_string())?;
+            let session = session(args)?;
+            let value = library_search_with(&library, &query, limit, |path| {
+                session.product_read(path).map_err(|e| e.to_string())
+            })?;
+            return Ok(("search", value));
         }
         if product == "contacts" {
             return Ok((
@@ -1290,6 +1459,7 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
         matches!(
             command,
             MailCommand::Create { .. }
+                | MailCommand::Send { .. }
                 | MailCommand::Update { .. }
                 | MailCommand::Delete { .. }
                 | MailCommand::Categories { .. }
@@ -1298,6 +1468,45 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
         ),
     )?;
     match command {
+        MailCommand::Send {
+            to,
+            cc,
+            bcc,
+            subject,
+            body,
+            attachment,
+            resume_draft,
+            confirm,
+        } => {
+            if !confirm {
+                return Err("mutations require --confirm".into());
+            }
+            let input = SendMailInput {
+                to,
+                cc,
+                bcc,
+                subject,
+                body,
+            };
+            input.validate().map_err(|error| error.to_string())?;
+            let files = if attachment.is_empty() {
+                Vec::new()
+            } else {
+                load_mail_attachments(&attachment).map_err(|error| error.to_string())?
+            };
+            Ok((
+                "outlook.mail.send",
+                with_owa(args, |s| {
+                    if let Some(id) = resume_draft {
+                        s.resume_attachment_mail(&id, &input, &files)
+                    } else if files.is_empty() {
+                        s.send_mail(&input)
+                    } else {
+                        s.send_mail_with_attachments(&input, &files)
+                    }
+                })?,
+            ))
+        }
         MailCommand::Mark {
             id,
             read,
@@ -1361,9 +1570,10 @@ fn mail_result(args: SessionArgs, command: MailCommand) -> Result<(&'static str,
             folder,
             query,
             limit,
+            offset,
         } => Ok((
             "outlook.mail.search",
-            with_owa(args, |s| s.mail_search(&folder, &query, limit))?,
+            with_owa(args, |s| s.mail_search_page(&folder, &query, limit, offset))?,
         )),
         MailCommand::Create { body_file, confirm } => {
             let input: DraftInput = serde_json::from_value(confirmed_json(&body_file, confirm)?)
@@ -1578,6 +1788,29 @@ fn calendar_result(
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Some(Command::Mcp { full_access }) => mcp::serve(full_access),
+        Some(Command::McpNative {
+            session,
+            mail_actions,
+        }) => {
+            if session.allow_mutation {
+                eprintln!(
+                    "Native MCP rejects --allow-mutation; use the scoped --mail-actions opt-in"
+                );
+                return ExitCode::FAILURE;
+            }
+            match native_mcp::serve_stdio(
+                session.safari_window.zip(session.safari_tab),
+                mail_actions,
+            ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("MCP server failed: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some(Command::McpArchive { session }) => mcp::serve_archive(session),
         Some(
             Command::Loop {
                 session: args,
@@ -1767,6 +2000,50 @@ fn main() -> ExitCode {
         Some(Command::Outlook {
             session: args,
             command:
+                OutlookCommand::Onedrive {
+                    command:
+                        OneDriveCommand::Share {
+                            id,
+                            drive_id,
+                            email,
+                            notify,
+                            confirm,
+                        },
+                },
+        }) => {
+            let result = (|| {
+                safari_write_guard(&args, confirm)?;
+                ProductWrite::drive_share(drive_id.as_deref(), &id, &email, notify)
+                    .map_err(|e| e.to_string())?;
+                session(args)?
+                    .drive_share(drive_id.as_deref(), &id, &email, notify)
+                    .map_err(|e| e.to_string())
+            })();
+            match result {
+                Ok(value) => {
+                    output("outlook.onedrive.share", &value);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => error(e),
+            }
+        }
+        Some(Command::Outlook {
+            session: args,
+            command:
+                OutlookCommand::Onedrive {
+                    command: OneDriveCommand::Permissions { id, drive_id },
+                },
+        }) => match moff_outlook_owa::drive_item_path(drive_id.as_deref(), &id) {
+            Ok(path) => run_product_read(
+                args,
+                "outlook.onedrive.permissions",
+                format!("{path}/permissions"),
+            ),
+            Err(e) => error(e),
+        },
+        Some(Command::Outlook {
+            session: args,
+            command:
                 OutlookCommand::Groups {
                     command: GroupsCommand::Manage(command),
                 },
@@ -1777,7 +2054,15 @@ fn main() -> ExitCode {
                 OutlookCommand::Loop {
                     command: LoopCommand::Search { query, limit },
                 },
-        }) => run_management(args, "loop", ManagementCommand::Search { query, limit }),
+        }) => run_management(
+            args,
+            "loop",
+            ManagementCommand::Search {
+                query,
+                limit,
+                library_url: None,
+            },
+        ),
         Some(Command::Outlook {
             session: args,
             command:
@@ -1884,7 +2169,15 @@ fn main() -> ExitCode {
                             query: Some(query),
                         },
                 },
-        }) => run_management(args, "people", ManagementCommand::Search { query, limit }),
+        }) => run_management(
+            args,
+            "people",
+            ManagementCommand::Search {
+                query,
+                limit,
+                library_url: None,
+            },
+        ),
         Some(Command::Outlook {
             session: args,
             command:
@@ -1957,7 +2250,15 @@ fn main() -> ExitCode {
                 OutlookCommand::Org {
                     command: OrgCommand::Search { query, limit },
                 },
-        }) => run_management(args, "org", ManagementCommand::Search { query, limit }),
+        }) => run_management(
+            args,
+            "org",
+            ManagementCommand::Search {
+                query,
+                limit,
+                library_url: None,
+            },
+        ),
         Some(Command::Outlook {
             session: args,
             command:
@@ -2027,6 +2328,7 @@ fn main() -> ExitCode {
                             id,
                             output: Some(path),
                             max_bytes,
+                            ..
                         },
                 },
         }) => download_file(args, &id, &path, max_bytes),
@@ -2036,13 +2338,19 @@ fn main() -> ExitCode {
                 OutlookCommand::Onedrive {
                     command:
                         OneDriveCommand::Get {
-                            id, output: None, ..
+                            id,
+                            drive_id,
+                            output: None,
+                            ..
                         },
                 },
         }) => match graph_result(
             args,
             "outlook.onedrive.get",
-            format!("/v1.0/me/drive/items/{}", encode_segment(&id)),
+            match moff_outlook_owa::drive_item_path(drive_id.as_deref(), &id) {
+                Ok(path) => path,
+                Err(e) => return error(e),
+            },
             false,
         ) {
             Ok((command, value)) => {
@@ -2117,6 +2425,61 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod management_tests {
     use super::*;
+
+    #[test]
+    fn library_search_uses_the_resolved_drive_and_preserves_scope_and_paging() {
+        let library = "https://example.sharepoint.com/sites/PROJ-Example/Shared%20Documents";
+        let mut paths = Vec::new();
+        let result = library_search_with(library, "pipeline", 1, |path| {
+            paths.push(path.to_owned());
+            Ok(match paths.len() {
+                1 => json!({"id":"site-id"}),
+                2 => json!({"value":[{"id":"drive-id","webUrl":library}]}),
+                _ => json!({"value":[{"id":"pdf","name":"pipeline.pdf","parentReference":{"driveId":"drive-id"}}],
+                    "@odata.nextLink":"https://graph.microsoft.com/v1.0/drives/drive-id/root/search(q='pipeline')?$skip=1"}),
+            })
+        }).unwrap();
+        assert_eq!(
+            paths[0],
+            "/v1.0/sites/example.sharepoint.com:/sites/PROJ-Example"
+        );
+        assert_eq!(paths[1], "/v1.0/sites/site-id/drives?$top=100");
+        assert_eq!(
+            paths[2],
+            "/v1.0/drives/drive-id/root/search(q='pipeline')?$top=1"
+        );
+        assert_eq!(result["search"]["drive_id"], "drive-id");
+        assert_eq!(result["search"]["library_url"], library);
+        assert_eq!(result["search"]["has_more"], true);
+        assert_eq!(result["value"][0]["id"], "pdf");
+    }
+
+    #[test]
+    fn library_search_never_falls_back_when_library_resolution_fails() {
+        let library = "https://example.sharepoint.com/sites/PROJ-Example/Shared%20Documents";
+        for drives in [
+            json!([]),
+            json!([{"id":"a","webUrl":library},{"id":"b","webUrl":library}]),
+        ] {
+            let mut reads = 0;
+            assert!(
+                library_search_with(library, "pipeline", 5, |_| {
+                    reads += 1;
+                    assert!(reads <= 2, "must not search an unresolved drive");
+                    Ok(if reads == 1 {
+                        json!({"id":"site"})
+                    } else {
+                        json!({"value":drives})
+                    })
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            library_search_with(library, "pipeline", 5, |_| Err("access denied".to_owned()))
+                .is_err()
+        );
+    }
 
     #[test]
     fn metadata_search_follows_sparse_pages_and_reports_truncation() {

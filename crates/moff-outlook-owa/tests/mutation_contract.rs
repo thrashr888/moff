@@ -1,11 +1,130 @@
 use moff_outlook_owa::{
     DraftInput, EventInput, EventMoveInput, MeetingResponse, MeetingResponseInput, ReplyInput,
-    batch_item_request, cancel_meeting_request, categories_request, create_draft_request,
-    create_event_request, delete_event_request, delete_message_request, move_event_request,
-    reply_draft_request, respond_event_request, search_item_request, update_draft_request,
-    update_event_request, validate_read_action,
+    SendMailInput, batch_item_request, cancel_meeting_request, categories_request,
+    create_draft_request, create_event_request, delete_event_request, delete_message_request,
+    move_event_request, reply_draft_request, respond_event_request, search_item_request,
+    send_mail_request, update_draft_request, update_event_request, validate_read_action,
 };
 use serde_json::json;
+
+fn send_input() -> SendMailInput {
+    SendMailInput {
+        to: vec!["to@example.com".into()],
+        cc: vec!["cc@example.com".into()],
+        bcc: vec!["bcc@example.com".into()],
+        subject: "Synthetic send contract".into(),
+        body: "<literal text>\nSecond line".into(),
+    }
+}
+
+#[test]
+fn send_builds_one_explicit_plain_text_message_without_sender_or_attachments() {
+    let request = send_mail_request(&send_input()).unwrap();
+    assert_eq!(request["__type"], "CreateItemJsonRequest:#Exchange");
+    assert_eq!(request["Body"]["MessageDisposition"], "SendAndSaveCopy");
+    let items = request["Body"]["Items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["__type"], "Message:#Exchange");
+    assert_eq!(items[0]["Subject"], "Synthetic send contract");
+    assert_eq!(
+        items[0]["Body"],
+        json!({
+            "__type":"BodyContentType:#Exchange","BodyType":"Text","Value":"<literal text>\nSecond line"
+        })
+    );
+    for (key, address) in [
+        ("ToRecipients", "to@example.com"),
+        ("CcRecipients", "cc@example.com"),
+        ("BccRecipients", "bcc@example.com"),
+    ] {
+        assert_eq!(
+            items[0][key],
+            json!([{
+                "__type":"EmailAddress:#Exchange","EmailAddress":address,"RoutingType":"SMTP"
+            }])
+        );
+    }
+    for key in ["From", "Sender", "Attachments", "ReferenceItemId", "ItemId"] {
+        assert!(items[0].get(key).is_none());
+    }
+}
+
+#[test]
+fn send_rejects_implicit_recipients_header_injection_spoofing_and_attachments() {
+    for address in [
+        "",
+        "Sarah",
+        "Sarah <a@example.com>",
+        "a@example.com,b@example.com",
+        "a@example.com;b@example.com",
+        "a@example.com\nBcc:b@example.com",
+        "a@@example.com",
+        "a@localhost",
+        ".a@example.com",
+        "a..b@example.com",
+        "a@-example.com",
+        "a@example..com",
+        " a@example.com",
+        "ü@example.com",
+    ] {
+        let mut input = send_input();
+        input.to = vec![address.into()];
+        assert!(send_mail_request(&input).is_err(), "{address:?}");
+    }
+    let mut input = send_input();
+    input.to.clear();
+    assert!(send_mail_request(&input).is_err());
+    input = send_input();
+    input.cc.push("TO@example.com".into());
+    assert!(send_mail_request(&input).is_err());
+    input = send_input();
+    input.to = (0..21).map(|n| format!("person{n}@example.com")).collect();
+    assert!(send_mail_request(&input).is_err());
+    for subject in [
+        "",
+        " ",
+        "Subject\r\nBcc: other@example.com",
+        "Subject\u{2028}another line",
+        "Subject\u{2029}another paragraph",
+        &"x".repeat(999),
+    ] {
+        let mut input = send_input();
+        input.subject = subject.into();
+        assert!(send_mail_request(&input).is_err());
+    }
+    for body in ["", " \n", "text\0", &"x".repeat(200_001)] {
+        let mut input = send_input();
+        input.body = body.into();
+        assert!(send_mail_request(&input).is_err());
+    }
+    for field in ["attachments", "from", "sender", "html", "draft_id"] {
+        let mut input = serde_json::to_value(send_input()).unwrap();
+        input[field] = json!("unsupported");
+        assert!(serde_json::from_value::<SendMailInput>(input).is_err());
+    }
+    for field in ["to", "subject", "body"] {
+        let mut input = serde_json::to_value(send_input()).unwrap();
+        input.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<SendMailInput>(input).is_err());
+    }
+}
+
+#[test]
+fn send_bounds_are_bytes_and_recipients_are_bounded_across_all_lists() {
+    let mut input = send_input();
+    input.to = (0..18).map(|n| format!("person{n}@example.com")).collect();
+    input.subject = "é".repeat(499);
+    input.body = "é".repeat(100_000);
+    assert!(send_mail_request(&input).is_ok());
+    input.bcc.push("extra@example.com".into());
+    assert!(send_mail_request(&input).is_err());
+    input.bcc.pop();
+    input.subject.push('é');
+    assert!(send_mail_request(&input).is_err());
+    input.subject = "Valid".into();
+    input.body.push('é');
+    assert!(send_mail_request(&input).is_err());
+}
 
 #[test]
 fn draft_writes_use_observed_exchange_envelopes_and_never_send() {

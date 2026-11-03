@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, FixedOffset, SecondsFormat};
 use serde::{Deserialize, Serialize};
@@ -6,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::{
     OutlookWebError, OutlookWebSession, ServiceCode, calendar_view_request, find_item_request,
-    get_item_request, header,
+    get_attachment_request, get_item_request, header,
 };
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -14,6 +15,101 @@ use crate::{
 pub struct DraftInput {
     pub subject: Option<String>,
     pub body: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SendMailInput {
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub cc: Vec<String>,
+    #[serde(default)]
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+}
+
+impl SendMailInput {
+    pub fn validate(&self) -> Result<(), OutlookWebError> {
+        let recipients: Vec<_> = self.to.iter().chain(&self.cc).chain(&self.bcc).collect();
+        if self.to.is_empty() || recipients.len() > 20 {
+            return Err(OutlookWebError::InvalidInput(
+                "send requires at least one To recipient and at most 20 total recipients",
+            ));
+        }
+        let mut seen = HashSet::new();
+        for address in recipients {
+            let valid = address.is_ascii()
+                && address.len() <= 254
+                && !address
+                    .bytes()
+                    .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+                && address.split_once('@').is_some_and(|(local, domain)| {
+                    !local.is_empty()
+                        && local.len() <= 64
+                        && !local.starts_with('.')
+                        && !local.ends_with('.')
+                        && !local.contains("..")
+                        && local.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || b".!#$%&'*+-/=?^_`{|}~".contains(&b)
+                        })
+                        && domain.contains('.')
+                        && domain.split('.').all(|label| {
+                            !label.is_empty()
+                                && label.len() <= 63
+                                && !label.starts_with('-')
+                                && !label.ends_with('-')
+                                && label
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                        })
+                });
+            if !valid || !seen.insert(address.to_ascii_lowercase()) {
+                return Err(OutlookWebError::InvalidInput(
+                    "send requires unique explicit SMTP addresses, not names, lists or duplicates",
+                ));
+            }
+        }
+        if self.subject.trim().is_empty()
+            || self.subject.len() > 998
+            || self
+                .subject
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+            || self.body.trim().is_empty()
+            || self.body.len() > 200_000
+            || self.body.contains('\0')
+        {
+            return Err(OutlookWebError::InvalidInput(
+                "send requires a nonempty single-line subject (max 998 bytes) and plain-text body (max 200000 bytes, no NUL)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn send_mail_request(input: &SendMailInput) -> Result<Value, OutlookWebError> {
+    input.validate()?;
+    let recipients = |addresses: &[String]| {
+        addresses
+            .iter()
+            .map(|address| {
+                json!({"__type":"EmailAddress:#Exchange","EmailAddress":address,"RoutingType":"SMTP"})
+            })
+            .collect::<Vec<_>>()
+    };
+    Ok(envelope(
+        "CreateItem",
+        json!({
+            "__type":"CreateItemRequest:#Exchange","MessageDisposition":"SendAndSaveCopy",
+            "Items":[{
+                "__type":"Message:#Exchange","Subject":input.subject,
+                "Body":{"__type":"BodyContentType:#Exchange","BodyType":"Text","Value":input.body},
+                "ToRecipients":recipients(&input.to),"CcRecipients":recipients(&input.cc),
+                "BccRecipients":recipients(&input.bcc)
+            }]
+        }),
+    ))
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -332,7 +428,7 @@ fn envelope(kind: &str, body: Value) -> Value {
 fn item_id(id: &str) -> Value {
     json!({"__type":"ItemId:#Exchange","Id":id})
 }
-fn change(field: &str, value: Value, item_type: &str) -> Value {
+pub(crate) fn change(field: &str, value: Value, item_type: &str) -> Value {
     let mut item = json!({"__type":item_type});
     item[field] = value;
     let mut update = json!({"__type":"SetItemField:#Exchange","Path":{"__type":"PropertyUri:#Exchange","FieldURI":field}});
@@ -512,6 +608,18 @@ pub(crate) fn single_item(value: &Value) -> Result<&Value, OutlookWebError> {
         .ok_or(OutlookWebError::InvalidResponse)?;
     Ok(&items[0])
 }
+pub(crate) fn is_mail_message(item: &Value) -> bool {
+    matches!(
+        item["__type"].as_str(),
+        Some(
+            "Message:#Exchange"
+                | "MeetingMessage:#Exchange"
+                | "MeetingRequestMessage:#Exchange"
+                | "MeetingResponseMessage:#Exchange"
+                | "MeetingCancellationMessage:#Exchange"
+        )
+    )
+}
 fn type_is(item: &Value, name: &str) -> Result<(), OutlookWebError> {
     if item.get("__type").and_then(Value::as_str) == Some(name) {
         Ok(())
@@ -604,6 +712,47 @@ pub fn calendar_item_request(id: &str) -> Value {
             "MyResponseType",
         ],
     )
+}
+
+impl OutlookWebSession {
+    pub fn send_mail(&self, input: &SendMailInput) -> Result<Value, OutlookWebError> {
+        let result = self.execute("CreateItem", &send_mail_request(input)?, true)?;
+        send_acknowledgement(&result, "CreateItem")
+    }
+}
+
+pub(crate) fn send_acknowledgement(
+    result: &Value,
+    action: &'static str,
+) -> Result<Value, OutlookWebError> {
+    // SendAndSaveCopy need not return an item ID. Never invent delivery/read-back evidence.
+    let unknown = |reason| {
+        if matches!(action, "SendItem" | "UpdateItem") {
+            OutlookWebError::SendOutcomeUnknown {
+                reason,
+                http_status: None,
+            }
+        } else {
+            OutlookWebError::OutcomeUnknown { action }
+        }
+    };
+    let responses = result
+        .pointer("/Body/ResponseMessages/Items")
+        .and_then(Value::as_array)
+        .filter(|responses| responses.len() == 1)
+        .ok_or_else(|| unknown("expected exactly one service acknowledgement"))?;
+    if responses[0]["ResponseCode"] != "NoError"
+        || responses[0]
+            .get("ResponseClass")
+            .is_some_and(|class| class != "Success")
+    {
+        return Err(unknown("service acknowledgement did not establish success"));
+    }
+    Ok(json!({
+        "status":"submission_acknowledged","acknowledged":true,
+        "delivery_verified":false,"sent_copy_verified":false,
+        "message_disposition":"SendAndSaveCopy"
+    }))
 }
 
 impl OutlookWebSession {
@@ -787,6 +936,127 @@ impl OutlookWebSession {
         nonempty(id)?;
         self.call("GetItem", &get_item_request(id))
     }
+    pub fn mail_attachment_get(&self, id: &str) -> Result<Value, OutlookWebError> {
+        nonempty(id)?;
+        self.call("GetAttachment", &get_attachment_request(id))
+    }
+
+    fn search_batch(
+        &self,
+        ids: &[String],
+        deadline: Instant,
+        scanned: usize,
+    ) -> Result<Vec<Value>, OutlookWebError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut request = batch_item_request(ids, false)?;
+        request["Body"]["ItemShape"] = search_item_request(&ids[0])["Body"]["ItemShape"].clone();
+        let response = self.search_call("GetItem", &request, deadline, scanned)?;
+        let messages = response
+            .pointer("/Body/ResponseMessages/Items")
+            .and_then(Value::as_array)
+            .ok_or(OutlookWebError::InvalidResponse)?;
+        let mut found = std::collections::HashMap::new();
+        for message in messages {
+            for full in message["Items"]
+                .as_array()
+                .ok_or(OutlookWebError::InvalidResponse)?
+            {
+                let id = field(full, "/ItemId/Id")?;
+                if !ids.iter().any(|requested| requested == id) || found.insert(id, full).is_some()
+                {
+                    return Err(OutlookWebError::InvalidResponse);
+                }
+            }
+        }
+        if found.len() != ids.len() {
+            return Err(OutlookWebError::InvalidResponse);
+        }
+        Ok(ids.iter().map(|id| found[id.as_str()].clone()).collect())
+    }
+
+    /// Scan one bounded page. An empty page of matches is not an exhausted folder.
+    pub fn mail_search_page(
+        &self,
+        folder: &str,
+        query: &str,
+        limit: u16,
+        offset: u32,
+    ) -> Result<Value, OutlookWebError> {
+        folder_ok(folder)?;
+        nonempty(query)?;
+        limit_ok(limit)?;
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let page_size = limit.min(20);
+        let mut request = find_item_request(page_size);
+        request["Body"]["ParentFolderIds"][0]["Id"] = json!(folder);
+        request["Body"]["Paging"]["Offset"] = json!(offset);
+        let page = self.search_call("FindItem", &request, deadline, 0)?;
+        let root = page
+            .pointer("/Body/ResponseMessages/Items/0/RootFolder")
+            .ok_or(OutlookWebError::InvalidResponse)?;
+        let items = root["Items"]
+            .as_array()
+            .ok_or(OutlookWebError::InvalidResponse)?;
+        if items.len() > usize::from(page_size) {
+            return Err(OutlookWebError::InvalidResponse);
+        }
+        let has_more = !root["IncludesLastItemInRange"]
+            .as_bool()
+            .ok_or(OutlookWebError::InvalidResponse)?;
+        let next = if has_more {
+            Some(
+                root["IndexedPagingOffset"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|n| *n > offset && !items.is_empty())
+                    .ok_or(OutlookWebError::InvalidResponse)?,
+            )
+        } else {
+            None
+        };
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        for item in items {
+            let id = field(item, "/ItemId/Id")?;
+            if !seen.insert(id) {
+                return Err(OutlookWebError::InvalidResponse);
+            }
+            if item["__type"]
+                .as_str()
+                .ok_or(OutlookWebError::InvalidResponse)?
+                .ends_with("Message:#Exchange")
+            {
+                ids.push(id.to_owned());
+            }
+        }
+        let query = query.to_lowercase();
+        let mut matches = Vec::new();
+        for full in self.search_batch(&ids, deadline, 0)? {
+            if contains_text(&full, &query)? {
+                let id = field(&full, "/ItemId/Id")?;
+                let mut item = items
+                    .iter()
+                    .find(|item| item["ItemId"]["Id"] == id)
+                    .ok_or(OutlookWebError::InvalidResponse)?
+                    .clone();
+                item.as_object_mut()
+                    .ok_or(OutlookWebError::InvalidResponse)?
+                    .extend(
+                        full.as_object()
+                            .ok_or(OutlookWebError::InvalidResponse)?
+                            .clone(),
+                    );
+                matches.push(item);
+            }
+        }
+        Ok(
+            json!({"count":matches.len(),"items":matches,"offset":offset,"scanned":items.len(),
+            "has_more":has_more,"next_offset":next}),
+        )
+    }
+
     pub fn mail_search(
         &self,
         folder: &str,
@@ -800,8 +1070,13 @@ impl OutlookWebSession {
         let mut matches = Vec::new();
         let mut offset = 0;
         let mut seen = HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let mut scanned = 0;
         loop {
-            let page = self.mail_list(folder, 100, offset)?;
+            let mut request = find_item_request(100);
+            request["Body"]["ParentFolderIds"][0]["Id"] = json!(folder);
+            request["Body"]["Paging"]["Offset"] = json!(offset);
+            let page = self.search_call("FindItem", &request, deadline, scanned)?;
             let root = page
                 .pointer("/Body/ResponseMessages/Items/0/RootFolder")
                 .ok_or(OutlookWebError::InvalidResponse)?;
@@ -809,6 +1084,7 @@ impl OutlookWebSession {
                 .get("Items")
                 .and_then(Value::as_array)
                 .ok_or(OutlookWebError::InvalidResponse)?;
+            let mut ids = Vec::new();
             for item in items {
                 let id = field(item, "/ItemId/Id")?;
                 if !seen.insert(id.to_owned()) {
@@ -821,13 +1097,17 @@ impl OutlookWebSession {
                 {
                     continue;
                 }
-                let response = self.call("GetItem", &search_item_request(id))?;
-                let full = single_item(&response)?;
-                if contains_text(full, &query)? {
-                    matches.push(full.clone());
-                }
-                if matches.len() > usize::from(limit) {
-                    return Ok(search_result(matches, limit));
+                ids.push(id.to_owned());
+            }
+            for batch in ids.chunks(20) {
+                for full in self.search_batch(batch, deadline, scanned)? {
+                    scanned += 1;
+                    if contains_text(&full, &query)? {
+                        matches.push(full.clone());
+                    }
+                    if matches.len() > usize::from(limit) {
+                        return Ok(search_result(matches, limit));
+                    }
                 }
             }
             match root.get("IncludesLastItemInRange").and_then(Value::as_bool) {
@@ -952,6 +1232,33 @@ impl OutlookWebSession {
     ) -> Result<Value, OutlookWebError> {
         nonempty(folder_id)?;
         interval(start, end)?;
+        let resolved;
+        let folder_id = if folder_id == "calendar" {
+            let response = self.call("GetFolder", &json!({
+                "Header":header(),"Body":{
+                    "__type":"GetFolderRequest:#Exchange",
+                    "FolderShape":{"__type":"FolderResponseShape:#Exchange","BaseShape":"IdOnly"},
+                    "FolderIds":[{"__type":"DistinguishedFolderId:#Exchange","Id":"calendar"}]
+                }
+            }))?;
+            let responses = response
+                .pointer("/Body/ResponseMessages/Items")
+                .and_then(Value::as_array)
+                .ok_or(OutlookWebError::InvalidResponse)?;
+            if responses.len() != 1 {
+                return Err(OutlookWebError::InvalidResponse);
+            }
+            let folders = responses[0]["Folders"]
+                .as_array()
+                .ok_or(OutlookWebError::InvalidResponse)?;
+            if folders.len() != 1 {
+                return Err(OutlookWebError::InvalidResponse);
+            }
+            resolved = field(&folders[0], "/FolderId/Id")?.to_owned();
+            resolved.as_str()
+        } else {
+            folder_id
+        };
         self.call(
             "GetCalendarView",
             &calendar_view_request(folder_id, start, end),
@@ -1074,6 +1381,116 @@ impl OutlookWebSession {
 mod tests {
     use super::*;
     use crate::test_support::{message, mock};
+
+    fn send_input() -> SendMailInput {
+        SendMailInput {
+            to: vec!["recipient@example.com".into()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Synthetic".into(),
+            body: "Message".into(),
+        }
+    }
+
+    #[test]
+    fn send_acknowledges_submission_without_inventing_delivery_or_item_id() {
+        let (session, requests, worker) = mock(vec![(
+            "CreateItem",
+            json!({
+                "Body":{"ResponseMessages":{"Items":[{"ResponseCode":"NoError","ResponseClass":"Success","Items":[]}]}}
+            }),
+        )]);
+        let result = session.send_mail(&send_input()).unwrap();
+        assert_eq!(result["status"], "submission_acknowledged");
+        assert_eq!(result["acknowledged"], true);
+        assert_eq!(result["delivery_verified"], false);
+        assert_eq!(result["sent_copy_verified"], false);
+        assert!(result.get("sent").is_none());
+        worker.join().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn send_errors_and_partial_or_missing_acknowledgements_never_succeed_or_retry() {
+        for response in [
+            json!({}),
+            json!({"Body":{"ResponseCode":"NoError"}}),
+            json!({"WasSuccessful":true,"ErrorCode":0}),
+            json!({"Body":{"ResponseMessages":{"Items":[]}}}),
+            json!({"Body":{"ResponseMessages":{"Items":[{"ResponseCode":"ErrorAccessDenied","ResponseClass":"Error"}]}}}),
+            json!({"Body":{"ResponseMessages":{"Items":[{"ResponseCode":"NoError","ResponseClass":"Error"}]}}}),
+            json!({"Body":{"ResponseMessages":{"Items":[{"ResponseCode":"NoError"},{"ResponseCode":"ErrorInvalidRecipients"}]}}}),
+            json!({"Body":{"ResponseMessages":{"Items":[{"ResponseCode":"NoError"},{"ResponseCode":"NoError"}]}}}),
+            json!({"FaultMessage":"synthetic fault"}),
+        ] {
+            let (session, requests, worker) = mock(vec![("CreateItem", response)]);
+            assert!(session.send_mail(&send_input()).is_err());
+            worker.join().unwrap();
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+        let (session, requests, worker) = mock(vec![]);
+        let mut input = send_input();
+        input.to.clear();
+        assert!(session.send_mail(&input).is_err());
+        assert!(requests.lock().unwrap().is_empty());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn default_calendar_is_resolved_before_view_and_explicit_ids_are_preserved() {
+        let range = ("2026-10-23T00:00:00-04:00", "2026-10-24T00:00:00-04:00");
+        let folder = json!({"Body":{"ResponseMessages":{"Items":[{
+            "ResponseCode":"NoError","Folders":[{"FolderId":{"Id":"real-calendar-id"}}]
+        }]}}});
+        let (session, requests, completion) = mock(vec![
+            ("GetFolder", folder),
+            (
+                "GetCalendarView",
+                json!({"Body":{"ResponseCode":"NoError","Items":[]}}),
+            ),
+        ]);
+        session.calendar_list("calendar", range.0, range.1).unwrap();
+        completion.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[0]["Body"]["FolderIds"][0]["__type"],
+            "DistinguishedFolderId:#Exchange"
+        );
+        assert_eq!(requests[0]["Body"]["FolderIds"][0]["Id"], "calendar");
+        assert_eq!(
+            requests[1]["Body"]["CalendarId"]["BaseFolderId"]["Id"],
+            "real-calendar-id"
+        );
+
+        let (session, requests, completion) = mock(vec![(
+            "GetCalendarView",
+            json!({"Body":{"ResponseCode":"NoError","Items":[]}}),
+        )]);
+        session
+            .calendar_list("explicit-id", range.0, range.1)
+            .unwrap();
+        completion.join().unwrap();
+        assert_eq!(
+            requests.lock().unwrap()[0]["Body"]["CalendarId"]["BaseFolderId"]["Id"],
+            "explicit-id"
+        );
+    }
+
+    #[test]
+    fn unresolved_default_calendar_fails_before_view_without_empty_result_fallback() {
+        let (session, requests, completion) = mock(vec![(
+            "GetFolder",
+            json!({
+                "Body":{"ResponseMessages":{"Items":[{"ResponseCode":"NoError","Folders":[]}]}}
+            }),
+        )]);
+        assert!(matches!(
+            session.calendar_list("calendar", "2026-10-23T00:00:00Z", "2026-10-24T00:00:00Z"),
+            Err(OutlookWebError::InvalidResponse)
+        ));
+        completion.join().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
 
     #[test]
     fn deletion_recycles_messages_and_rejects_meeting_cancellations() {
@@ -1301,5 +1718,150 @@ mod tests {
             .is_err()
         );
         assert!(contains_text(&json!({"Subject":""}), "absent").is_err());
+    }
+
+    fn search_page(ids: &[String], last: bool) -> Value {
+        json!({"Body":{"ResponseMessages":{"Items":[{"ResponseCode":"NoError","RootFolder":{
+            "Items":ids.iter().map(|id| json!({"__type":"Message:#Exchange","ItemId":{"Id":id}})).collect::<Vec<_>>(),
+            "IncludesLastItemInRange":last,"IndexedPagingOffset":ids.len()
+        }}]}}})
+    }
+
+    fn search_items(ids: &[String]) -> Value {
+        json!({"Body":{"ResponseMessages":{"Items":[{"ResponseCode":"NoError",
+            "Items":ids.iter().rev().map(|id| json!({"ItemId":{"Id":id},"Subject":id,
+                "Body":{"Value":"match in body"}})).collect::<Vec<_>>()
+        }]}}})
+    }
+
+    #[test]
+    fn mail_search_batches_twenty_and_preserves_folder_order() {
+        let ids: Vec<_> = (0..21).map(|i| format!("message-{i}")).collect();
+        let (session, requests, worker) = mock(vec![
+            ("FindItem", search_page(&ids, true)),
+            ("GetItem", search_items(&ids[..20])),
+            ("GetItem", search_items(&ids[20..])),
+        ]);
+        let result = session.mail_search("inbox", "MATCH", 25).unwrap();
+        worker.join().unwrap();
+        assert_eq!(result["count"], 21);
+        assert_eq!(result["has_more"], false);
+        assert_eq!(result["items"][0]["Subject"], "message-0");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1]["Body"]["ItemIds"].as_array().unwrap().len(), 20);
+        assert_eq!(requests[2]["Body"]["ItemIds"].as_array().unwrap().len(), 1);
+        assert_eq!(requests[1]["Body"]["ItemShape"]["BaseShape"], "IdOnly");
+    }
+
+    #[test]
+    fn mail_search_rejects_missing_duplicate_and_unrequested_batch_items() {
+        let ids = vec!["a".into(), "b".into()];
+        for returned in [
+            vec!["a".into()],
+            vec!["a".into(), "a".into()],
+            vec!["a".into(), "other".into()],
+        ] {
+            let (session, _, worker) = mock(vec![
+                ("FindItem", search_page(&ids, true)),
+                ("GetItem", search_items(&returned)),
+            ]);
+            assert!(matches!(
+                session.mail_search("inbox", "match", 25),
+                Err(OutlookWebError::InvalidResponse)
+            ));
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn mail_search_paginates_and_reports_more_matches_without_claiming_completeness() {
+        let ids = vec!["a".into()];
+        let next = vec!["b".into(), "c".into()];
+        let (session, requests, worker) = mock(vec![
+            ("FindItem", search_page(&ids, false)),
+            ("GetItem", search_items(&ids)),
+            ("FindItem", search_page(&next, true)),
+            ("GetItem", search_items(&next)),
+        ]);
+        let result = session.mail_search("inbox", "match", 1).unwrap();
+        worker.join().unwrap();
+        assert_eq!(result["count"], 1);
+        assert_eq!(result["has_more"], true);
+        assert_eq!(requests.lock().unwrap()[2]["Body"]["Paging"]["Offset"], 1);
+    }
+
+    #[test]
+    fn exhausted_search_budget_is_an_error_not_an_empty_result() {
+        let (session, requests, worker) = mock(vec![]);
+        let error = session
+            .search_call("FindItem", &json!({}), Instant::now(), 120)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            OutlookWebError::SearchTimedOut { scanned: 120 }
+        ));
+        assert!(error.to_string().contains("incomplete, not empty"));
+        assert!(requests.lock().unwrap().is_empty());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn search_page_without_matches_returns_continuation_not_a_whole_folder_negative() {
+        let ids = vec!["a".into(), "b".into()];
+        let (session, requests, worker) = mock(vec![
+            ("FindItem", search_page(&ids, false)),
+            ("GetItem", search_items(&ids)),
+        ]);
+        let result = session.mail_search_page("inbox", "absent", 100, 0).unwrap();
+        worker.join().unwrap();
+        assert_eq!(result["count"], 0);
+        assert_eq!(result["scanned"], 2);
+        assert_eq!(result["has_more"], true);
+        assert_eq!(result["next_offset"], 2);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            requests.lock().unwrap()[0]["Body"]["Paging"]["MaxEntriesReturned"],
+            20
+        );
+    }
+
+    #[test]
+    fn search_continuation_reaches_end_and_keeps_sender_metadata() {
+        let ids = vec!["a".into()];
+        let mut page = search_page(&ids, true);
+        page["Body"]["ResponseMessages"]["Items"][0]["RootFolder"]["Items"][0]["From"] =
+            json!({"Mailbox":{"Name":"Synthetic sender"}});
+        let (session, requests, worker) =
+            mock(vec![("FindItem", page), ("GetItem", search_items(&ids))]);
+        let result = session.mail_search_page("inbox", "match", 10, 20).unwrap();
+        worker.join().unwrap();
+        assert_eq!(result["offset"], 20);
+        assert_eq!(result["has_more"], false);
+        assert!(result["next_offset"].is_null());
+        assert_eq!(
+            result["items"][0]["From"]["Mailbox"]["Name"],
+            "Synthetic sender"
+        );
+        assert_eq!(requests.lock().unwrap()[0]["Body"]["Paging"]["Offset"], 20);
+    }
+
+    #[test]
+    fn search_pages_reject_invalid_paging_metadata_before_reading_bodies() {
+        let ids = vec!["a".into()];
+        for (key, value) in [
+            ("IndexedPagingOffset", json!(0)),
+            ("IncludesLastItemInRange", Value::Null),
+            ("Items", json!([])),
+        ] {
+            let mut page = search_page(&ids, false);
+            page["Body"]["ResponseMessages"]["Items"][0]["RootFolder"][key] = value;
+            let (session, _, worker) = mock(vec![("FindItem", page)]);
+            assert!(matches!(
+                session.mail_search_page("inbox", "match", 20, 0),
+                Err(OutlookWebError::InvalidResponse)
+            ));
+            worker.join().unwrap();
+        }
     }
 }

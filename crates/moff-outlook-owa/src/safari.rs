@@ -25,7 +25,7 @@ fn outlook_url(value: &str) -> bool {
             && url.port().is_none()
             && matches!(
                 url.host_str(),
-                Some("outlook.office.com" | "outlook.cloud.microsoft")
+                Some("outlook.office.com" | "outlook.cloud.microsoft" | "outlook.live.com")
             )
             && (url.path().starts_with("/mail/")
                 || url.path().starts_with("/calendar/")
@@ -59,6 +59,64 @@ fn sign_in_url(value: &str) -> bool {
     })
 }
 
+fn diagnose_auth_tab(
+    tab: &safari::OpenTab,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<Value, OutlookWebError> {
+    let window = u32::try_from(tab.window).map_err(|_| OutlookWebError::SafariUnavailable)?;
+    let position = u32::try_from(tab.tab).map_err(|_| OutlookWebError::SafariUnavailable)?;
+    let url = Url::parse(&tab.url).map_err(|_| OutlookWebError::InvalidResponse)?;
+    let host = url.host_str().ok_or(OutlookWebError::InvalidResponse)?;
+    let mut page = if outlook_url(&tab.url) {
+        match OutlookWebSession::safari_auth_status(Some((window, position))) {
+            Ok(status) => json!({"state":status["state"],"message":status["message"]}),
+            Err(_) => json!({
+                "state":"outlook_status_unavailable",
+                "next_step":"Inspect the Outlook tab and retry moff auth diagnose."
+            }),
+        }
+    } else {
+        let result = runtime.block_on(async {
+            let document = safari::document_target(tab_target(tab)?)
+                .await
+                .map_err(|_| OutlookWebError::SafariBeforeDispatch)?;
+            let result = safari::eval_document(
+                &format!("({})()", include_str!("safari_auth_diagnose.js")),
+                &document,
+                &eval_options(10),
+            )
+            .await
+            .map_err(|_| OutlookWebError::SafariOperationFailed)?;
+            if result.truncated {
+                return Err(OutlookWebError::InvalidResponse);
+            }
+            match result.value["step"].as_str() {
+                Some(
+                    step @ ("consent_review"
+                    | "verification_choice"
+                    | "verification_code"
+                    | "password"
+                    | "account_selection"
+                    | "username"
+                    | "sign_in_page"),
+                ) => Ok(json!({"state":"sign_in_required","step":step})),
+                _ => Err(OutlookWebError::InvalidResponse),
+            }
+        });
+        match result {
+            Ok(page) => page,
+            Err(_) => json!({
+                "state":"sign_in_inspection_unavailable",
+                "next_step":"Review this sign-in page in Safari and complete its prompts yourself."
+            }),
+        }
+    };
+    page["window"] = json!(window);
+    page["tab"] = json!(position);
+    page["host"] = json!(host);
+    Ok(page)
+}
+
 async fn verify_host_runtime(
     tab: &safari::OpenTab,
     target: &DocumentTarget,
@@ -78,139 +136,131 @@ async fn verify_host_runtime(
     Ok(())
 }
 
-async fn diagnose_auth_tab(tab: &safari::OpenTab) -> Result<Value, OutlookWebError> {
-    let window = u32::try_from(tab.window).map_err(|_| OutlookWebError::SafariUnavailable)?;
-    let position = u32::try_from(tab.tab).map_err(|_| OutlookWebError::SafariUnavailable)?;
-    let host = Url::parse(&tab.url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .unwrap_or_default();
-    let mut page = if outlook_url(&tab.url) {
-        match auth_status_for_tab(tab).await {
-            Ok(status) => {
-                let state = match status["status"].as_u64() {
-                    Some(200) => "authenticated",
-                    Some(401) => "outlook_session_expired",
-                    Some(422) => "outlook_auth_adapter_unavailable",
-                    Some(425) => "outlook_loading",
-                    _ => return Err(OutlookWebError::InvalidResponse),
-                };
-                json!({"state":state})
-            }
-            Err(_) => json!({
-                "state":"outlook_status_unavailable",
-                "next_step":"Inspect the Outlook tab and retry moff auth diagnose."
-            }),
-        }
-    } else {
-        match safari::document_target(tab_target(tab)?).await {
-            Ok(document) => {
-                let result = safari::eval_document(
-                    &format!("({})()", include_str!("safari_auth_diagnose.js")),
-                    &document,
-                    &eval_options(10),
-                )
-                .await;
-                match result {
-                    Ok(result) if !result.truncated => json!({
-                        "state":"sign_in_required",
-                        "step":result.value["step"]
-                    }),
-                    _ => json!({
-                        "state":"sign_in_inspection_unavailable",
-                        "next_step":"Review this sign-in page in Safari and complete its prompts yourself."
-                    }),
-                }
-            }
-            Err(_) => json!({
-                "state":"sign_in_inspection_unavailable",
-                "next_step":"Review this sign-in page in Safari and complete its prompts yourself."
-            }),
-        }
-    };
-    page["window"] = json!(window);
-    page["tab"] = json!(position);
-    page["host"] = json!(host);
-    Ok(page)
-}
-
 impl OutlookWebSession {
-    /// Check browser authentication without refreshing or invoking interactive login.
-    pub fn safari_auth_status(target: Option<(u32, u32)>) -> Result<Value, OutlookWebError> {
-        let runtime =
-            tokio::runtime::Runtime::new().map_err(|_| OutlookWebError::SafariOperationFailed)?;
-        runtime.block_on(async {
-            let tabs = safari::tabs()
-                .await
-                .map_err(|_| OutlookWebError::SafariOperationFailed)?;
-            let tab = selected_tab(&tabs, target)?;
-            auth_status_for_tab(tab).await
-        })
-    }
-
     /// Inspect allowlisted sign-in pages without reading page text or form values.
     pub fn safari_auth_diagnose(target: Option<(u32, u32)>) -> Result<Value, OutlookWebError> {
         let runtime =
             tokio::runtime::Runtime::new().map_err(|_| OutlookWebError::SafariOperationFailed)?;
-        runtime.block_on(async {
-            let tabs = safari::tabs()
-                .await
-                .map_err(|_| OutlookWebError::SafariOperationFailed)?;
-            let candidates: Vec<_> = tabs
-                .iter()
-                .filter(|tab| {
-                    (outlook_url(&tab.url) || sign_in_url(&tab.url))
-                        && target.is_none_or(|(window, position)| {
-                            tab.window == i64::from(window) && tab.tab == i64::from(position)
-                        })
-                })
-                .collect();
-            if candidates.is_empty() {
-                return Ok(json!({
-                    "state":"no_sign_in_tab",
-                    "next_step":"Open Outlook in Safari; if it redirects to sign-in, run moff auth diagnose again.",
-                    "credential_export":false,
-                    "page_content_read":false
-                }));
-            }
-
-            let mut pages = Vec::with_capacity(candidates.len());
-            for tab in candidates {
-                pages.push(diagnose_auth_tab(tab).await?);
-            }
-
-            let state = if pages.iter().any(|page| page["state"] == "authenticated") {
-                "authenticated"
-            } else if pages.iter().any(|page| page["state"] == "sign_in_required") {
-                "sign_in_required"
-            } else if pages.iter().any(|page| {
-                matches!(
-                    page["state"].as_str(),
-                    Some("outlook_session_expired" | "outlook_loading")
-                )
-            }) {
-                "needs_user_action"
-            } else {
-                "diagnosis_incomplete"
-            };
-            let next_step = match state {
-                "authenticated" => "Silent authentication is working; retry your Outlook command.",
-                "sign_in_required" => {
-                    "Complete the sign-in prompts yourself in Safari, then rerun moff auth status."
-                }
-                "needs_user_action" => {
-                    "Wait for Outlook to finish loading or complete any sign-in prompts yourself in Safari, then rerun moff auth status."
-                }
-                _ => "Inspect the Safari tabs and retry moff auth diagnose.",
-            };
-            Ok(json!({
-                "state":state,
-                "pages":pages,
-                "next_step":next_step,
+        let tabs = runtime
+            .block_on(safari::tabs())
+            .map_err(|_| OutlookWebError::SafariOperationFailed)?;
+        let candidates: Vec<_> = tabs
+            .iter()
+            .filter(|tab| {
+                (outlook_url(&tab.url) || sign_in_url(&tab.url))
+                    && target.is_none_or(|(window, position)| {
+                        tab.window == i64::from(window) && tab.tab == i64::from(position)
+                    })
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Ok(json!({
+                "state":"no_sign_in_tab",
+                "next_step":"Open Outlook in Safari; if it redirects to sign-in, run moff auth diagnose again.",
                 "credential_export":false,
                 "page_content_read":false
-            }))
-        })
+            }));
+        }
+        let mut pages = Vec::with_capacity(candidates.len());
+        for tab in candidates {
+            pages.push(diagnose_auth_tab(tab, &runtime)?);
+        }
+        let state = if pages.iter().any(|page| page["state"] == "authenticated") {
+            "authenticated"
+        } else if pages.iter().any(|page| page["state"] == "sign_in_required") {
+            "sign_in_required"
+        } else if pages.iter().any(|page| {
+            matches!(
+                page["state"].as_str(),
+                Some("session_expired" | "outlook_not_ready")
+            )
+        }) {
+            "needs_user_action"
+        } else {
+            "diagnosis_incomplete"
+        };
+        let next_step = match state {
+            "authenticated" => {
+                "Silent authentication is working; this does not prove that a mailbox read will succeed."
+            }
+            "sign_in_required" => {
+                "Complete the sign-in prompts yourself in Safari, then rerun moff auth status."
+            }
+            "needs_user_action" => {
+                "Wait for Outlook to finish loading or complete sign-in yourself in Safari, then rerun moff auth status."
+            }
+            _ => "Inspect the Safari tabs and retry moff auth diagnose.",
+        };
+        Ok(json!({
+            "state":state,"pages":pages,"next_step":next_step,
+            "credential_export":false,"page_content_read":false
+        }))
+    }
+
+    /// Check browser authentication without refreshing or invoking interactive login.
+    pub fn safari_auth_status(target: Option<(u32, u32)>) -> Result<Value, OutlookWebError> {
+        let session = Self::from_safari(target)?;
+        #[cfg(not(test))]
+        let SessionTransport::Safari(safari) = &session.transport;
+        #[cfg(test)]
+        let SessionTransport::Safari(safari) = &session.transport else {
+            return Err(OutlookWebError::SafariUnavailable);
+        };
+        let script = format!(
+            "(async function(){{const result=await {};return {{status:result.status,failure:result.failure,recovery_marker_present:sessionStorage.getItem('__moff_auth_recovery')!==null}};}})()",
+            page_script(
+                include_str!("safari_read.js"),
+                &json!({"action":"__MoffAuthStatus"})
+            )
+        );
+        let result = safari
+            .runtime
+            .block_on(safari::eval_document(
+                &script,
+                &safari.target,
+                &eval_options(30),
+            ))
+            .map_err(|_| OutlookWebError::SafariAuthRecoveryFailed("silent token acquisition"))?;
+        if result.truncated {
+            return Err(OutlookWebError::InvalidResponse);
+        }
+        if result.value["failure"] == "timeout" {
+            return Err(OutlookWebError::ReadTimedOut {
+                action: "authentication check",
+            });
+        }
+        if result.value["failure"] == "network" {
+            return Err(OutlookWebError::ReadNetworkFailed {
+                action: "authentication check",
+            });
+        }
+        match result.value["status"].as_u64() {
+            Some(status @ (200 | 401 | 422 | 425)) => {
+                let (state, message) = match status {
+                    200 => (
+                        "authenticated",
+                        "Silent browser authentication succeeded; this does not prove that a mailbox read will succeed.",
+                    ),
+                    401 => (
+                        "session_expired",
+                        "Run moff outlook auth refresh --confirm and finish any sign-in steps yourself in Safari.",
+                    ),
+                    425 => (
+                        "outlook_not_ready",
+                        "Open the selected Outlook tab, finish sign-in if prompted, and wait for Mail.",
+                    ),
+                    _ => (
+                        "auth_adapter_changed",
+                        "Outlook authentication modules changed; Moff needs an adapter update, not repeated refreshes.",
+                    ),
+                };
+                Ok(json!({"authenticated":result.value["status"] == 200,
+                "state":state,"message":message,
+                "status":result.value["status"],"recovery_marker_present":result.value["recovery_marker_present"],
+                "credential_export":false}))
+            }
+            _ => Err(OutlookWebError::InvalidResponse),
+        }
     }
 
     /// Explicitly reload Outlook and let browser SSO recover; never interact with login UI.
@@ -298,35 +348,6 @@ impl OutlookWebSession {
     }
 }
 
-async fn auth_status_for_tab(tab: &safari::OpenTab) -> Result<Value, OutlookWebError> {
-    let target = safari::document_target(tab_target(tab)?)
-        .await
-        .map_err(|_| OutlookWebError::SafariBeforeDispatch)?;
-    verify_host_runtime(tab, &target).await?;
-    let script = format!(
-        "(async function(){{const result=await {};return {{status:result.status,recovery_marker_present:sessionStorage.getItem('__moff_auth_recovery')!==null}};}})()",
-        page_script(
-            include_str!("safari_read.js"),
-            &json!({"action":"__MoffAuthStatus"})
-        )
-    );
-    let result = safari::eval_document(&script, &target, &eval_options(30))
-        .await
-        .map_err(|_| OutlookWebError::SafariAuthRecoveryFailed("silent token acquisition"))?;
-    if result.truncated {
-        return Err(OutlookWebError::InvalidResponse);
-    }
-    match result.value["status"].as_u64() {
-        Some(200 | 401 | 422 | 425) => Ok(json!({
-            "authenticated":result.value["status"] == 200,
-            "status":result.value["status"],
-            "recovery_marker_present":result.value["recovery_marker_present"],
-            "credential_export":false
-        })),
-        _ => Err(OutlookWebError::InvalidResponse),
-    }
-}
-
 fn selected_tab(
     tabs: &[safari::OpenTab],
     target: Option<(u32, u32)>,
@@ -367,6 +388,16 @@ fn page_script(source: &str, config: &Value) -> String {
         include_str!("safari_auth.js"),
         include_str!("safari_response.js")
     )
+}
+
+pub(crate) fn request_script_bytes(action: &str, body: &Value) -> usize {
+    page_script(
+        include_str!("safari_read.js"),
+        &json!({
+            "action":action,"body":body,"mutation":true,"allow_mutation":true,"timeout_ms":25000
+        }),
+    )
+    .len()
 }
 
 fn transfer_options(total_bytes: u64) -> BinaryTransferOptions {
@@ -417,6 +448,35 @@ impl OutlookWebSession {
 }
 
 impl SafariSession {
+    pub(super) fn set_pin(&self, id: &str, pinned: bool) -> Result<(), OutlookWebError> {
+        if !self.allow_mutation {
+            return Err(OutlookWebError::SafariReadOnly);
+        }
+        let script = format!(
+            "({})({})",
+            include_str!("safari_pin.js"),
+            json!({"id":id,"pinned":pinned,"allow_mutation":true})
+        );
+        let result = self
+            .runtime
+            .block_on(safari::eval_document(
+                &script,
+                &self.target,
+                &eval_options(25),
+            ))
+            .map_err(|_| OutlookWebError::OutcomeUnknown { action: "PinItem" })?;
+        if result.value["dispatched"] == false {
+            return Err(if result.value["reason"] == "outlook_not_ready" {
+                OutlookWebError::OutlookNotReady
+            } else {
+                OutlookWebError::AuthenticationAdapterChanged
+            });
+        }
+        if result.truncated || result.value["success"] != true {
+            return Err(OutlookWebError::OutcomeUnknown { action: "PinItem" });
+        }
+        Ok(())
+    }
     pub(super) fn product_read(&self, url: &str) -> Result<Value, OutlookWebError> {
         self.product_request(&json!({"url":url}), false)
     }
@@ -733,6 +793,16 @@ impl SafariSession {
         body: &Value,
         mutation: bool,
     ) -> Result<Value, OutlookWebError> {
+        self.call_with_timeout(action, body, mutation, Duration::from_secs(25))
+    }
+
+    pub(super) fn call_with_timeout(
+        &self,
+        action: &'static str,
+        body: &Value,
+        mutation: bool,
+        timeout: Duration,
+    ) -> Result<Value, OutlookWebError> {
         if mutation {
             if !self.allow_mutation
                 || ![
@@ -740,6 +810,7 @@ impl SafariSession {
                     "UpdateItem",
                     "UpdateCalendarEvent",
                     "DeleteItem",
+                    "MoveItem",
                 ]
                 .contains(&action)
             {
@@ -750,7 +821,8 @@ impl SafariSession {
         }
         let script = page_script(
             include_str!("safari_read.js"),
-            &json!({ "action": action, "body": body, "mutation": mutation, "allow_mutation": self.allow_mutation }),
+            &json!({ "action": action, "body": body, "mutation": mutation,
+                "allow_mutation": self.allow_mutation, "timeout_ms": timeout.as_millis() }),
         );
         let result = self
             .runtime
@@ -760,7 +832,7 @@ impl SafariSession {
                 &EvalOptions {
                     allow_eval: true,
                     max_chars: 1_000_000,
-                    timeout: 60,
+                    timeout: u32::try_from(timeout.as_secs().saturating_add(10)).unwrap_or(60),
                 },
             ))
             .map_err(|error| {
@@ -777,54 +849,228 @@ impl SafariSession {
                     }
                 }
                 if mutation {
-                    OutlookWebError::OutcomeUnknown { action }
+                    uncertain_write(
+                        action,
+                        "Safari evaluation failed without phase evidence",
+                        None,
+                    )
                 } else {
                     OutlookWebError::SafariOperationFailed
                 }
             })?;
         if result.truncated {
             return Err(if mutation {
-                OutlookWebError::OutcomeUnknown { action }
+                uncertain_write(action, "Safari result was truncated", None)
             } else {
                 OutlookWebError::TruncatedSearch
             });
         }
-        let value = result.value;
-        let status = value["status"]
-            .as_u64()
-            .and_then(|n| u16::try_from(n).ok())
-            .ok_or(if mutation {
-                OutlookWebError::OutcomeUnknown { action }
+        let diagnostic_action =
+            if action == "UpdateItem" && body["Body"]["MessageDisposition"] == "SendAndSaveCopy" {
+                "UpdateItem mail submission"
             } else {
-                OutlookWebError::InvalidResponse
-            })?;
-        if status == 401 {
-            return Err(OutlookWebError::SessionExpired);
+                action
+            };
+        decode_call_result(diagnostic_action, &result.value, mutation)
+    }
+}
+
+fn uncertain_write(
+    action: &'static str,
+    reason: &'static str,
+    http_status: Option<u16>,
+) -> OutlookWebError {
+    if matches!(action, "SendItem" | "UpdateItem mail submission") {
+        OutlookWebError::SendOutcomeUnknown {
+            reason,
+            http_status,
         }
-        if !(200..300).contains(&status) {
-            if mutation && status >= 500 {
-                return Err(OutlookWebError::OutcomeUnknown { action });
+    } else {
+        OutlookWebError::OutcomeUnknown { action }
+    }
+}
+
+fn decode_call_result(
+    action: &'static str,
+    value: &Value,
+    mutation: bool,
+) -> Result<Value, OutlookWebError> {
+    if let Some(failure) = value["failure"].as_str() {
+        return Err(if mutation && value["dispatched"] != false {
+            uncertain_write(
+                action,
+                match failure {
+                    "timeout" => "browser request timed out after dispatch",
+                    "network" => "browser network failed after dispatch",
+                    "response_too_large" => "browser response exceeded size limit after dispatch",
+                    _ => "unrecognized browser failure after dispatch",
+                },
+                None,
+            )
+        } else {
+            match failure {
+                "timeout" => OutlookWebError::ReadTimedOut { action },
+                "network" => OutlookWebError::ReadNetworkFailed { action },
+                "response_too_large" => OutlookWebError::ResponseTooLarge,
+                _ => OutlookWebError::InvalidResponse,
             }
-            return Err(OutlookWebError::RequestRejected(status));
-        }
-        decode_response(value["body"].as_str().ok_or(if mutation {
-            OutlookWebError::OutcomeUnknown { action }
+        });
+    }
+    let status = value["status"]
+        .as_u64()
+        .and_then(|n| u16::try_from(n).ok())
+        .ok_or(if mutation {
+            uncertain_write(action, "browser result lacks a valid HTTP status", None)
         } else {
             OutlookWebError::InvalidResponse
-        })?)
-        .map_err(|_| {
-            if mutation {
-                OutlookWebError::OutcomeUnknown { action }
-            } else {
-                OutlookWebError::InvalidResponse
-            }
-        })
+        })?;
+    if status == 401 {
+        return Err(OutlookWebError::SessionExpired);
     }
+    if status == 425 && value["stage"] == "authentication" {
+        return Err(OutlookWebError::OutlookNotReady);
+    }
+    if status == 422 && value["stage"] == "authentication" {
+        return Err(OutlookWebError::AuthenticationAdapterChanged);
+    }
+    if !(200..300).contains(&status) {
+        if mutation && status >= 500 {
+            return Err(uncertain_write(
+                action,
+                "server returned an error after dispatch",
+                Some(status),
+            ));
+        }
+        return Err(OutlookWebError::RequestRejected(status));
+    }
+    decode_response(value["body"].as_str().ok_or(if mutation {
+        uncertain_write(
+            action,
+            "successful HTTP response lacks a text body",
+            Some(status),
+        )
+    } else {
+        OutlookWebError::InvalidResponse
+    })?)
+    .map_err(|_| {
+        if mutation {
+            uncertain_write(
+                action,
+                "successful HTTP response body is not valid JSON",
+                Some(status),
+            )
+        } else {
+            OutlookWebError::InvalidResponse
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_uncertainty_preserves_safe_phase_reason_and_http_status_without_response_content() {
+        for (value, reason, status) in [
+            (
+                json!({"status":0,"failure":"network","dispatched":true}),
+                "network",
+                None,
+            ),
+            (
+                json!({"status":0,"failure":"timeout","dispatched":true}),
+                "timed out",
+                None,
+            ),
+            (
+                json!({"status":0,"failure":"response_too_large","dispatched":true}),
+                "size limit",
+                None,
+            ),
+            (json!({}), "HTTP status", None),
+            (
+                json!({"status":500,"body":"private body/token"}),
+                "server returned",
+                Some(500),
+            ),
+            (json!({"status":503}), "server returned", Some(503)),
+            (json!({"status":200}), "lacks a text body", Some(200)),
+            (
+                json!({"status":200,"body":"private body/token"}),
+                "not valid JSON",
+                Some(200),
+            ),
+            (json!({"status":204,"body":""}), "not valid JSON", Some(204)),
+        ] {
+            let error = decode_call_result("SendItem", &value, true).unwrap_err();
+            assert!(
+                matches!(&error, OutlookWebError::SendOutcomeUnknown { http_status, .. } if *http_status == status)
+            );
+            let text = error.to_string();
+            assert!(text.contains(reason), "{text}");
+            assert!(text.contains("do not retry"), "{text}");
+            assert!(!text.contains("private body/token"));
+        }
+        for status in [400, 403, 404, 409, 429] {
+            assert!(
+                matches!(decode_call_result("SendItem",&json!({"status":status}),true),
+                Err(OutlookWebError::RequestRejected(code)) if code == status)
+            );
+        }
+        assert!(matches!(
+            decode_call_result(
+                "SendItem",
+                &json!({"failure":"timeout","dispatched":false}),
+                true
+            ),
+            Err(OutlookWebError::ReadTimedOut { .. })
+        ));
+    }
+
+    #[test]
+    fn browser_diagnostics_preserve_auth_timeout_and_write_uncertainty() {
+        for (value, expected) in [
+            (json!({"status":401}), "expired"),
+            (json!({"status":425,"stage":"authentication"}), "not loaded"),
+            (json!({"status":422,"stage":"authentication"}), "adapter"),
+            (
+                json!({"status":0,"failure":"timeout","dispatched":true}),
+                "deadline",
+            ),
+            (
+                json!({"status":0,"failure":"network","dispatched":true}),
+                "network",
+            ),
+            (
+                json!({"status":0,"failure":"response_too_large","dispatched":true}),
+                "size limit",
+            ),
+            (json!({"status":200,"body":"not JSON"}), "invalid data"),
+        ] {
+            let error = decode_call_result("GetItem", &value, false).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        assert!(matches!(
+            decode_call_result("GetItem", &json!({"status":422}), false),
+            Err(OutlookWebError::RequestRejected(422))
+        ));
+        assert!(matches!(
+            decode_call_result(
+                "MoveItem",
+                &json!({"status":0,"failure":"timeout","dispatched":true}),
+                true
+            ),
+            Err(OutlookWebError::OutcomeUnknown { action: "MoveItem" })
+        ));
+        assert!(matches!(
+            decode_call_result(
+                "MoveItem",
+                &json!({"status":0,"failure":"timeout","dispatched":false}),
+                true
+            ),
+            Err(OutlookWebError::ReadTimedOut { .. })
+        ));
+    }
 
     #[test]
     fn transfer_options_keep_transport_bounded_and_total_is_a_ceiling() {
@@ -836,27 +1082,6 @@ mod tests {
         assert_eq!(options.timeout, 60);
         assert_eq!(options.idle_timeout, 120);
         assert!(transfer_options(0).validate().is_ok());
-    }
-
-    #[test]
-    fn accepts_only_loaded_outlook_product_tabs() {
-        for url in [
-            "https://outlook.office.com/mail/",
-            "https://outlook.cloud.microsoft/calendar/view/week",
-            "https://outlook.cloud.microsoft/host/4a6520d6-94a8-4730-9184-24997b9b3401/auth",
-        ] {
-            assert!(outlook_url(url));
-        }
-        for url in [
-            "http://outlook.office.com/mail/",
-            "https://outlook.office.com.evil/mail/",
-            "https://outlook.office.com/",
-            "https://user@outlook.office.com/mail/",
-            "https://outlook.cloud.microsoft/host/invalid/auth",
-            "https://outlook.cloud.microsoft/host/4a6520d6-94a8-4730-9184-24997b9b3401/auth/other",
-        ] {
-            assert!(!outlook_url(url));
-        }
     }
 
     #[test]
@@ -876,6 +1101,31 @@ mod tests {
             "https://attacker.example/",
         ] {
             assert!(!sign_in_url(url));
+        }
+    }
+
+    #[test]
+    fn accepts_only_loaded_outlook_product_tabs() {
+        for url in [
+            "https://outlook.office.com/mail/",
+            "https://outlook.cloud.microsoft/calendar/view/week",
+            "https://outlook.cloud.microsoft/host/4a6520d6-94a8-4730-9184-24997b9b3401/auth",
+            "https://outlook.live.com/mail/",
+            "https://outlook.live.com/calendar/0/view/week",
+        ] {
+            assert!(outlook_url(url));
+        }
+        for url in [
+            "http://outlook.office.com/mail/",
+            "https://outlook.office.com.evil/mail/",
+            "https://outlook.live.com.evil/mail/",
+            "https://outlook.live.com/owa/",
+            "https://outlook.office.com/",
+            "https://user@outlook.office.com/mail/",
+            "https://outlook.cloud.microsoft/host/invalid/auth",
+            "https://outlook.cloud.microsoft/host/4a6520d6-94a8-4730-9184-24997b9b3401/auth/other",
+        ] {
+            assert!(!outlook_url(url));
         }
     }
 

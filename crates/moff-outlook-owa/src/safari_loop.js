@@ -1,5 +1,5 @@
 async function(config, acquireToken, readResponse) {
-    if (!["https://outlook.office.com", "https://outlook.cloud.microsoft"].includes(location.origin))
+    if (!["https://outlook.office.com", "https://outlook.cloud.microsoft", "https://outlook.live.com"].includes(location.origin))
         throw new Error("Loop requires an Outlook document");
     const base = "https://substrate.office.com/recommended/api/v1.1/loop";
     const validatePod = id => {

@@ -523,7 +523,7 @@ mod tests {
         json!({"Body":{"ResponseCode":"NoError","Items":items,"IsTruncated":false}})
     }
     fn input() -> WorkInput {
-        serde_json::from_value(json!({"folder_id":"calendar",
+        serde_json::from_value(json!({"folder_id":"calendar-id",
             "windows":[{"start":"2026-10-12T09:00:00-07:00","end":"2026-10-12T17:00:00-07:00"}],
             "tasks":[{"subject":"Prepare","minutes":60}],
             "allow_overlap_titles":["Focus Time"]}))
@@ -542,7 +542,7 @@ mod tests {
         ]);
         let slots = session
             .availability(
-                "calendar",
+                "calendar-id",
                 "2026-10-12T09:00:00-07:00",
                 "2026-10-12T15:00:00-07:00",
                 60,
@@ -565,7 +565,7 @@ mod tests {
         let snapshot = vec![old.clone()];
         let plan = WorkPlan {
             version: 1,
-            folder_id: "calendar".into(),
+            folder_id: "calendar-id".into(),
             windows: input().windows,
             allow_overlap_titles: vec![],
             snapshot: snapshot.clone(),
@@ -629,7 +629,7 @@ mod tests {
             plan.blocks[0].event.start.as_deref(),
             Some("2026-10-12T10:00:00-07:00")
         );
-        assert!(plan.blocks[0].overlaps.is_empty());
+        assert_eq!(plan.blocks[0].overlaps.len(), 0);
         task_input.tasks[0].deadline = Some("2026-10-12T10:30:00-07:00".into());
         assert!(session.plan_work_blocks(&task_input).is_err());
         worker.join().unwrap();
