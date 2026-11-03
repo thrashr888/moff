@@ -131,6 +131,8 @@ enum OutlookCommand {
 enum AuthCommand {
     /// Check silent authentication without a refresh or interactive sign-in.
     Status,
+    /// Inspect the current Outlook sign-in step without reading page text or form values.
+    Diagnose,
     /// Reload the selected Outlook tab for browser SSO; leave account/2FA clicks to you.
     Refresh {
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=120))]
@@ -687,9 +689,11 @@ fn schema() -> Value {
             "products":["mail","calendar","people","org","onedrive","groups","loop"],
             "requires":"loaded authenticated Outlook tab; Graph operations require corresponding delegated permissions",
             "credential_export":false,
-            "auth_recovery":{"refresh":true,"status":true,"interactive_sign_in":false,"confirmation":"--confirm","wait_seconds_max":120}}},
+            "auth_recovery":{"refresh":true,"status":true,"diagnose":true,"interactive_sign_in":false,
+                "diagnostic_context":"allowlisted sign-in stage only; no page text, form values, or credentials",
+                "confirmation":"--confirm","wait_seconds_max":120}}},
         "commands":{
-            "auth":{"refresh":true,"status":true},
+            "auth":{"refresh":true,"status":true,"diagnose":true},
             "mail":{"list":true,"search":true,"get":true,"get-batch":true,"categories":true,"reply-draft":true,"reply_all_draft":true,"mark":true,"create":true,"update":true,"delete":true,"send":true},
             "calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"get-batch":true,"availability":true,"work-blocks":{"plan":true,"apply":true},"create":true,"update":true,"delete":true,"respond":true,"move":true,"cancel":true},
             "people":{"list":true,"search":true,"get":true,"contacts":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true}},
@@ -1855,6 +1859,30 @@ fn main() -> ExitCode {
             Ok(value) => {
                 output("outlook.auth.status", &value);
                 if value["authenticated"] == true {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                }
+            }
+            Err(e) => error(e),
+        },
+        Some(
+            Command::Auth {
+                session: args,
+                command: AuthCommand::Diagnose,
+            }
+            | Command::Outlook {
+                session: args,
+                command:
+                    OutlookCommand::Auth {
+                        command: AuthCommand::Diagnose,
+                    },
+            },
+        ) => match OutlookWebSession::safari_auth_diagnose(args.safari_window.zip(args.safari_tab))
+        {
+            Ok(value) => {
+                output("outlook.auth.diagnose", &value);
+                if value["state"] == "authenticated" {
                     ExitCode::SUCCESS
                 } else {
                     ExitCode::from(2)
