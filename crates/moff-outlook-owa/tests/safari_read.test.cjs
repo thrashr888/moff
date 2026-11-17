@@ -9,20 +9,25 @@ const responseSource = fs.readFileSync(require("node:path").join(__dirname, "../
 
 function fixture(options = {}) {
     const requests = [];
+    const authCalls = [];
     const cache = {
-        121455: {
-            ij: async () => options.expired ? {TokenResultCode: 3} : {TokenResultCode: 0, AccessToken: "test-secret"},
+        [options.rspackModules ? 100148 : 121455]: {
+            ij: async (...args) => {
+                authCalls.push(args);
+                return options.expired ? {TokenResultCode: 3} : {TokenResultCode: 0, AccessToken: "test-secret"};
+            },
             a9: async () => options.expired ? "" : "synthetic-personal-token",
         },
-        429896: {A: () => ({})},
     };
+    if (!options.rspackModules) cache[429896] = {A: () => ({})};
     const runtime = id => cache[id];
     runtime.m = options.changed ? {} : cache;
     const chunks = [];
     chunks.push = function (entry) { entry[2](runtime); return Array.prototype.push.call(this, entry); };
     const context = {
         location: {origin: options.origin || "https://outlook.office.com"},
-        window: {webpackChunkOwa: options.unloaded ? undefined : chunks}, crypto: {randomUUID: () => "test"},
+        window: {[options.chunkGlobal || "webpackChunkOwa"]: options.unloaded ? undefined : chunks},
+        crypto: {randomUUID: () => "test"},
         sessionStorage: {
             getItem: () => options.marker || null,
             removeItem: () => {},
@@ -39,7 +44,7 @@ function fixture(options = {}) {
     const read = vm.runInNewContext(`(${source})`, context);
     const auth = vm.runInNewContext(`(${authSource})`, context);
     const response = vm.runInNewContext(`(${responseSource})`, context);
-    return {call: config => read(config, options.acquireToken || auth, response), auth, requests, chunks};
+    return {call: config => read(config, options.acquireToken || auth, response), auth, authCalls, requests, chunks};
 }
 
 function sendConfig() {
@@ -294,6 +299,17 @@ test("read authenticates inside page and returns no credential", async () => {
     assert.ok(!JSON.stringify(result).includes("test-secret"));
 });
 
+test("read supports Outlook's Rspack chunk global", async () => {
+    const f = fixture({chunkGlobal: "rspackChunkOwa", rspackModules: true});
+    const result = await f.call({action: "FindItem", body: {}});
+    assert.equal(result.status, 200);
+    assert.equal(f.requests[0].init.headers.authorization, "Bearer test-secret");
+    assert.equal(f.authCalls[0][0], "MoffRead");
+    assert.equal(f.authCalls[0][1], undefined);
+    assert.equal(f.authCalls[0][2].resource, "https://outlook.office.com");
+    assert.equal(f.chunks.length, 0);
+});
+
 test("SSO probe requires the recovery marker and exports only status, never credentials", async () => {
     for (const [options, status] of [
         [{}, 409],
@@ -350,6 +366,11 @@ test("standalone auth status is silent and failed mailbox requests are not retri
     const status = fixture();
     assert.equal((await status.call({action:"__MoffAuthStatus"})).status, 200);
     assert.equal(status.requests.length, 0);
+    const rspackStatus = fixture({chunkGlobal:"rspackChunkOwa",rspackModules:true});
+    const rspackResult = await rspackStatus.call({action:"__MoffAuthStatus"});
+    assert.equal(rspackResult.status,200);
+    assert.equal(rspackStatus.requests.length,0);
+    assert.ok(!JSON.stringify(rspackResult).includes("test-secret"));
     const failure = fixture({status:500});
     assert.equal((await failure.call({action:"FindItem",body:{}})).status, 500);
     assert.equal(failure.requests.length, 1);

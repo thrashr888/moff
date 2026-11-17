@@ -4,7 +4,7 @@ const vm=require("node:vm");
 const fs=require("node:fs");
 const path=require("node:path");
 const source=fs.readFileSync(path.join(__dirname,"../src/safari_pin.js"),"utf8");
-function fixture({changed=false,success=true}={}) {
+function fixture({changed=false,success=true,chunkGlobal="webpackChunkOwa"}={}) {
     const calls=[];
     const modules={
         708334:{pinUnpinItems:async(...args)=>{calls.push(args);return {success};}},
@@ -13,7 +13,7 @@ function fixture({changed=false,success=true}={}) {
     const runtime=id=>modules[id]; runtime.m=changed ? {} : modules;
     const chunks=[];
     chunks.push=entry=>{entry[2](runtime);Array.prototype.push.call(chunks,entry);};
-    const context={location:{origin:"https://outlook.office.com"},window:{webpackChunkOwa:chunks},
+    const context={location:{origin:"https://outlook.office.com"},window:{[chunkGlobal]:chunks},
         crypto:{randomUUID:()=>"unique"}};
     return {calls,context,call:vm.runInNewContext(`(${source})`,context)};
 }
@@ -21,6 +21,11 @@ test("native pin calls only the observed helper with one exact message and no ta
     const f=fixture();
     assert.equal((await f.call({allow_mutation:true,id:"id",pinned:true})).success,true);
     assert.deepEqual(JSON.parse(JSON.stringify(f.calls)),[[["id"],{mailbox:"synthetic"},true]]);
+});
+test("native pin supports Outlook's Rspack chunk global",async()=>{
+    const f=fixture({chunkGlobal:"rspackChunkOwa"});
+    assert.equal((await f.call({allow_mutation:true,id:"id",pinned:true})).success,true);
+    assert.equal(f.calls.length,1);
 });
 test("unconfirmed or malformed pins never dispatch and adapter drift is explicit",async()=>{
     for(const args of [{id:"id",pinned:true},{allow_mutation:true,id:"",pinned:true},{allow_mutation:true,id:"id",pinned:"yes"}]) {
