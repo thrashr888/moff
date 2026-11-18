@@ -714,6 +714,24 @@ pub fn calendar_item_request(id: &str) -> Value {
     )
 }
 
+fn sent_rsvp(item: &Value, response: MeetingResponse, subject: &str) -> bool {
+    matches!(
+        item["__type"].as_str(),
+        Some("MeetingResponseMessageType:#Exchange" | "MeetingResponseMessage:#Exchange")
+    ) && item["ResponseType"].as_str() == Some(response.response_type())
+        && item["Subject"]
+            .as_str()
+            .and_then(|value| value.split_once(':'))
+            .is_some_and(|(_, original)| original.trim() == subject.trim())
+}
+
+fn event_slot(item: &Value) -> Option<(DateTime<FixedOffset>, DateTime<FixedOffset>)> {
+    Some((
+        datetime(item["Start"].as_str()?).ok()?,
+        datetime(item["End"].as_str()?).ok()?,
+    ))
+}
+
 impl OutlookWebSession {
     pub fn send_mail(&self, input: &SendMailInput) -> Result<Value, OutlookWebError> {
         let result = self.execute("CreateItem", &send_mail_request(input)?, true)?;
@@ -1193,19 +1211,65 @@ impl OutlookWebSession {
         let response = self.calendar_get(id)?;
         let item = single_item(&response)?;
         let request = respond_event_request(item, input)?;
+        if input.response == MeetingResponse::Decline {
+            let subject = field(item, "/Subject")?;
+            nonempty(subject)?;
+            let slot = event_slot(item).ok_or(OutlookWebError::InvalidResponse)?;
+            let before = self.sent_rsvp_ids(input.response, subject)?;
+            let result = self.execute(Mutation::RespondEvent.action(), &request, true)?;
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                let after = self
+                    .sent_rsvp_ids(input.response, subject)
+                    .map_err(|_| OutlookWebError::VerificationFailed)?;
+                for id in after.difference(&before) {
+                    let sent = self
+                        .mail_get(id)
+                        .map_err(|_| OutlookWebError::VerificationFailed)?;
+                    let sent =
+                        single_item(&sent).map_err(|_| OutlookWebError::VerificationFailed)?;
+                    // Recurring meetings can share a subject across occurrences.
+                    if sent_rsvp(sent, input.response, subject) && event_slot(sent) == Some(slot) {
+                        return Ok(result);
+                    }
+                }
+            }
+            return Err(OutlookWebError::VerificationFailed);
+        }
         let result = self.execute(Mutation::RespondEvent.action(), &request, true)?;
         let verified = self
             .calendar_get(id)
             .map_err(|_| OutlookWebError::VerificationFailed)?;
-        let verified_item =
-            single_item(&verified).map_err(|_| OutlookWebError::VerificationFailed)?;
-        if verified_item.get("MyResponseType").and_then(Value::as_str)
-            != Some(input.response.response_type())
-        {
-            return Err(OutlookWebError::VerificationFailed);
+        let item = single_item(&verified).map_err(|_| OutlookWebError::VerificationFailed)?;
+        let response = item["MyResponseType"]
+            .as_str()
+            .or_else(|| item["ResponseType"].as_str());
+        if response == Some(input.response.response_type()) {
+            Ok(result)
+        } else {
+            Err(OutlookWebError::VerificationFailed)
         }
-        Ok(result)
     }
+
+    fn sent_rsvp_ids(
+        &self,
+        response: MeetingResponse,
+        subject: &str,
+    ) -> Result<HashSet<String>, OutlookWebError> {
+        let page = self.mail_list("sentitems", 25, 0)?;
+        let items = page
+            .pointer("/Body/ResponseMessages/Items/0/RootFolder/Items")
+            .and_then(Value::as_array)
+            .ok_or(OutlookWebError::InvalidResponse)?;
+        items
+            .iter()
+            .filter(|item| sent_rsvp(item, response, subject))
+            .map(|item| field(item, "/ItemId/Id").map(str::to_owned))
+            .collect()
+    }
+
     pub fn update_draft(&self, id: &str, input: &DraftInput) -> Result<Value, OutlookWebError> {
         draft_updates(input)?;
         let response = self.mail_get(id)?;
@@ -1381,6 +1445,93 @@ impl OutlookWebSession {
 mod tests {
     use super::*;
     use crate::test_support::{message, mock};
+
+    #[test]
+    fn meeting_decline_verifies_a_new_sent_response_for_the_same_occurrence() {
+        let before = json!({
+            "__type":"CalendarItem:#Exchange","ItemId":{"Id":"id","ChangeKey":"key"},
+            "IsMeeting":true,"IsOrganizer":false,"CalendarItemType":"Occurrence",
+            "Subject":"Weekly: Planning","Start":"2026-11-23T18:00:00Z","End":"2026-11-23T19:00:00Z"
+        });
+        let sent = |id, start, end| {
+            json!({
+                "__type":"MeetingResponseMessageType:#Exchange", "ItemId":{"Id":id},
+                "Subject":"Declined: Weekly: Planning","ResponseType":"Decline","Start":start,"End":end
+            })
+        };
+        let previous = sent("old", "2026-11-23T18:00:00Z", "2026-11-23T19:00:00Z");
+        let other_week = sent("other", "2026-11-30T18:00:00Z", "2026-11-30T19:00:00Z");
+        let current = sent(
+            "new",
+            "2026-11-23T10:00:00-08:00",
+            "2026-11-23T11:00:00-08:00",
+        );
+        let page = |items| {
+            json!({"Body":{"ResponseMessages":{"Items":[{
+                "ResponseCode":"NoError","RootFolder":{"Items":items}
+            }]}}})
+        };
+        let send_ack = json!({"Body":{"ResponseMessages":{"Items":[{
+            "ResponseClass":"Success","ResponseCode":"NoError","Items":[]
+        }]}}});
+        let (session, requests, worker) = mock(vec![
+            ("GetItem", message(before)),
+            ("FindItem", page(vec![previous.clone()])),
+            ("CreateItem", send_ack.clone()),
+            ("FindItem", page(vec![previous, other_week.clone()])),
+            ("GetItem", message(other_week)),
+            ("FindItem", page(vec![current.clone()])),
+            ("GetItem", message(current)),
+        ]);
+        let result = session.respond_event(
+            "id",
+            &MeetingResponseInput {
+                response: MeetingResponse::Decline,
+                message: Some("PTO".into()),
+                proposed_start: None,
+                proposed_end: None,
+            },
+        );
+        assert_eq!(result.unwrap(), send_ack);
+        worker.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[1]["Body"]["ParentFolderIds"][0]["Id"], "sentitems");
+        assert_eq!(requests[4]["Body"]["ItemIds"][0]["Id"], "other");
+        assert_eq!(requests[6]["Body"]["ItemIds"][0]["Id"], "new");
+    }
+
+    #[test]
+    fn meeting_decline_without_a_matching_sent_copy_does_not_resend() {
+        let event = json!({
+            "__type":"CalendarItem:#Exchange","ItemId":{"Id":"id","ChangeKey":"key"},
+            "IsMeeting":true,"IsOrganizer":false,"CalendarItemType":"Single",
+            "Subject":"Weekly Planning","Start":"2026-11-23T18:00:00Z","End":"2026-11-23T19:00:00Z"
+        });
+        let empty = search_page(&[], true);
+        let (session, requests, worker) = mock(vec![
+            ("GetItem", message(event)),
+            ("FindItem", empty.clone()),
+            (
+                "CreateItem",
+                json!({"Body":{"ResponseCode":"NoError","ResponseClass":"Success"}}),
+            ),
+            ("FindItem", empty.clone()),
+            ("FindItem", empty.clone()),
+            ("FindItem", empty),
+        ]);
+        let result = session.respond_event(
+            "id",
+            &MeetingResponseInput {
+                response: MeetingResponse::Decline,
+                message: None,
+                proposed_start: None,
+                proposed_end: None,
+            },
+        );
+        assert!(matches!(result, Err(OutlookWebError::VerificationFailed)));
+        worker.join().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 6);
+    }
 
     fn send_input() -> SendMailInput {
         SendMailInput {

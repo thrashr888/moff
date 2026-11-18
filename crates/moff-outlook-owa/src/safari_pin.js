@@ -3,7 +3,7 @@ async function(config) {
         || config.allow_mutation !== true || typeof config.id !== "string" || !config.id.trim()
         || typeof config.pinned !== "boolean") throw new Error("Invalid native pin request");
     let runtime;
-    const chunks = window.webpackChunkOwa;
+    const chunks = window.rspackChunkOwa || window.webpackChunkOwa;
     if (!chunks) return {dispatched:false, reason:"outlook_not_ready"};
     chunks.push([["__moff_pin_" + crypto.randomUUID()], {}, value => {runtime=value;}]);
     chunks.pop();
