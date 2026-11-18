@@ -17,7 +17,8 @@ with `cargo install --path crates/moff-cli --locked`.
 
 1. Open and sign into Outlook in Safari (`outlook.office.com`,
    `outlook.cloud.microsoft`, or `outlook.live.com`).
-2. Enable Safari Automation for your terminal/app and **Allow JavaScript from Apple Events**.
+2. In **Safari Settings > Developer > Automation**, enable **Allow JavaScript from Apple Events**.
+   If macOS prompts you, allow your terminal or app to control Safari.
 3. Run `moff auth status`; if it fails, `moff auth diagnose`, then `moff auth refresh --confirm`.
 
 With several Outlook tabs open, choose one: `moff outlook --safari-window 1 --safari-tab 1 mail list`.
