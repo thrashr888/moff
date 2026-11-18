@@ -2,9 +2,10 @@
 
 Moff is a personal **Microsoft 365 management CLI** for Outlook mail, calendar,
 contacts and related products (People, Org, OneDrive, Groups, Loop). It drives a
-signed-in Outlook tab in Safari through the Cider library: credentials stay in
-the tab, and Moff has no Entra app, OAuth flow, Azure CLI, Keychain access or
-token cache. Run `moff schema` for the supported operations and known gaps.
+signed-in Outlook tab in Safari through the [Cider library](https://github.com/thrashr888/cider):
+credentials stay in the tab, and Moff has no Entra app, OAuth flow, Azure CLI,
+Keychain access or token cache. Run `moff schema` for the supported operations
+and known gaps.
 
 ## Install and sign in
 
