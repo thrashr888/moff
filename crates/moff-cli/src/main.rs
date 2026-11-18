@@ -37,13 +37,16 @@ enum Command {
         #[arg(long)]
         full_access: bool,
     },
-    /// Serve native Outlook tools and MCP Apps cards; read-only unless --mail-actions.
+    /// Serve typed Outlook tools and MCP Apps cards; read-only by default.
     McpNative {
         #[command(flatten)]
         session: SessionArgs,
         /// Expose typed flag, native pin, and preview-gated archive actions to the host.
         #[arg(long)]
         mail_actions: bool,
+        /// Expose typed mail send, appointment creation and meeting RSVP tools.
+        #[arg(long)]
+        write_actions: bool,
     },
     /// Serve archive discovery, preview, and approval-gated archive tools (stdio).
     McpArchive {
@@ -758,6 +761,22 @@ fn encode_segment(segment: &str) -> String {
         .replace('+', "%20")
 }
 
+fn onedrive_list_path(item_id: Option<&str>, limit: u16) -> String {
+    let base = item_id.map_or_else(
+        || "root".to_owned(),
+        |id| format!("items/{}", encode_segment(id)),
+    );
+    format!("/v1.0/me/drive/{base}/children?$top={limit}")
+}
+
+fn groups_list_path(limit: u16) -> String {
+    format!("/v1.0/groups?$filter=groupTypes%2Fany%28c%3Ac%20eq%20%27Unified%27%29&$top={limit}")
+}
+
+fn people_list_path(limit: u16) -> String {
+    format!("/v1.0/me/people?$top={limit}")
+}
+
 fn user_path(user: Option<&str>, relationship: &str) -> String {
     match user {
         Some(user) => format!("/v1.0/users/{}/{}", encode_segment(user), relationship),
@@ -1011,15 +1030,13 @@ fn management_result(
             ));
         }
         let path = match product {
-            "people" => format!("/v1.0/me/people?$top={limit}"),
+            "people" => people_list_path(limit),
             "org" => format!("/v1.0/users?$top={limit}"),
             "onedrive" => format!(
                 "/v1.0/me/drive/root/search(q='{}')?$top={limit}",
                 encode_segment(&query.replace('\'', "''"))
             ),
-            "groups" => format!(
-                "/v1.0/groups?$filter=groupTypes%2Fany%28c%3Ac%20eq%20%27Unified%27%29&$top={limit}"
-            ),
+            "groups" => groups_list_path(limit),
             "loop" => format!("/v1.0/me/drive/root/search(q='.loop')?$top={limit}"),
             _ => return Err("unsupported product".to_owned()),
         };
@@ -1792,16 +1809,18 @@ fn main() -> ExitCode {
         Some(Command::McpNative {
             session,
             mail_actions,
+            write_actions,
         }) => {
             if session.allow_mutation {
                 eprintln!(
-                    "Native MCP rejects --allow-mutation; use the scoped --mail-actions opt-in"
+                    "Native MCP rejects --allow-mutation; use --mail-actions or --write-actions to opt in"
                 );
                 return ExitCode::FAILURE;
             }
             match native_mcp::serve_stdio(
                 session.safari_window.zip(session.safari_tab),
                 mail_actions,
+                write_actions,
             ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
@@ -2154,11 +2173,7 @@ fn main() -> ExitCode {
                 OutlookCommand::People {
                     command: PeopleCommand::List { limit },
                 },
-        }) => run_product_read(
-            args,
-            "outlook.people.list",
-            format!("/v1.0/me/people?$top={limit}"),
-        ),
+        }) => run_product_read(args, "outlook.people.list", people_list_path(limit)),
         Some(Command::Outlook {
             session: args,
             command:
@@ -2187,7 +2202,7 @@ fn main() -> ExitCode {
         }) => match graph_result(
             args,
             "outlook.people.search",
-            format!("/v1.0/me/people?$top={limit}"),
+            people_list_path(limit),
             false,
         ) {
             Ok((command, value)) => {
@@ -2302,14 +2317,10 @@ fn main() -> ExitCode {
                     command: OneDriveCommand::List { item_id, limit },
                 },
         }) => {
-            let base = item_id.map_or_else(
-                || "root".to_owned(),
-                |id| format!("items/{}", encode_segment(&id)),
-            );
             match graph_result(
                 args,
                 "outlook.onedrive.list",
-                format!("/v1.0/me/drive/{base}/children?$top={limit}"),
+                onedrive_list_path(item_id.as_deref(), limit),
                 false,
             ) {
                 Ok((command, value)) => {
@@ -2365,14 +2376,7 @@ fn main() -> ExitCode {
                 OutlookCommand::Groups {
                     command: GroupsCommand::List { limit },
                 },
-        }) => match graph_result(
-            args,
-            "outlook.groups.list",
-            format!(
-                "/v1.0/groups?$filter=groupTypes%2Fany%28c%3Ac%20eq%20%27Unified%27%29&$top={limit}"
-            ),
-            false,
-        ) {
+        }) => match graph_result(args, "outlook.groups.list", groups_list_path(limit), false) {
             Ok((command, value)) => {
                 output(command, &value);
                 ExitCode::SUCCESS
