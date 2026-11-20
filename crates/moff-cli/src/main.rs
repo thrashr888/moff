@@ -15,6 +15,7 @@ use moff_outlook_owa::{
 };
 use serde_json::{Value, json};
 mod archive_mcp;
+mod documents;
 mod mcp;
 mod native_mcp;
 
@@ -31,6 +32,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Read and preview/edit Word documents using signed-in `SharePoint` Safari tabs.
+    Docs {
+        #[command(flatten)]
+        session: SessionArgs,
+        #[command(subcommand)]
+        command: documents::DocumentCommand,
+    },
     /// Serve CLI operations over MCP; read-only unless --full-access.
     Mcp {
         /// Add a separately approval-gated tool for every supported CLI operation.
@@ -258,6 +266,11 @@ enum MailCommand {
 
 #[derive(Debug, Subcommand)]
 enum CalendarCommand {
+    /// Find the next occurrence within 90 days and its linked Word agenda candidates.
+    Agenda {
+        #[arg(long)]
+        id: String,
+    },
     /// Read 1-20 calendar items in one request.
     GetBatch {
         #[arg(long, required = true, num_args = 1..=20)]
@@ -468,7 +481,7 @@ enum OneDriveCommand {
         #[arg(long)]
         id: String,
         /// Owning drive ID for a `SharePoint` or another accessible drive item.
-        #[arg(long, conflicts_with = "output")]
+        #[arg(long)]
         drive_id: Option<String>,
         /// Stream a file to a new local path; never overwrite an existing file.
         #[arg(long)]
@@ -621,6 +634,12 @@ enum ManagementCommand {
         body_file: Option<PathBuf>,
         #[arg(long)]
         file: Option<PathBuf>,
+        /// Owning drive for file content replacement; omit for your own drive.
+        #[arg(long, requires = "file")]
+        drive_id: Option<String>,
+        /// Refuse replacement if the file changed since this entity tag was read.
+        #[arg(long, requires = "file")]
+        expected_etag: Option<String>,
         #[arg(long, requires = "file", default_value_t = DEFAULT_MAX_FILE_BYTES, value_parser = clap::value_parser!(u64).range(1..=250_000_000))]
         max_bytes: u64,
         #[arg(long, required = true)]
@@ -686,7 +705,7 @@ fn schema() -> Value {
         "archive_mcp":{"command":"moff mcp-archive","transport":"stdio","requires_host_approval":true,
             "tools":["mail_archive_folders","mail_archive_preview","mail_archive"],
             "batch_max":20,"delete":false,"send":false},
-        "command_prefixes":{"auth":["auth"],"default":["outlook"]},
+        "command_prefixes":{"auth":["auth"],"default":["outlook"],"docs":["docs"]},
         "transports":{"safari":{"experimental":true,"mutations":true,"delete":true,
             "mutation_gate":"--allow-mutation and --confirm",
             "products":["mail","calendar","people","org","onedrive","groups","loop"],
@@ -696,9 +715,10 @@ fn schema() -> Value {
                 "diagnostic_context":"allowlisted sign-in stage only; no page text, form values, or credentials",
                 "confirmation":"--confirm","wait_seconds_max":120}}},
         "commands":{
+            "docs":{"read":true,"edit":true},
             "auth":{"refresh":true,"status":true,"diagnose":true},
             "mail":{"list":true,"search":true,"get":true,"get-batch":true,"categories":true,"reply-draft":true,"reply_all_draft":true,"mark":true,"create":true,"update":true,"delete":true,"send":true},
-            "calendar":{"folders":true,"view":true,"list":true,"search":true,"get":true,"get-batch":true,"availability":true,"work-blocks":{"plan":true,"apply":true},"create":true,"update":true,"delete":true,"respond":true,"move":true,"cancel":true},
+            "calendar":{"agenda":true,"folders":true,"view":true,"list":true,"search":true,"get":true,"get-batch":true,"availability":true,"work-blocks":{"plan":true,"apply":true},"create":true,"update":true,"delete":true,"respond":true,"move":true,"cancel":true},
             "people":{"list":true,"search":true,"get":true,"contacts":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true}},
             "org":{"list":true,"get":true,"search":true,"manager":true,"reports":true,"create":false,"update":false,"delete":false},
             "onedrive":{"create":true,"get":true,"update":true,"delete":true,"list":true,"search":true,"upload":true,"download":true,"share":true,"permissions":true},
@@ -735,6 +755,12 @@ fn schema() -> Value {
             "groups_scope":"Microsoft 365 groups; update/delete require verified ownership",
             "verification":"Graph metadata writes use API acknowledgement; uploads check acknowledged size; native Loop deletion verifies GET 404",
             "max_json_bytes":200_000},
+        "word_documents":{"commands":["docs read","docs edit"],"transport":"same-origin signed-in SharePoint Safari tab; no Graph permission required for canonical document URLs",
+            "edit":"append paragraphs to a unique heading; optionally create a section before an existing unique heading",
+            "preview_default":true,"apply_requires":["--allow-mutation","--confirm","--expected-etag"],
+            "max_docx_bytes":16_000_000,"preserves":"existing XML, images, comments and other package parts",
+            "verification":"downloaded bytes must match the submitted package; never retry uncertain writes",
+            "unsupported":["protected, signed or macro-enabled documents","editing with track changes enabled","arbitrary replacement or deletion","headers/footers/comment content extraction"]},
         "remaining_management_gaps":["Loop workspace naming and page/content creation/editing","files above 250 MB","meeting/recurrence management"],
         "mutations":true,"mutation_confirmation":"--confirm","delete_policy":"mail/calendar move to Deleted Items; OneDrive recycle; contacts/groups API deletion; native Loop workspaces permanent",
         "calendar_mutation_scope":"single appointments without attendees","scheduling_policy":"empty gaps first; explicit exact-title overlap fallback","batch_limit":20,
@@ -1074,6 +1100,8 @@ fn management_result(
         ManagementCommand::Update {
             id,
             file: Some(file),
+            drive_id,
+            expected_etag,
             confirm,
             max_bytes,
             ..
@@ -1086,7 +1114,18 @@ fn management_result(
             }
             return Ok((
                 "update",
-                file_mutation(args, Some(id), None, None, file, *max_bytes)?,
+                file_mutation(
+                    args,
+                    Some(FileReplacement {
+                        id,
+                        drive: drive_id.as_deref(),
+                        expected_etag: expected_etag.as_deref(),
+                    }),
+                    None,
+                    None,
+                    file,
+                    *max_bytes,
+                )?,
             ));
         }
         _ => (),
@@ -1233,14 +1272,21 @@ fn management_result(
     Ok((action, result))
 }
 
+struct FileReplacement<'a> {
+    id: &'a str,
+    drive: Option<&'a str>,
+    expected_etag: Option<&'a str>,
+}
+
 fn file_mutation(
     args: SessionArgs,
-    id: Option<&str>,
+    replacement: Option<FileReplacement<'_>>,
     parent: Option<&str>,
     name: Option<&str>,
     file: &Path,
     max_bytes: u64,
 ) -> Result<Value, String> {
+    let id = replacement.as_ref().map(|target| target.id);
     let name = if id.is_none() {
         Some(
             name.or_else(|| file.file_name()?.to_str())
@@ -1264,21 +1310,34 @@ fn file_mutation(
     let request = ProductWrite::drive_upload(parent, id, name, size, id.map(|_| "preflight"))
         .map_err(|e| e.to_string())?;
     let session = session(args)?;
-    let request = if let Some(id) = id {
-        let before = session
-            .product_read(&format!(
-                "/v1.0/me/drive/items/{}",
-                product_segment(id).map_err(|e| e.to_string())?
-            ))
+    let request = if let Some(target) = replacement {
+        let item_path = moff_outlook_owa::drive_item_path(target.drive, target.id)
             .map_err(|e| e.to_string())?;
-        if !before["file"].is_object() {
-            return Err("content replacement requires an existing file, not a folder".to_owned());
+        let before = session
+            .product_read(&item_path)
+            .map_err(|e| e.to_string())?;
+        if before["id"] != target.id
+            || !before["file"].is_object()
+            || before.get("remoteItem").is_some()
+        {
+            return Err(
+                "content replacement requires an exact existing file in its owning drive"
+                    .to_owned(),
+            );
         }
         let etag = before["eTag"]
             .as_str()
             .filter(|s| !s.is_empty())
             .ok_or("file returned no entity tag")?;
-        ProductWrite::drive_upload(None, Some(id), None, size, Some(etag))
+        if target
+            .expected_etag
+            .is_some_and(|expected| expected != etag)
+        {
+            return Err(
+                "file changed since --expected-etag; read it again before editing".to_owned(),
+            );
+        }
+        ProductWrite::drive_replace_content(target.drive, target.id, size, etag)
             .map_err(|e| e.to_string())?
     } else {
         request
@@ -1295,7 +1354,13 @@ fn file_mutation(
     Ok(value)
 }
 
-fn download_file(args: SessionArgs, id: &str, path: &Path, max_bytes: u64) -> ExitCode {
+fn download_file(
+    args: SessionArgs,
+    drive: Option<&str>,
+    id: &str,
+    path: &Path,
+    max_bytes: u64,
+) -> ExitCode {
     let result = (|| -> Result<Value, String> {
         product_segment(id).map_err(|e| e.to_string())?;
         let session = session(args)?;
@@ -1309,7 +1374,7 @@ fn download_file(args: SessionArgs, id: &str, path: &Path, max_bytes: u64) -> Ex
                 )
             })?;
         let count = session
-            .drive_download(id, &mut file, max_bytes)
+            .drive_download_from(drive, id, &mut file, max_bytes)
             .map_err(|e| {
                 format!(
                     "download write failed; a partial file may remain at {}: {e}",
@@ -1645,6 +1710,12 @@ fn calendar_result(
         ),
     )?;
     match command {
+        CalendarCommand::Agenda { id } => Ok((
+            "outlook.calendar.agenda",
+            with_owa(args, |session| {
+                session.calendar_agenda(&id, chrono::Utc::now().fixed_offset())
+            })?,
+        )),
         CalendarCommand::GetBatch { id } => Ok((
             "outlook.calendar.get-batch",
             with_owa(args, |s| s.get_batch(&id, true))?,
@@ -1805,6 +1876,7 @@ fn calendar_result(
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Some(Command::Docs { session, command }) => documents::run(session, command),
         Some(Command::Mcp { full_access }) => mcp::serve(full_access),
         Some(Command::McpNative {
             session,
@@ -2100,6 +2172,8 @@ fn main() -> ExitCode {
                 id,
                 body_file: Some(body_file),
                 file: None,
+                drive_id: None,
+                expected_etag: None,
                 max_bytes: DEFAULT_MAX_FILE_BYTES,
                 confirm,
             },
@@ -2337,12 +2411,13 @@ fn main() -> ExitCode {
                     command:
                         OneDriveCommand::Get {
                             id,
+                            drive_id,
                             output: Some(path),
                             max_bytes,
                             ..
                         },
                 },
-        }) => download_file(args, &id, &path, max_bytes),
+        }) => download_file(args, drive_id.as_deref(), &id, &path, max_bytes),
         Some(Command::Outlook {
             session: args,
             command:
@@ -2429,6 +2504,44 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod management_tests {
     use super::*;
+
+    #[test]
+    fn shared_drive_transfers_accept_download_and_versioned_replace_args() {
+        assert!(
+            Cli::try_parse_from([
+                "moff",
+                "outlook",
+                "onedrive",
+                "get",
+                "--id",
+                "file",
+                "--drive-id",
+                "drive",
+                "--output",
+                "download.docx",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "moff",
+                "outlook",
+                "--allow-mutation",
+                "onedrive",
+                "update",
+                "--id",
+                "file",
+                "--drive-id",
+                "drive",
+                "--file",
+                "edited.docx",
+                "--expected-etag",
+                "version",
+                "--confirm",
+            ])
+            .is_ok()
+        );
+    }
 
     #[test]
     fn library_search_uses_the_resolved_drive_and_preserves_scope_and_paging() {

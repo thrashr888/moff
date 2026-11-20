@@ -67,8 +67,12 @@ pub(crate) fn product_url(path: &str) -> Result<Url, OutlookWebError> {
     ) || matches!(segments.as_slice(), ["v1.0","me","drive","root", search]
         | ["v1.0","drives",_,"root",search] if search.starts_with("search(q='") && search.ends_with("')"));
     let user = matches!(segments.as_slice(), ["v1.0", "users", _]);
+    let share = matches!(segments.as_slice(), ["v1.0", "shares", id, "driveItem"]
+        if id.strip_prefix("u!").is_some_and(|encoded| !encoded.is_empty()
+            && encoded.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))));
     let allowed = paged
         || user
+        || share
         || matches!(
             segments.as_slice(),
             ["v1.0", "me"]
@@ -158,10 +162,17 @@ impl OutlookWebSession {
         output: &mut impl std::io::Write,
         max_bytes: u64,
     ) -> Result<u64, OutlookWebError> {
-        let url = format!(
-            "https://graph.microsoft.com/v1.0/me/drive/items/{}",
-            product_segment(id)?
-        );
+        self.drive_download_from(None, id, output, max_bytes)
+    }
+
+    pub fn drive_download_from(
+        &self,
+        drive: Option<&str>,
+        id: &str,
+        output: &mut impl std::io::Write,
+        max_bytes: u64,
+    ) -> Result<u64, OutlookWebError> {
+        let url = format!("https://graph.microsoft.com{}", drive_item_path(drive, id)?);
         match &self.transport {
             crate::SessionTransport::Safari(safari) => {
                 safari.product_download(&url, output, max_bytes)
@@ -439,6 +450,20 @@ impl ProductWrite {
         };
         let mut request = Self::new(path, "PUT", None, etag)?;
         request.upload_size = Some(size);
+        Ok(request)
+    }
+
+    pub fn drive_replace_content(
+        drive: Option<&str>,
+        id: &str,
+        size: u64,
+        etag: &str,
+    ) -> Result<Self, OutlookWebError> {
+        let mut request = Self::drive_upload(None, Some(id), None, size, Some(etag))?;
+        request.url = format!(
+            "https://graph.microsoft.com{}/content",
+            drive_item_path(drive, id)?
+        );
         Ok(request)
     }
 

@@ -20,6 +20,7 @@ async function(config, acquireToken, readResponse) {
         /^\/v1\.0\/me\/drive\/items\/[^/]+$/,
         /^\/v1\.0\/(?:me\/drive|drives\/[^/]+)\/items\/[^/]+\/(?:invite|permissions(?:\/[^/]+)?)$/,
         /^\/v1\.0\/drives\/[^/]+\/items\/[^/]+$/,
+        /^\/v1\.0\/shares\/u![A-Za-z0-9_-]+\/driveItem$/,
         /^\/v1\.0\/me\/drive\/root\/search\(q='[^/]*'\)$/,
         /^\/v1\.0\/drives\/[^/]+\/root\/search\(q='[^/]*'\)$/,
         /^\/v1\.0\/sites\/[^/]+(?:\/(?:sites|teams)\/[^/]+|\/drives)?$/,

@@ -8,6 +8,34 @@ fn moff() -> Command {
 }
 
 #[test]
+fn word_document_apply_requires_a_preview_version_and_mutation_opt_in() {
+    let args = [
+        "docs",
+        "edit",
+        "--url",
+        "https://tenant.sharepoint.com/sites/Project/Doc.aspx?sourcedoc=12345678-1234-1234-1234-123456789abc",
+        "--section",
+        "Next meeting",
+        "--body-file",
+        "/dev/stdin",
+        "--confirm",
+    ];
+    moff()
+        .args(args)
+        .write_stdin("{}")
+        .assert()
+        .failure()
+        .stderr(contains("--expected-etag"));
+    moff()
+        .args(args)
+        .args(["--expected-etag", "version"])
+        .write_stdin("{}")
+        .assert()
+        .failure()
+        .stderr(contains("--allow-mutation"));
+}
+
+#[test]
 fn send_requires_explicit_content_opt_in_and_confirmation_without_browser_access() {
     let send = [
         "mail",
@@ -288,21 +316,6 @@ fn file_sharing_requires_explicit_recipient_opt_in_and_confirmation() {
         .assert()
         .failure()
         .stderr(contains("explicit recipient email"));
-    moff()
-        .args([
-            "outlook",
-            "onedrive",
-            "get",
-            "--id",
-            "file",
-            "--drive-id",
-            "drive",
-            "--output",
-            "/not/write",
-        ])
-        .assert()
-        .failure()
-        .stderr(contains("cannot be used with"));
     let output = moff().arg("schema").output().unwrap();
     let schema: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(schema["commands"]["onedrive"]["share"], true);

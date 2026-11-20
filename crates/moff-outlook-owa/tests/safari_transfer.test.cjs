@@ -144,3 +144,19 @@ test("existing uploads pin the entity tag and zero-byte uploads remain bounded",
     assert.equal(f.requests[0].init.body.length,0);
     assert.equal(f.window.__moff_upload_empty.size,0);
 });
+
+test("shared-drive downloads and replacements keep the exact owning drive and version", async () => {
+    const shared = "https://graph.microsoft.com/v1.0/drives/library/items/file";
+    const f = fixture(url => url === shared
+        ? json({file:{},size:3,"@microsoft.graph.downloadUrl":secretUrl})
+        : new Response(new Uint8Array([0,128,255]),{status:206}));
+    const download = await f.open({url:shared,direction:"download",size:3});
+    assert.deepEqual(Array.from(await download.read(128000)),[0,128,255]);
+    await download.close();
+    const upload = fixture(() => json({id:"file",size:0},200));
+    const replacement = await upload.open({url:shared + "/content",direction:"upload",size:0,
+        allow_mutation:true,etag:"exact-version",result_key:"__moff_upload_shared"});
+    await replacement.close();
+    assert.equal(upload.requests[0].url,shared + "/content");
+    assert.equal(upload.requests[0].init.headers["if-match"],"exact-version");
+});

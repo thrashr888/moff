@@ -16,6 +16,9 @@ url = "2.5.7"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 cider = { package = "cider-cli", git = "https://github.com/thrashr888/cider", rev = "7220e5d6ef2dfbcfa35243f2b054666c4782f8f1", default-features = false }
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "time"] }
+zip = { version = "9.8.0", default-features = false, features = ["deflate"] }
+roxmltree = "0.21.2"
+scraper = "0.29.0"
 
 [lints]
 workspace = true
