@@ -8,7 +8,9 @@ pub use mail_actions::{flag_request, mail_action_item_request, native_pin_state}
 mod contacts;
 pub use archive::*;
 mod operations;
+mod recurrence;
 pub use contacts::validate_contact_input;
+pub use recurrence::*;
 mod loop_workspaces;
 mod products;
 pub use loop_workspaces::LoopWorkspaceRequest;

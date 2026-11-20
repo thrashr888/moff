@@ -39,6 +39,13 @@ moff outlook calendar list --folder-id '<calendar-id>' \
 
 Discover everything else with `moff --help` and `moff <command> --help`.
 
+`moff outlook calendar reschedule-series --id '<occurrence-id>' --body-file schedule.json`
+previews a future-only weekly meeting change. JSON takes local `start`/`end`
+(`YYYY-MM-DDTHH:MM:SS`) in the existing series time zone and `interval_weeks`.
+Apply with `--allow-mutation`, `--confirm`, and both preview change keys
+(`--expected-change-key` and `--expected-series-change-key`). Existing attendees,
+body, Teams link and series end date are preserved; past meetings are not edited.
+
 ## Write safety
 
 The Outlook CLI is read-only by default. Write commands require

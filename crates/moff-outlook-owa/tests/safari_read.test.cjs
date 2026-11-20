@@ -530,6 +530,41 @@ test("attendee notifications are allowed only for a versioned start/end move", a
     }
 });
 
+test("future weekly series edits require exact bounded recurrence fields and versioned occurrence", async () => {
+    const id = {__type:"ItemId:#Exchange",Id:"occurrence",ChangeKey:"key"};
+    const field = (name,value) => ({__type:"SetItemField:#Exchange",
+        Path:{__type:"PropertyUri:#Exchange",FieldURI:name},
+        Item:{__type:"CalendarItem:#Exchange",[name]:value}});
+    const config = {action:"UpdateCalendarEvent",mutation:true,allow_mutation:true,body:{
+        Header:{TimeZoneContext:{TimeZoneDefinition:{Id:"Pacific Standard Time"}}},
+        Body:{__type:"UpdateCalendarEventRequest:#Exchange",EventId:id,EventScope:2,TargetAudience:0,
+            ShouldSendUpdateToAttendees:true,ItemChange:{__type:"ItemChange:#Exchange",ItemId:id,
+                Updates:[field("Start","2026-12-08T10:15:00"),field("End","2026-12-08T11:00:00"),
+                    field("Recurrence",{
+                        RecurrencePattern:{__type:"WeeklyRecurrence:#Exchange",Interval:2,
+                            DaysOfWeek:"Tuesday",FirstDayOfWeek:"Monday"},
+                        RecurrenceRange:{__type:"EndDateRecurrence:#Exchange",
+                            StartDate:"2026-12-08",EndDate:"2027-01-14"}})]}}
+    }};
+    assert.equal((await fixture().call(config)).status,200);
+    for (const corrupt of [
+        c => {c.body.Body.EventScope=3;},
+        c => {delete c.body.Body.ItemChange.ItemId.ChangeKey;},
+        c => {c.body.Body.ItemChange.Updates[2].Item.Recurrence.RecurrencePattern.Interval=0;},
+        c => {c.body.Body.ItemChange.Updates[2].Item.Recurrence.RecurrencePattern.DaysOfWeek="Wednesday";},
+        c => {c.body.Body.ItemChange.Updates[2].Item.Recurrence.RecurrenceRange.StartDate="2026-12-01";},
+        c => {c.body.Body.ItemChange.Updates[2].Item.Recurrence.RecurrenceRange.EndDate="2026-12-01";},
+        c => {c.body.Body.ItemChange.Updates.push(field("RequiredAttendees",[]));},
+        c => {delete c.body.Header.TimeZoneContext;},
+        c => {c.body.Body.ItemChange.Updates[0].Item.Start += "Z";},
+    ]) {
+        const copy=structuredClone(config), f=fixture();
+        corrupt(copy);
+        await assert.rejects(f.call(copy));
+        assert.equal(f.requests.length,0);
+    }
+});
+
 test("recycle operations require one versioned item and prohibit permanent deletion or notifications", async () => {
     const body = {Body:{__type:"DeleteItemRequest:#Exchange",DeleteType:"MoveToDeletedItems",
         SendMeetingCancellations:"SendToNone",SuppressReadReceipts:true,
