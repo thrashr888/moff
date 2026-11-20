@@ -9,9 +9,9 @@ use clap::{Args, Parser, Subcommand};
 use moff_outlook_owa::{
     DEFAULT_MAX_FILE_BYTES, DraftInput, EventInput, EventMoveInput, LoopWorkspaceRequest,
     MeetingResponseInput, OutlookWebError, OutlookWebSession, ProductWrite, ReplyInput,
-    SendMailInput, WorkInput, WorkPlan, calendar_folders_request, calendar_view_request,
-    load_mail_attachments, product_segment, validate_contact_input, validate_file_size,
-    validate_read_action,
+    SendMailInput, SeriesScheduleInput, WorkInput, WorkPlan, calendar_folders_request,
+    calendar_view_request, load_mail_attachments, product_segment, validate_contact_input,
+    validate_file_size, validate_read_action,
 };
 use serde_json::{Value, json};
 mod archive_mcp;
@@ -356,6 +356,21 @@ enum CalendarCommand {
         body_file: PathBuf,
         #[arg(long, required = true)]
         confirm: bool,
+    },
+    /// Preview a weekly series schedule change from this occurrence onward; --confirm sends it.
+    RescheduleSeries {
+        #[arg(long)]
+        id: String,
+        /// JSON: start/end local YYYY-MM-DDTHH:MM:SS in the existing series time zone, `interval_weeks`.
+        #[arg(long, value_name = "PATH")]
+        body_file: PathBuf,
+        /// Apply the preview, notifying all attendees. Requires both preview change keys.
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long, requires = "confirm")]
+        expected_change_key: Option<String>,
+        #[arg(long, requires = "confirm")]
+        expected_series_change_key: Option<String>,
     },
     /// Cancel one organizer-owned meeting and notify all attendees.
     Cancel {
@@ -735,9 +750,15 @@ fn schema() -> Value {
             "groups_scope":"Microsoft 365 groups; update/delete require verified ownership",
             "verification":"Graph metadata writes use API acknowledgement; uploads check acknowledged size; native Loop deletion verifies GET 404",
             "max_json_bytes":200_000},
-        "remaining_management_gaps":["Loop workspace naming and page/content creation/editing","files above 250 MB","meeting/recurrence management"],
+        "remaining_management_gaps":["Loop workspace naming and page/content creation/editing","files above 250 MB","non-weekly or open-ended recurrence editing; whole-series recurrence edits"],
         "mutations":true,"mutation_confirmation":"--confirm","delete_policy":"mail/calendar move to Deleted Items; OneDrive recycle; contacts/groups API deletion; native Loop workspaces permanent",
-        "calendar_mutation_scope":"single appointments without attendees","scheduling_policy":"empty gaps first; explicit exact-title overlap fallback","batch_limit":20,
+        "calendar_mutation_scope":"personal appointments; individual meeting RSVP/move/cancel; preview-gated future-only weekly series rescheduling with existing end date preserved",
+        "series_rescheduling":{"command":"outlook calendar reschedule-series","preview_default":true,
+            "input":["start/end local YYYY-MM-DDTHH:MM:SS in inherited series time zone","interval_weeks 1-52"],
+            "apply_requires":["--allow-mutation","--confirm","--expected-change-key","--expected-series-change-key"],
+            "scope":"selected occurrence and following; start may move at most 31 days later; same-day duration",
+            "preserves":["past occurrences","existing end date","attendees","body","online meeting"],"automatic_retry":false},
+        "scheduling_policy":"empty gaps first; explicit exact-title overlap fallback","batch_limit":20,
         "search_semantics":"mail/calendar literal subject/body; contacts/groups literal metadata; OneDrive drive search then metadata filtering; native Loop workspaces literal recent titles"
     })
 }
@@ -1638,6 +1659,7 @@ fn calendar_result(
                 | CalendarCommand::Delete { .. }
                 | CalendarCommand::Respond { .. }
                 | CalendarCommand::Move { .. }
+                | CalendarCommand::RescheduleSeries { confirm: true, .. }
                 | CalendarCommand::Cancel { .. }
                 | CalendarCommand::WorkBlocks {
                     command: WorkBlockCommand::Apply { .. }
@@ -1797,6 +1819,35 @@ fn calendar_result(
                 "outlook.calendar.cancel",
                 with_owa(args, |s| s.cancel_meeting(&id))?,
             ))
+        }
+        CalendarCommand::RescheduleSeries {
+            id,
+            body_file,
+            confirm,
+            expected_change_key,
+            expected_series_change_key,
+        } => {
+            let input: SeriesScheduleInput = serde_json::from_value(read_json(&body_file)?)
+                .map_err(
+                    |_| "--body-file requires start/end local timestamps and interval_weeks",
+                )?;
+            if confirm {
+                let key = expected_change_key
+                    .ok_or("apply requires --expected-change-key from preview")?;
+                let series_key = expected_series_change_key
+                    .ok_or("apply requires --expected-series-change-key from preview")?;
+                Ok((
+                    "outlook.calendar.reschedule-series",
+                    with_owa(args, |s| {
+                        s.reschedule_series(&id, &input, &key, &series_key)
+                    })?,
+                ))
+            } else {
+                Ok((
+                    "outlook.calendar.reschedule-series.preview",
+                    with_owa(args, |s| s.preview_series_schedule(&id, &input))?,
+                ))
+            }
         }
     }
 }

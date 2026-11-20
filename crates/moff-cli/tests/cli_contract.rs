@@ -8,6 +8,45 @@ fn moff() -> Command {
 }
 
 #[test]
+fn series_apply_requires_opt_in_and_preview_versions_before_browser_access() {
+    let args = [
+        "calendar",
+        "reschedule-series",
+        "--id",
+        "synthetic",
+        "--body-file",
+        "/dev/stdin",
+        "--confirm",
+    ];
+    moff()
+        .arg("outlook")
+        .args(args)
+        .write_stdin("{}")
+        .assert()
+        .failure()
+        .stderr(contains("--allow-mutation"));
+    moff()
+        .args(["outlook", "--allow-mutation"])
+        .args(args)
+        .write_stdin(
+            r#"{"start":"2026-12-08T10:15:00","end":"2026-12-08T11:00:00","interval_weeks":2}"#,
+        )
+        .assert()
+        .failure()
+        .stderr(contains("--expected-change-key"));
+    moff()
+        .args(["outlook", "--allow-mutation"])
+        .args(args)
+        .args(["--expected-change-key", "key"])
+        .write_stdin(
+            r#"{"start":"2026-12-08T10:15:00","end":"2026-12-08T11:00:00","interval_weeks":2}"#,
+        )
+        .assert()
+        .failure()
+        .stderr(contains("--expected-series-change-key"));
+}
+
+#[test]
 fn send_requires_explicit_content_opt_in_and_confirmation_without_browser_access() {
     let send = [
         "mail",

@@ -166,12 +166,37 @@ async function(config, acquireToken, readResponse) {
                     : [];
                 const start = updates?.find(update => update.Path?.FieldURI === "Start")?.Item?.Start;
                 const end = updates?.find(update => update.Path?.FieldURI === "End")?.Item?.End;
-                if (body.EventScope !== 0 || body.TargetAudience !== 0 || fields.join(",") !== "End,Start"
+                const recurrence = updates?.find(update => update.Path?.FieldURI === "Recurrence")?.Item?.Recurrence;
+                let validScope = body.EventScope === 0 && fields.join(",") === "End,Start";
+                if (body.EventScope === 2 && fields.join(",") === "End,Recurrence,Start") {
+                    const pattern = recurrence?.RecurrencePattern, range = recurrence?.RecurrenceRange;
+                    const local = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/;
+                    const date = /^\d{4}-\d{2}-\d{2}$/;
+                    const zone = config.body.Header?.TimeZoneContext?.TimeZoneDefinition?.Id;
+                    validScope = onlyKeys(recurrence, ["RecurrencePattern", "RecurrenceRange"])
+                        && onlyKeys(pattern, ["__type", "DaysOfWeek", "FirstDayOfWeek", "Interval"])
+                        && pattern.__type === "WeeklyRecurrence:#Exchange"
+                        && Number.isInteger(pattern.Interval) && pattern.Interval >= 1 && pattern.Interval <= 52
+                        && local.test(start) && local.test(end) && start.slice(0,10) === end.slice(0,10)
+                        && pattern.DaysOfWeek === ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"][
+                            new Date(start + "Z").getUTCDay()]
+                        && onlyKeys(range, ["__type", "StartDate", "EndDate"])
+                        && range.__type === "EndDateRecurrence:#Exchange"
+                        && range.StartDate === start.slice(0,10) && date.test(range.EndDate)
+                        && range.EndDate >= range.StartDate && typeof zone === "string" && zone.trim().length > 0
+                        && updates.every(update => update.__type === "SetItemField:#Exchange"
+                            && onlyKeys(update, ["__type", "Path", "Item"])
+                            && onlyKeys(update.Path, ["__type", "FieldURI"])
+                            && update.Path.__type === "PropertyUri:#Exchange"
+                            && onlyKeys(update.Item, ["__type", update.Path.FieldURI])
+                            && update.Item.__type === "CalendarItem:#Exchange");
+                }
+                if (!validScope || body.TargetAudience !== 0
                     || !itemId?.Id || !itemId?.ChangeKey || eventId?.Id !== itemId.Id
                     || eventId?.ChangeKey !== itemId.ChangeKey || !start || !end
                     || !Number.isFinite(Date.parse(start)) || !Number.isFinite(Date.parse(end))
                     || Date.parse(end) <= Date.parse(start)) {
-                    throw new Error("Only an explicit, versioned meeting-time move may notify attendees");
+                    throw new Error("Only a versioned meeting-time move or bounded future weekly series edit may notify attendees");
                 }
             } else if (body.ShouldSendUpdateToAttendees !== false) {
                 throw new Error("Invitations are prohibited");
