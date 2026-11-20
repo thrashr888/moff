@@ -70,6 +70,7 @@ access. Restart MCP servers after upgrading Moff.
 
 ## More
 
+- [Word documents and meeting agendas](docs/word-documents.md)
 - [Workspaces and transfers](docs/workspaces-and-transfers.md)
 - [Bot harness](harness/README.md) and [macOS app](apps/macos/README.md)
 - Request contracts: [`lib.rs`](crates/moff-outlook-owa/src/lib.rs) and

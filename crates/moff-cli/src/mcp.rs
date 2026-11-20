@@ -22,6 +22,7 @@ const READS: &[&str] = &[
     "reports",
     "availability",
     "read",
+    "agenda",
 ];
 
 pub(super) fn tool_result(text: String, failed: bool) -> Value {

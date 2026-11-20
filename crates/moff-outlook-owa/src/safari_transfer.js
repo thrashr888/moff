@@ -2,8 +2,8 @@ async function(config, acquireToken, readResponse, signal) {
     if (!["https://outlook.office.com", "https://outlook.cloud.microsoft", "https://outlook.live.com"].includes(location.origin))
         throw new Error("Transfers require an Outlook document");
     const url = new URL(config.url);
-    const item = /^\/v1\.0\/me\/drive\/items\/[^/]+$/.test(url.pathname);
-    const existing = /^\/v1\.0\/me\/drive\/items\/[^/]+\/content$/.test(url.pathname);
+    const item = /^\/v1\.0\/(?:me\/drive|drives\/[^/]+)\/items\/[^/]+$/.test(url.pathname);
+    const existing = /^\/v1\.0\/(?:me\/drive|drives\/[^/]+)\/items\/[^/]+\/content$/.test(url.pathname);
     const creating = /^\/v1\.0\/me\/drive\/(root|items\/[^/]+):\/[^/]+:\/content$/.test(url.pathname);
     if (url.origin !== "https://graph.microsoft.com" || url.username || url.password || url.hash
         || /%2f|%5c|%25/i.test(url.pathname)
